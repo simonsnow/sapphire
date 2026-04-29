@@ -11,6 +11,49 @@ from core.event_bus import publish, Events
 logger = logging.getLogger(__name__)
 
 
+# Whisper frequently hallucinates these canned phrases on silence/noise/
+# off-language input (trained heavily on YouTube captions). Filtering them
+# prevents phantom LLM calls after wakeword false-positives. Case-
+# insensitive exact-match after strip + punctuation normalization.
+_WHISPER_HALLUCINATIONS = {
+    'thank you',
+    'thanks for watching',
+    'thanks for watching!',
+    'thanks for watching.',
+    'you',
+    '.',
+    'bye',
+    'bye.',
+    'bye!',
+    'goodbye',
+    'goodbye.',
+    "i'm sorry",
+    "i'm sorry.",
+    'subtitles by',
+    '[music]',
+    '[laughter]',
+    '[applause]',
+    'thanks.',
+    'thank you.',
+    'okay.',
+    'ok.',
+}
+
+
+def _is_whisper_hallucination(text: str) -> bool:
+    """Return True if `text` matches a known Whisper hallucination phrase
+    (or is empty/whitespace — same downstream treatment)."""
+    if not text:
+        return True
+    normalized = text.strip().lower()
+    if not normalized:
+        return True
+    if normalized in _WHISPER_HALLUCINATIONS:
+        return True
+    stripped = normalized.rstrip('.!?').strip()
+    return stripped in _WHISPER_HALLUCINATIONS
+
+
 class WakeWordDetector:
     def __init__(self, model_name=None):
         """Initialize OpenWakeWord detector.
@@ -277,6 +320,16 @@ class WakeWordDetector:
                 self.system.speak_error('speech')
                 return
 
+            # Whisper hallucination filter. On silence or noise after a
+            # wakeword false-positive, Whisper famously produces canned
+            # phrases (trained on YouTube captions). Without this filter,
+            # the user wakes to Sapphire replying to phantom input at 3am.
+            # Scout 4 finding (2026-04-19).
+            if _is_whisper_hallucination(text):
+                logger.warning(f"Whisper hallucination filtered: {text!r}")
+                self.system.speak_error('speech')
+                return
+
             # post_stt hook — plugins can correct/translate/normalize transcription
             from core.hooks import hook_runner, HookEvent
             if hook_runner.has_handlers("post_stt"):
@@ -366,11 +419,34 @@ class WakeWordDetector:
                         self.audio_recorder.stop_recording()
                         time.sleep(1)
                         self.audio_recorder.start_recording()
+                        # Verify recovery actually succeeded — start_recording
+                        # swallows exceptions and leaves stream=None on failure.
+                        # Without this check, the loop keeps polling a None
+                        # stream forever and the user thinks wakeword is up
+                        # when it's silently dead. Scout 4 finding (2026-04-19).
+                        if self.audio_recorder.get_stream() is None:
+                            raise RuntimeError("start_recording returned but stream is None")
                         logger.info("Attempted stream recovery after persistent errors")
                         consecutive_errors = 0
                     except Exception as recovery_err:
                         logger.error(f"Stream recovery failed: {recovery_err}")
-                        time.sleep(5)
+                        # Publish a CONTINUITY_TASK_ERROR so the UI surfaces
+                        # "wakeword is silently dead." Otherwise the UI toggle
+                        # still reads on, but Sapphire can't hear.
+                        try:
+                            from core.event_bus import publish, Events
+                            publish(Events.CONTINUITY_TASK_ERROR, {
+                                "task": "Wake Word",
+                                "error": f"Wake word stream recovery failed ({type(recovery_err).__name__}: "
+                                         f"{recovery_err}). Audio input is dead — check mic, restart "
+                                         f"Sapphire, or toggle wake word off/on.",
+                            })
+                        except Exception:
+                            pass
+                        # Stop the loop rather than spin forever on a dead
+                        # stream. UI state will follow once the loop exits.
+                        self.running = False
+                        break
 
     def start_listening(self):
         if self.running:

@@ -39,45 +39,57 @@ class ToolsetManager:
         self._load()
     
     def _load(self):
-        """Load toolsets from user file, seeding from core defaults if needed."""
+        """Load toolsets from user file. Seeds from core defaults on first run only.
+
+        After first run, user/toolsets.json is authoritative — deleted toolsets
+        stay deleted across restarts. Mirrors the c0b6817 fix for personas.
+        """
         user_path = self.USER_DIR / "toolsets.json"
         core_path = self.BASE_DIR / "toolsets.json"
 
-        # Load core defaults (used for seeding)
-        core_ts = {}
-        try:
-            with open(core_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            core_ts = {k: v for k, v in data.items() if not k.startswith('_')}
-        except Exception as e:
-            logger.error(f"Failed to load core toolsets: {e}")
-
-        # Load user file if it exists
-        self._toolsets = {}
         if user_path.exists():
+            # User file is authoritative — no re-seeding on boot
             try:
                 with open(user_path, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                 self._toolsets = {k: v for k, v in data.items() if not k.startswith('_')}
             except Exception as e:
                 logger.error(f"Failed to load user toolsets: {e}")
+                self._toolsets = {}
+            # Targeted migration: ensure 'default' exists. The agent persona
+            # (core/personas/personas.json) and the agents plugin default_toolset
+            # setting both reference `toolset='default'`. On installs that seeded
+            # their user file before 'default' was a shipped toolset, spawned
+            # agents resolve to 0 tools and silently run with no capability.
+            # Scout #8 — 2026-04-20. If the user deliberately deleted 'default'
+            # after this migration, they can remove it again; we only seed once
+            # per load pass when genuinely missing.
+            if 'default' not in self._toolsets:
+                try:
+                    with open(core_path, 'r', encoding='utf-8') as f:
+                        core_data = json.load(f)
+                    core_default = core_data.get('default')
+                    if core_default:
+                        self._toolsets['default'] = core_default
+                        self._save_to_user()
+                        logger.info("Seeded missing 'default' toolset from core defaults (scout #8 migration)")
+                except Exception as e:
+                    logger.warning(f"'default' toolset migration failed: {e}")
+            logger.info(f"Loaded {len(self._toolsets)} toolsets")
+            return
 
-        # Seed any new core defaults that don't exist in user file
-        seeded = 0
-        for name, ts in core_ts.items():
-            if name not in self._toolsets:
-                self._toolsets[name] = ts
-                seeded += 1
+        # First run — seed from core defaults
+        self._toolsets = {}
+        try:
+            with open(core_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            self._toolsets = {k: v for k, v in data.items() if not k.startswith('_')}
+        except Exception as e:
+            logger.error(f"Failed to load core toolsets for first-run seed: {e}")
 
-        # Save if we seeded new entries
-        if seeded > 0:
-            logger.info(f"Seeded {seeded} new toolsets from defaults")
+        if self._toolsets:
             self._save_to_user()
-
-        if not self._toolsets:
-            self._toolsets = {}
-
-        logger.info(f"Loaded {len(self._toolsets)} toolsets")
+            logger.info(f"First run — seeded {len(self._toolsets)} toolsets from defaults")
     
     def reload(self):
         """Reload toolsets from disk."""

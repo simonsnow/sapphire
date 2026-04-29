@@ -5,17 +5,15 @@ import * as ui from '../ui.js';
 import { getElements, getIsProc, setHistLen, refresh } from '../core/state.js';
 import { updateScene, updateSendButtonLLM } from './scene.js';
 import { applyTrimColor } from './chat-settings.js';
-import { cancelPendingSave } from '../views/chat.js';
+import { cancelPendingSave, flushPendingSave } from '../views/chat.js';
 
 export async function populateChatDropdown() {
     const { chatSelect } = getElements();
     try {
         const data = await api.fetchChatList();
-        // Separate regular chats from story chats
-        const regularChats = data.chats.filter(c => !c.story_chat && !c.private_chat);
-        const storyChats = data.chats.filter(c => c.story_chat);
+        const regularChats = data.chats.filter(c => !c.private_chat);
         const privateChats = data.chats.filter(c => c.private_chat);
-        ui.renderChatDropdown(regularChats, data.active_chat, storyChats, privateChats);
+        ui.renderChatDropdown(regularChats, data.active_chat, [], privateChats);
     } catch (e) {
         console.error('Failed to load chat list:', e);
         if (chatSelect && chatSelect.options.length === 0) {
@@ -35,19 +33,34 @@ export async function handleChatChange() {
     if (!selectedChat) return;
     
     try {
-        cancelPendingSave();  // Prevent stale save from overwriting new chat's settings
+        // Flush any pending debounced save for the CURRENT chat before switching.
+        // Prevents the user's last-moment change (e.g. scope dropdown selection) from
+        // being eaten when they change a setting and switch chats within the 500ms
+        // debounce window. The flush fires the save for the OLD chat, then we activate
+        // the new one.
+        await flushPendingSave();
         audio.stop();
         // activateChat already returns settings - no need for separate getChatSettings call
         const result = await api.activateChat(selectedChat);
         const settings = result?.settings || {};
-        
+
         const len = await refresh(false);
         setHistLen(len);
         await updateScene();
-        
+
         // Use settings from activate response
         updateSendButtonLLM(settings.llm_primary || 'auto', settings.llm_model || '');
         applyTrimColor(settings.trim_color || '');
+
+        // Dispatch 'chat-activated' so chat.js loadSidebar fires AFTER the backend
+        // has switched active chat. Previously loadSidebar was wired to the native
+        // 'change' event on chatSelect, which raced with activateChat and caused
+        // 404s on GET /api/chats/{name}/settings when the fetch beat the switch.
+        if (chatSelect) {
+            chatSelect.dispatchEvent(new CustomEvent('chat-activated', {
+                detail: { chat: selectedChat, settings }
+            }));
+        }
     } catch (e) {
         console.error('Failed to switch chat:', e);
         ui.showToast(`Failed to switch chat: ${e.message}`, 'error');

@@ -255,16 +255,14 @@ class TestPasswordConsistency:
     """Verify password minimum length is consistent across all layers."""
 
     def test_setup_min_length_matches(self):
-        """save_password_hash should reject passwords shorter than 6."""
+        """save_password_hash should reject passwords shorter than 10."""
         from core.setup import save_password_hash
-        result = save_password_hash("12345")  # 5 chars
+        result = save_password_hash("123456")  # 6 chars, below new threshold
         assert result is None  # rejected
 
-    def test_setup_accepts_6_chars(self):
-        """save_password_hash should accept 6-char passwords."""
-        # We can't easily test this without writing to disk, so just verify
-        # the code checks for < 6
+    def test_setup_rejects_short_passwords(self):
+        """Verify the minimum length constant is 10 (raised 2026-04-22 per M6)."""
         import inspect
         from core.setup import save_password_hash
         source = inspect.getsource(save_password_hash)
-        assert "< 6" in source or "len(password) < 6" in source
+        assert "< 10" in source or "len(password) < 10" in source

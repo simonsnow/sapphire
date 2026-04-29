@@ -2,6 +2,8 @@
 import * as ui from '../ui.js';
 import { showExportDialog, showImportDialog } from '../shared/import-export.js';
 import { setupModalClose } from '../shared/modal.js';
+import { getInitData } from '../shared/init-data.js';
+import { on as onBusEvent, Events as BusEvents } from '../core/event-bus.js';
 
 function csrfHeaders(extra = {}) {
     const token = document.querySelector('meta[name="csrf-token"]')?.content || '';
@@ -18,9 +20,29 @@ let goalScopeCache = [];
 let memoryPage = 0;
 const MEMORIES_PER_PAGE = 100;
 
+// Memory card view state — survives re-renders within a single Mind session
+// so toggling tabs / scopes doesn't reset what the user was filtering by.
+// Reset by hand if you ever want a "fresh view" button.
+let _memSearch = '';
+let _memSort = 'newest';            // newest | oldest | longest | shortest | label
+let _memLabelFilter = null;          // null = show all labels; string = filter
+let _memShowAll = false;             // false = cap at MEM_INITIAL_LIMIT cards
+const MEM_INITIAL_LIMIT = 200;
+const MEM_TOP_LABELS = 8;
+
+// Fetched-data cache. Populated on first render for a scope; re-rendered
+// in-place on every filter change WITHOUT a new fetch. Invalidated on scope
+// change, MIND_CHANGED event for this domain/scope, or manual invalidate().
+// Witch-hunt 2026-04-21 R2 — without this, every keystroke fired a new
+// `/api/memory/list` HTTP round-trip; rapid typing also caused response
+// reorder (fetch-ab lands after fetch-abc) showing stale results.
+let _memCache = { scope: null, rows: null };
+function _invalidateMemCache() { _memCache = { scope: null, rows: null }; }
+
 export default {
     init(el) {
         container = el;
+        subscribeMindSse();
     },
     async show() {
         if (window._mindTab) {
@@ -28,13 +50,88 @@ export default {
             delete window._mindTab;
         }
         if (window._mindScope) {
+            // Explicit programmatic override (e.g. clicked a memory link from chat)
             currentScope = window._mindScope;
             delete window._mindScope;
+        } else {
+            // Sync to the active chat's scope for the current tab. Without this,
+            // Mind view always shows 'default' while the AI writes into whatever
+            // scope the active chat's settings have (memory_scope/goal_scope/etc).
+            // Two rooms, same house — root of the "Sapphire made a goal but I
+            // don't see it" class of bug.
+            const chatScope = await _scopeForActiveChatTab(activeTab);
+            if (chatScope) currentScope = chatScope;
         }
         await render();
     },
     hide() {}
 };
+
+
+// ─── Active-chat scope resolution ────────────────────────────────────────────
+
+const _TAB_TO_SCOPE_KEY = {
+    memories: 'memory_scope',
+    people: 'people_scope',
+    knowledge: 'knowledge_scope',
+    'ai-notes': 'knowledge_scope',
+    goals: 'goal_scope',
+};
+
+// Each Mind tab corresponds to a server-side MIND_CHANGED domain. Used by the
+// SSE handler below to decide whether an incoming event is relevant to the
+// currently-visible tab. 'ai-notes' and 'knowledge' share the knowledge
+// domain on the server (same tables, filtered by tab type on the client).
+const _DOMAIN_FOR_TAB = {
+    memories: 'memory',
+    people: 'people',
+    knowledge: 'knowledge',
+    'ai-notes': 'knowledge',
+    goals: 'goal',
+};
+
+let _mindSseSubscribed = false;
+
+function subscribeMindSse() {
+    // Subscribe once — init() may be called more than once as views cycle.
+    if (_mindSseSubscribed) return;
+    _mindSseSubscribed = true;
+    onBusEvent(BusEvents.MIND_CHANGED, (data) => {
+        if (!data || !container || !container.isConnected) return;
+        // Skip when Mind view isn't currently visible (offsetParent is null
+        // when the element is display:none or its parent is). No point
+        // re-fetching for a view the user can't see.
+        if (container.offsetParent === null) return;
+        const { domain, scope } = data;
+        if (!domain || !scope) return;
+        if (scope !== currentScope) return;
+        if (_DOMAIN_FOR_TAB[activeTab] !== domain) return;
+        // SSE says backing data for this domain/scope changed — invalidate
+        // any domain-specific caches so the next render re-fetches.
+        if (domain === 'memory') _invalidateMemCache();
+        renderContent();
+    });
+}
+
+async function _scopeForActiveChatTab(tab) {
+    // Returns the scope name the active chat uses for `tab`'s domain, or
+    // null if it can't be determined (caller keeps currentScope as-is).
+    const settingKey = _TAB_TO_SCOPE_KEY[tab];
+    if (!settingKey) return null;
+    try {
+        const resp = await fetch('/api/status');
+        if (!resp.ok) return null;
+        const data = await resp.json();
+        const raw = (data.chat_settings || {})[settingKey];
+        // 'none' means the scope dimension is disabled for this chat —
+        // the AI can't write there. Fall back to 'default' so the user
+        // can still see SOMETHING (global + default overlay).
+        if (!raw || raw === 'none') return 'default';
+        return raw;
+    } catch {
+        return null;
+    }
+}
 
 // ─── Main Render ─────────────────────────────────────────────────────────────
 
@@ -75,13 +172,25 @@ async function render() {
         </div>
     `;
 
-    // Tab switching
+    // Tab switching — re-sync scope to the active chat's setting for the new
+    // tab's domain. Each tab maps to a different scope axis (memories →
+    // memory_scope, goals → goal_scope, etc). Without this, switching tabs
+    // keeps the prior tab's scope and the user sees mismatched data.
     container.querySelectorAll('.mind-tab').forEach(btn => {
-        btn.addEventListener('click', () => {
+        btn.addEventListener('click', async () => {
             container.querySelectorAll('.mind-tab').forEach(b => b.classList.remove('active'));
             btn.classList.add('active');
             activeTab = btn.dataset.tab;
             memoryPage = 0;
+            const chatScope = await _scopeForActiveChatTab(activeTab);
+            const scopeChanged = chatScope && chatScope !== currentScope;
+            if (chatScope) currentScope = chatScope;
+            // If the auto-sync changed scope, reset memory-card filter state
+            // for the same reason as the manual scope dropdown handler. H17.
+            if (scopeChanged) {
+                _memSearch = ''; _memSort = 'newest';
+                _memLabelFilter = null; _memShowAll = false;
+            }
             updateScopeDropdown();
             renderContent();
         });
@@ -91,6 +200,14 @@ async function render() {
     container.querySelector('#mind-scope').addEventListener('change', (e) => {
         currentScope = e.target.value;
         memoryPage = 0;
+        // Reset memory-card filter state — without this, typing "boss" in
+        // 'work' scope and switching to 'home' lands on Memories with the
+        // search box still saying "boss" and zero results, looks broken.
+        // Witch-hunt 2026-04-21 finding H17.
+        _memSearch = '';
+        _memSort = 'newest';
+        _memLabelFilter = null;
+        _memShowAll = false;
         renderContent();
     });
 
@@ -222,108 +339,382 @@ async function renderContent() {
 
 // ─── Memories Tab ────────────────────────────────────────────────────────────
 
-async function renderMemories(el) {
-    const resp = await fetch(`/api/memory/list?scope=${encodeURIComponent(currentScope)}`);
-    if (!resp.ok) { el.innerHTML = '<div class="mind-empty">Failed to load memories</div>'; return; }
-    const data = await resp.json();
-    const groups = data.memories || {};
-    const labels = Object.keys(groups).sort();
+// ─── Memory cards view (TODO L138 — UX overhaul, 2026-04-21) ─────────────────
+//
+// Replaces the old grouped-by-label accordion with a flat card list driven by
+// search, sort, and top-N label chips (option B from the design discussion).
+// Cards show the full memory content — no truncation, the 512-char save cap is
+// the bound. Private rows render with a plaintext private_key pill so the user
+// can see the gating word at a glance.
 
-    const desc = '<div class="mind-tab-desc">Short identity snippets the AI saves during conversation. Grouped by label — these shape how it remembers you and itself.</div>';
+const MEM_RELATIVE_TIME_THRESHOLDS = [
+    [60, 'just now', 1],
+    [3600, 'm ago', 60],
+    [86400, 'h ago', 3600],
+    [604800, 'd ago', 86400],
+    [2592000, 'w ago', 604800],
+    [Infinity, 'mo ago', 2592000],
+];
+function _relativeTime(ts) {
+    if (!ts) return '';
+    const t = typeof ts === 'string' ? new Date(ts).getTime() : ts;
+    if (!t || isNaN(t)) return '';
+    const sec = Math.max(0, (Date.now() - t) / 1000);
+    for (const [bound, suffix, divisor] of MEM_RELATIVE_TIME_THRESHOLDS) {
+        if (sec < bound) {
+            return suffix === 'just now' ? suffix : `${Math.floor(sec / divisor)}${suffix}`;
+        }
+    }
+    return new Date(t).toLocaleDateString();
+}
+
+// Hash a label string into a hue so each label gets a stable color across
+// renders. Light visual distinction without forcing taxonomy.
+function _labelHue(label) {
+    if (!label) return 220;
+    let h = 0;
+    for (let i = 0; i < label.length; i++) h = (h * 31 + label.charCodeAt(i)) % 360;
+    return h;
+}
+
+function _renderMemoryCard(m, animDelay) {
+    const labelText = m.label || 'unlabeled';
+    const hue = _labelHue(m.label);
+    const labelStyle = m.label
+        ? `background:hsl(${hue},60%,18%);color:hsl(${hue},80%,72%);border:1px solid hsl(${hue},60%,32%)`
+        : `background:var(--bg-tertiary,#1a1b2e);color:var(--text-muted,#888);border:1px solid var(--border,#333)`;
+    const keyPill = m.private_key
+        ? `<span class="mind-mem-key" title="Gated by this private key — only AI calls passing this key can see it">🔒 ${escHtml(m.private_key)}</span>`
+        : '';
+    const ts = _relativeTime(m.timestamp);
+    // Stash private_key on the card via data-attr so delete can pass it
+    // through. The user already sees the plaintext key on this UI surface;
+    // the gate is for AI tool calls, not for the user's own privileged view.
+    const pkAttr = m.private_key ? ` data-private-key="${escHtml(m.private_key)}"` : '';
+    return `
+        <div class="mind-mem-card" data-id="${m.id}"${pkAttr} style="animation-delay:${animDelay.toFixed(2)}s">
+            <div class="mind-mem-header">
+                <span class="mind-mem-label" style="${labelStyle}">${escHtml(labelText)}</span>
+                ${keyPill}
+                <span class="mind-mem-time">${escHtml(ts)}</span>
+                <span class="mind-mem-id">[${m.id}]</span>
+            </div>
+            <div class="mind-mem-content">${escHtml(m.content)}</div>
+            <div class="mind-mem-actions">
+                <button class="mind-btn-sm mind-edit-memory" data-id="${m.id}" title="Edit">&#x270E;</button>
+                <button class="mind-btn-sm mind-del-memory" data-id="${m.id}" title="Delete">&#x2715;</button>
+            </div>
+        </div>
+    `;
+}
+
+const MEM_CARD_STYLES = `
+<style>
+@keyframes mindMemSlideIn {
+    from { opacity: 0; transform: translateY(8px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+.mind-mem-controls {
+    /* container-type lets stats below query THIS element's width (not the
+       viewport) — Mind panel can be sub-viewport when the chat sidebar is
+       open, so viewport media queries aren't accurate. Stats wrap to their
+       own line below ~520px container width. */
+    container-type: inline-size;
+    display: flex; align-items: center; gap: 10px; margin-bottom: 14px;
+    flex-wrap: wrap;
+}
+.mind-mem-search-wrap {
+    position: relative; flex: 1 1 200px; min-width: 0;
+}
+.mind-mem-sort { flex-shrink: 0; }
+.mind-mem-stats-inline { flex-shrink: 0; }
+@container (max-width: 520px) {
+    .mind-mem-stats-inline {
+        /* Drop to own line below the search/sort row when narrow. */
+        flex-basis: 100%; margin-left: 0; margin-top: 2px;
+        justify-content: flex-end;
+    }
+}
+.mind-mem-search-wrap::before {
+    content: '⌕'; position: absolute; left: 10px; top: 50%; transform: translateY(-50%);
+    font-size: 13px; color: var(--text-muted, #888); pointer-events: none;
+}
+.mind-mem-search {
+    width: 100%; background: var(--bg-secondary, #1a1b2e); color: var(--text, #e1e1e6);
+    border: 1px solid var(--border, #333); border-radius: 6px;
+    padding: 7px 12px 7px 30px; font-size: 13px; outline: none;
+}
+.mind-mem-search:focus { border-color: var(--accent, #4a7); }
+.mind-mem-sort {
+    /* width:auto overrides the global "select { width:100% }" rule from
+       shared.css. Without this the sort dropdown eats the controls row. */
+    width: auto !important;
+    background: var(--bg-secondary, #1a1b2e); color: var(--text, #e1e1e6);
+    border: 1px solid var(--border, #333); border-radius: 6px;
+    padding: 6px 10px; font-size: 12px; cursor: pointer; outline: none;
+}
+.mind-mem-chips {
+    display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 14px;
+}
+.mind-mem-chip {
+    padding: 4px 10px; font-size: 11px; border-radius: 4px; cursor: pointer;
+    background: transparent; color: var(--text-muted, #888);
+    border: 1px solid var(--border, #333); transition: all 0.15s;
+}
+.mind-mem-chip:hover { color: var(--text, #e1e1e6); border-color: var(--accent, #4a7); }
+.mind-mem-chip.active {
+    background: hsla(var(--chip-hue, 200), 60%, 18%, 1);
+    color: hsl(var(--chip-hue, 200), 80%, 72%);
+    border-color: hsl(var(--chip-hue, 200), 60%, 40%);
+}
+.mind-mem-stats-inline {
+    margin-left: auto; display: inline-flex; gap: 6px; align-items: center;
+    font-size: 11px; font-family: monospace; color: var(--text-muted, #888);
+    white-space: nowrap;
+}
+.mind-mem-stats-inline strong { color: var(--text, #e1e1e6); }
+.mind-mem-stats-scope { color: var(--text, #e1e1e6); opacity: 0.85; }
+.mind-mem-list { display: flex; flex-direction: column; gap: 8px; }
+.mind-mem-card {
+    background: var(--bg-secondary, #1a1b2e); border: 1px solid var(--border, #333);
+    border-radius: 8px; padding: 12px 14px; position: relative;
+    animation: mindMemSlideIn 0.32s ease both;
+}
+.mind-mem-header {
+    display: flex; align-items: center; gap: 8px; margin-bottom: 7px; flex-wrap: wrap;
+}
+.mind-mem-label {
+    font-size: 10px; padding: 2px 8px; border-radius: 3px; font-family: monospace;
+    letter-spacing: 0.04em;
+}
+.mind-mem-key {
+    font-size: 10px; padding: 2px 8px; border-radius: 3px; font-family: monospace;
+    background: hsla(40, 80%, 18%, 1); color: hsl(40, 90%, 70%);
+    border: 1px solid hsl(40, 70%, 38%);
+}
+.mind-mem-time {
+    font-size: 10px; color: var(--text-muted, #888); font-family: monospace; margin-left: auto;
+}
+.mind-mem-id { font-size: 9px; color: var(--text-muted, #888); font-family: monospace; opacity: 0.5; }
+.mind-mem-content {
+    font-size: 13px; color: var(--text, #e1e1e6); line-height: 1.55; word-break: break-word;
+}
+.mind-mem-actions {
+    position: absolute; top: 8px; right: 8px; display: flex; gap: 4px;
+    opacity: 0; transition: opacity 0.15s;
+}
+.mind-mem-card:hover .mind-mem-actions { opacity: 1; }
+.mind-mem-show-more {
+    margin-top: 10px; padding: 8px; text-align: center; font-size: 12px;
+    color: var(--text-muted, #888); cursor: pointer;
+    background: var(--bg-secondary, #1a1b2e); border: 1px dashed var(--border, #333); border-radius: 6px;
+}
+.mind-mem-show-more:hover { color: var(--text, #e1e1e6); border-color: var(--accent, #4a7); }
+.mind-mem-empty { padding: 24px; text-align: center; color: var(--text-muted, #888); font-style: italic; }
+</style>
+`;
+
+async function renderMemories(el) {
+    // Cache-first: if we already have rows for currentScope, skip the fetch
+    // and render in-place. Filter/search/sort handlers below call this same
+    // function; they hit the warm cache, nothing goes to the network. Cache
+    // populates on cold scope and invalidates on scope change / MIND_CHANGED
+    // event / explicit invalidate. Witch-hunt 2026-04-21 R2.
+    if (_memCache.scope !== currentScope || _memCache.rows === null) {
+        try {
+            const resp = await fetch(`/api/memory/list?scope=${encodeURIComponent(currentScope)}`);
+            if (!resp.ok) { el.innerHTML = '<div class="mind-empty">Failed to load memories</div>'; return; }
+            const data = await resp.json();
+            const groups = data.memories || {};
+            // Flatten to one array — server returns grouped by label, we want
+            // a single sortable/filterable list.
+            const rows = [];
+            for (const arr of Object.values(groups)) for (const m of arr) rows.push(m);
+            _memCache = { scope: currentScope, rows };
+        } catch (e) {
+            el.innerHTML = `<div class="mind-empty">Failed to load memories: ${e.message}</div>`;
+            return;
+        }
+    }
+    _renderMemoriesFromCache(el);
+}
+
+function _renderMemoriesFromCache(el) {
+    // Preserve focus across the el.innerHTML rewrite below — without this,
+    // typing in the search input kills focus after the first keystroke.
+    const focusedEl = document.activeElement;
+    const refocus = focusedEl && el.contains(focusedEl) && focusedEl.id
+        ? {
+            id: focusedEl.id,
+            selStart: focusedEl.selectionStart ?? null,
+            selEnd: focusedEl.selectionEnd ?? null,
+        }
+        : null;
+
+    const all = _memCache.rows || [];
+
+    // Top-N label chips (option B): most-frequent labels in this scope.
+    const labelCounts = {};
+    for (const m of all) {
+        const k = m.label || 'unlabeled';
+        labelCounts[k] = (labelCounts[k] || 0) + 1;
+    }
+    const topLabels = Object.entries(labelCounts)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, MEM_TOP_LABELS);
+
+    // Stats ribbon — minimal, three numbers.
+    const totalCount = all.length;
+    const privateCount = all.filter(m => m.private_key).length;
+    const labelVariety = Object.keys(labelCounts).length;
+
+    // Apply current filter state.
+    const search = _memSearch.trim().toLowerCase();
+    let filtered = all;
+    if (_memLabelFilter) {
+        filtered = filtered.filter(m => (m.label || 'unlabeled') === _memLabelFilter);
+    }
+    if (search) {
+        filtered = filtered.filter(m =>
+            (m.content || '').toLowerCase().includes(search) ||
+            (m.label || '').toLowerCase().includes(search) ||
+            (m.private_key || '').toLowerCase().includes(search)
+        );
+    }
+    // Sort.
+    const sortFns = {
+        newest: (a, b) => (new Date(b.timestamp) - new Date(a.timestamp)),
+        oldest: (a, b) => (new Date(a.timestamp) - new Date(b.timestamp)),
+        longest: (a, b) => (b.content || '').length - (a.content || '').length,
+        shortest: (a, b) => (a.content || '').length - (b.content || '').length,
+        label: (a, b) => (a.label || 'zz').localeCompare(b.label || 'zz'),
+    };
+    filtered.sort(sortFns[_memSort] || sortFns.newest);
+
+    // Cap visible cards to keep render fast on large scopes; reveal-all button
+    // for the rest. 200 is enough that scroll feels natural; show-all is one
+    // click away.
+    const visible = _memShowAll ? filtered : filtered.slice(0, MEM_INITIAL_LIMIT);
+    const hidden = filtered.length - visible.length;
+
+    const desc = '<div class="mind-tab-desc">Short snippets the AI saves during conversation. Search, filter, or click chips to narrow.</div>';
     const toolbar = `<div class="mind-toolbar">
         <button class="mind-btn" id="mind-find-dups">Find Duplicates</button>
         <button class="mind-btn" id="mind-export-memories">Export</button>
         <button class="mind-btn" id="mind-import-memories">Import</button>
     </div>`;
 
-    if (!labels.length) {
-        el.innerHTML = desc + toolbar + '<div class="mind-empty">No memories in this scope</div>';
+    if (!totalCount) {
+        el.innerHTML = MEM_CARD_STYLES + desc + toolbar +
+            '<div class="mind-mem-empty">No memories in this scope yet.</div>';
         _bindMemoryIO(el);
         return;
     }
 
-    // Count total and paginate by accordion (never split a group)
-    const totalMemories = labels.reduce((n, l) => n + groups[l].length, 0);
-    let pageLabels = labels, showPagination = false;
-    if (totalMemories > MEMORIES_PER_PAGE) {
-        showPagination = true;
-        let count = 0, startIdx = 0, collected = 0;
-        // Find starting label for current page
-        for (let i = 0; i < labels.length; i++) {
-            if (count >= memoryPage * MEMORIES_PER_PAGE) { startIdx = i; break; }
-            count += groups[labels[i]].length;
-            startIdx = i;
-        }
-        // Collect labels for this page (don't break groups)
-        pageLabels = [];
-        count = 0;
-        for (let i = startIdx; i < labels.length && count < MEMORIES_PER_PAGE; i++) {
-            pageLabels.push(labels[i]);
-            count += groups[labels[i]].length;
-        }
-    }
+    // Build chips. "All" chip + top labels + a clear-filter when one is active.
+    const chips = [
+        `<div class="mind-mem-chip ${_memLabelFilter === null ? 'active' : ''}" data-label="" style="--chip-hue:200">All (${totalCount})</div>`,
+        ...topLabels.map(([label, count]) => {
+            const hue = _labelHue(label === 'unlabeled' ? null : label);
+            const active = _memLabelFilter === label ? 'active' : '';
+            return `<div class="mind-mem-chip ${active}" data-label="${escHtml(label)}" style="--chip-hue:${hue}">${escHtml(label)} (${count})</div>`;
+        }),
+    ].join('');
 
-    const totalPages = showPagination ? Math.ceil(labels.length / pageLabels.length) : 1;
+    const cards = visible.map((m, i) => _renderMemoryCard(m, i * 0.025)).join('');
+    const showMoreBtn = hidden > 0
+        ? `<div class="mind-mem-show-more" id="mind-mem-show-all">Show ${hidden} more memories</div>`
+        : '';
+    const emptyFiltered = !visible.length
+        ? `<div class="mind-mem-empty">No memories match ${search ? `"${escHtml(search)}"` : 'this filter'}.</div>`
+        : '';
 
-    el.innerHTML = desc + toolbar + (showPagination ? `
-        <div class="mind-pagination">
-            <button class="mind-btn-sm" id="mem-prev" ${memoryPage === 0 ? 'disabled' : ''}>&#x25C0; Prev</button>
-            <span class="mind-page-info">${memoryPage + 1} / ${totalPages} (${totalMemories} memories)</span>
-            <button class="mind-btn-sm" id="mem-next" ${memoryPage >= totalPages - 1 ? 'disabled' : ''}>Next &#x25B6;</button>
+    // Stats fold into the controls row (margin-left:auto floats them right
+    // of the sort dropdown). Drops one whole vertical row from the layout —
+    // search/sort/stats live on a single line. Krem feedback 2026-04-21.
+    const statsInline = `
+        <span class="mind-mem-stats-inline">
+            <span><strong>${totalCount}</strong> mem</span>
+            <span>·</span>
+            <span><strong>${labelVariety}</strong> labels</span>
+            ${privateCount > 0 ? `<span>·</span><span><strong>${privateCount}</strong> private</span>` : ''}
+            <span>·</span>
+            <span class="mind-mem-stats-scope">${escHtml(currentScope)}</span>
+        </span>
+    `;
+
+    el.innerHTML = MEM_CARD_STYLES + desc + toolbar + `
+        <div class="mind-mem-controls">
+            <div class="mind-mem-search-wrap">
+                <input type="text" class="mind-mem-search" id="mind-mem-search"
+                    placeholder="Search memories..." value="${escHtml(_memSearch)}">
+            </div>
+            <select class="mind-mem-sort" id="mind-mem-sort">
+                <option value="newest" ${_memSort === 'newest' ? 'selected' : ''}>Sort: Newest</option>
+                <option value="oldest" ${_memSort === 'oldest' ? 'selected' : ''}>Sort: Oldest</option>
+                <option value="longest" ${_memSort === 'longest' ? 'selected' : ''}>Sort: Longest</option>
+                <option value="shortest" ${_memSort === 'shortest' ? 'selected' : ''}>Sort: Shortest</option>
+                <option value="label" ${_memSort === 'label' ? 'selected' : ''}>Sort: By Label</option>
+            </select>
+            ${statsInline}
         </div>
-    ` : '') +
-    '<div class="mind-list">' + pageLabels.map(label => {
-        const memories = groups[label];
-        return `
-            <details class="mind-accordion" open>
-                <summary class="mind-accordion-header">
-                    <span class="mind-accordion-title">${escHtml(label)}</span>
-                    <span class="mind-accordion-count">${memories.length}</span>
-                </summary>
-                <div class="mind-accordion-body">
-                    <div class="mind-accordion-inner">
-                        ${memories.map(m => `
-                            <div class="mind-item" data-id="${m.id}">
-                                <div class="mind-item-content">${escHtml(m.content)}</div>
-                                <div class="mind-item-actions">
-                                    <button class="mind-btn-sm mind-edit-memory" data-id="${m.id}" title="Edit">&#x270E;</button>
-                                    <button class="mind-btn-sm mind-del-memory" data-id="${m.id}" title="Delete">&#x2715;</button>
-                                </div>
-                            </div>
-                        `).join('')}
-                    </div>
-                </div>
-            </details>
-        `;
-    }).join('') + '</div>';
+        <div class="mind-mem-chips">${chips}</div>
+        <div class="mind-mem-list">${cards}${emptyFiltered}</div>
+        ${showMoreBtn}
+    `;
 
-    // Pagination handlers
-    el.querySelector('#mem-prev')?.addEventListener('click', async () => {
-        if (memoryPage > 0) { memoryPage--; await renderMemories(el); }
+    // Search wires up live (debounced is overkill at this scale).
+    el.querySelector('#mind-mem-search')?.addEventListener('input', e => {
+        _memSearch = e.target.value;
+        _memShowAll = false;  // reset reveal when filter changes
+        renderMemories(el);
     });
-    el.querySelector('#mem-next')?.addEventListener('click', async () => {
-        if (memoryPage < totalPages - 1) { memoryPage++; await renderMemories(el); }
+    // Sort dropdown.
+    el.querySelector('#mind-mem-sort')?.addEventListener('change', e => {
+        _memSort = e.target.value;
+        renderMemories(el);
+    });
+    // Chips — clicking the active one clears it.
+    el.querySelectorAll('.mind-mem-chip').forEach(chip => {
+        chip.addEventListener('click', () => {
+            const lbl = chip.dataset.label || null;
+            _memLabelFilter = (lbl === _memLabelFilter || lbl === '') ? null : lbl;
+            _memShowAll = false;
+            renderMemories(el);
+        });
+    });
+    // Show-more reveal.
+    el.querySelector('#mind-mem-show-all')?.addEventListener('click', () => {
+        _memShowAll = true;
+        renderMemories(el);
     });
 
     // Edit handlers
     el.querySelectorAll('.mind-edit-memory').forEach(btn => {
         btn.addEventListener('click', () => {
             const id = parseInt(btn.dataset.id);
-            const item = btn.closest('.mind-item');
-            const content = item.querySelector('.mind-item-content').textContent;
+            const card = btn.closest('.mind-mem-card');
+            const content = card.querySelector('.mind-mem-content').textContent;
             showMemoryEditModal(el, id, content);
         });
     });
 
-    // Delete handlers
+    // Delete handlers — pass private_key from the card's data-attr if set
+    // so the user can delete private rows from their own UI (gate is for
+    // AI tool callers, not the authenticated user).
     el.querySelectorAll('.mind-del-memory').forEach(btn => {
         btn.addEventListener('click', async () => {
             if (!confirm('Delete this memory?')) return;
             const id = parseInt(btn.dataset.id);
+            const card = btn.closest('.mind-mem-card');
+            const pk = card?.dataset.privateKey || '';
+            const url = `/api/memory/${id}?scope=${encodeURIComponent(currentScope)}`
+                + (pk ? `&private_key=${encodeURIComponent(pk)}` : '');
             try {
-                const resp = await fetch(`/api/memory/${id}?scope=${encodeURIComponent(currentScope)}`, { method: 'DELETE', headers: csrfHeaders() });
+                const resp = await fetch(url, { method: 'DELETE', headers: csrfHeaders() });
                 if (resp.ok) {
                     ui.showToast('Deleted', 'success');
+                    _invalidateMemCache();
                     await renderMemories(el);
                 }
             } catch (e) { ui.showToast('Failed', 'error'); }
@@ -331,6 +722,19 @@ async function renderMemories(el) {
     });
 
     _bindMemoryIO(el);
+
+    // Restore focus + cursor on the same-id element after the innerHTML
+    // rewrite. If the originally-focused element no longer exists (e.g. the
+    // user clicked something that's now gone), this is a no-op.
+    if (refocus) {
+        const restored = el.querySelector(`#${refocus.id}`);
+        if (restored) {
+            restored.focus();
+            if (refocus.selStart !== null && typeof restored.setSelectionRange === 'function') {
+                try { restored.setSelectionRange(refocus.selStart, refocus.selEnd); } catch { /* element type doesn't support selection */ }
+            }
+        }
+    }
 }
 
 function _bindMemoryIO(el) {
@@ -385,7 +789,7 @@ function _bindMemoryIO(el) {
                 const result = await resp.json();
                 ui.showToast(`Imported ${result.imported} memories, ${result.skipped} duplicates skipped`, 'success');
             },
-            onDone: async () => { await renderMemories(el); },
+            onDone: async () => { _invalidateMemCache(); await renderMemories(el); },
         });
     });
 }
@@ -404,6 +808,7 @@ function _showDuplicatesModal(el, pairs) {
         if (currentIdx >= pairs.length) {
             overlay.remove();
             ui.showToast('All duplicates reviewed', 'success');
+            _invalidateMemCache();
             renderMemories(el);
             return;
         }
@@ -440,6 +845,7 @@ function _showDuplicatesModal(el, pairs) {
 
         overlay.querySelector('.mind-modal-close').addEventListener('click', () => {
             overlay.remove();
+            _invalidateMemCache();
             renderMemories(el);
         });
 
@@ -473,6 +879,7 @@ function _showDuplicatesModal(el, pairs) {
 
         overlay.querySelector('#dup-skip-all').addEventListener('click', () => {
             overlay.remove();
+            _invalidateMemCache();
             renderMemories(el);
         });
     }
@@ -529,6 +936,7 @@ function showMemoryEditModal(el, memoryId, content) {
             if (resp.ok) {
                 close();
                 ui.showToast('Memory updated', 'success');
+                _invalidateMemCache();
                 await renderMemories(el);
             } else {
                 const err = await resp.json();
@@ -1374,12 +1782,13 @@ function showDeleteScopeConfirmation2(scopeName, typeLabel, count) {
     execBtn.addEventListener('click', async () => {
         if (input2.value.trim() !== 'DELETE') return;
         const enc = encodeURIComponent(scopeName);
-        const apis = [
-            `/api/memory/scopes/${enc}`,
-            `/api/knowledge/scopes/${enc}`,
-            `/api/knowledge/people/scopes/${enc}`,
-            `/api/goals/scopes/${enc}`
-        ];
+        // Phase 2f: derive the delete API list from /api/init scope_declarations
+        // filtered to Mind-domain scopes (nav_target starts with "mind:"). Was a
+        // hardcoded 4-URL list. New plugin mind scopes get swept automatically.
+        const initData = await getInitData().catch(() => null);
+        const mindDecls = (initData?.scope_declarations || [])
+            .filter(d => d.nav_target?.startsWith('mind:'));
+        const apis = mindDecls.map(d => `${d.endpoint}/${enc}`);
         try {
             const results = await Promise.allSettled(apis.map(url =>
                 fetch(url, {

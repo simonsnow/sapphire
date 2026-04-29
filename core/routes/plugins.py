@@ -23,6 +23,14 @@ router = APIRouter()
 _toggle_locks: dict[str, threading.Lock] = {}
 _toggle_locks_guard = threading.Lock()
 
+# Module-level mutex for the read-modify-write of user/webui/plugins.json.
+# Per-plugin locks above don't help when concurrent toggles target DIFFERENT
+# plugins — both reads see the same disk snapshot, both writes replace the
+# file, the second writer's payload was computed from pre-first-write state,
+# so the first toggle vanishes from disk silently. This guards the disk file
+# itself across plugin names. Witch-hunt 2026-04-21 finding H10.
+_user_plugins_file_mutex = threading.Lock()
+
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 STATIC_DIR = PROJECT_ROOT / "interfaces" / "web" / "static"
 
@@ -35,8 +43,27 @@ USER_PLUGIN_SETTINGS_DIR = USER_WEBUI_DIR / 'plugins'
 LOCKED_PLUGINS = []
 
 
+def _enforce_locked(result):
+    """Ensure LOCKED_PLUGINS are always in the enabled list."""
+    for locked in LOCKED_PLUGINS:
+        if locked not in result["enabled"]:
+            result["enabled"].append(locked)
+    return result
+
+
 def _get_merged_plugins():
-    """Merge static and user plugins.json."""
+    """Merge static and user plugins.json into the shape the UI consumes.
+
+    The `enabled` list reflects what's ACTUALLY RUNNING, not just what's in
+    the user file. Backends with `default_enabled: true` + no explicit user
+    toggle are live via scan() semantics but won't appear in the user file
+    until the user clicks the toggle — previously this meant /api/init's
+    `plugins_config.enabled` missed them, and the frontend's
+    `enabledPlugins` Set (which drives scope-dropdown visibility in
+    scope-dropdowns.js:64) hid their scopes. Tools worked via SCOPE_REGISTRY
+    but the Mind dropdowns ghosted. Toggle-off-then-on wrote the plugin to
+    disk and the mismatch resolved. TODO L132 — 2026-04-21.
+    """
     static_plugins_json = STATIC_DIR / 'core-ui' / 'plugins.json'
     try:
         with open(static_plugins_json, encoding='utf-8') as f:
@@ -44,27 +71,53 @@ def _get_merged_plugins():
     except Exception:
         static = {"enabled": [], "plugins": {}}
 
-    if not USER_PLUGINS_JSON.exists():
-        return static
+    if USER_PLUGINS_JSON.exists():
+        try:
+            with open(USER_PLUGINS_JSON, encoding='utf-8') as f:
+                user = json.load(f)
+        except Exception:
+            user = None
+    else:
+        user = None
 
+    if user is None:
+        merged = {
+            "enabled": list(static.get("enabled", [])),
+            "plugins": dict(static.get("plugins", {}))
+        }
+    else:
+        merged = {
+            "enabled": list(user.get("enabled", static.get("enabled", []))),
+            "plugins": dict(static.get("plugins", {})),
+        }
+        if "plugins" in user:
+            merged["plugins"].update(user["plugins"])
+
+    # Augment with runtime-enabled plugins the user file doesn't yet list
+    # (default_enabled semantics). The plugin_loader is the source of truth
+    # for what's actually active; merge its view into the returned dict so
+    # frontend and backend agree.
+    #
+    # Snapshot under `_lock` and iterate the snapshot — concurrent
+    # rescan/uninstall pop entries under the same lock, so iterating the live
+    # dict can raise `RuntimeError: dictionary changed size during iteration`,
+    # which the outer except would swallow into a half-populated `enabled`
+    # list and frontend's `enabledPlugins` Set would silently hide scopes.
+    # Witch-hunt 2026-04-21 finding H7.
     try:
-        with open(USER_PLUGINS_JSON, encoding='utf-8') as f:
-            user = json.load(f)
+        from core.plugin_loader import plugin_loader
+        with plugin_loader._lock:
+            snapshot = list(plugin_loader._plugins.items())
+        disk = set(merged["enabled"])
+        for name, info in snapshot:
+            if info.get("loaded") and info.get("enabled") and name not in disk:
+                merged["enabled"].append(name)
     except Exception:
-        return static
+        # plugin_loader may not be initialized during very early boot — in
+        # that case the disk state is what we've got; ship it.
+        pass
 
-    merged = {
-        "enabled": user.get("enabled", static.get("enabled", [])),
-        "plugins": dict(static.get("plugins", {}))
-    }
-    if "plugins" in user:
-        merged["plugins"].update(user["plugins"])
-
-    for locked in LOCKED_PLUGINS:
-        if locked not in merged["enabled"]:
-            merged["enabled"].append(locked)
-
-    return merged
+    return _enforce_locked(merged)
 
 
 @router.get("/api/webui/plugins")
@@ -130,6 +183,7 @@ async def list_plugins(request: Request, _=Depends(require_login)):
                     "has_script": has_script,
                     "sidebar_accordion": manifest.get("capabilities", {}).get("sidebar_accordion"),
                     "missing_deps": info.get("missing_deps", []),
+                    "essential": manifest.get("essential", False),
                 })
     except Exception:
         pass
@@ -163,41 +217,55 @@ async def toggle_plugin(plugin_name: str, request: Request, _=Depends(require_lo
         if plugin_name not in known:
             raise HTTPException(status_code=404, detail=f"Unknown plugin: {plugin_name}")
 
-        enabled = list(merged.get("enabled", []))
-
-        # Determine current state from plugin_loader (handles default_enabled plugins
-        # that aren't in the persisted enabled list)
-        currently_enabled = plugin_name in enabled
-        try:
-            from core.plugin_loader import plugin_loader as _pl
-            info = _pl.get_plugin_info(plugin_name)
-            if info:
-                currently_enabled = info["enabled"]
-        except Exception:
-            pass
-
-        if currently_enabled:
-            if plugin_name in enabled:
-                enabled.remove(plugin_name)
-            new_state = False
-        else:
-            if plugin_name not in enabled:
-                enabled.append(plugin_name)
-            new_state = True
-
+        # Read-modify-write of the user plugins.json must be atomic across
+        # plugin names — concurrent toggles of TWO different plugins both
+        # read the same disk snapshot and the second writer's payload was
+        # computed before the first writer's change landed, silently losing
+        # one toggle. Module-level `_user_plugins_file_mutex` guards the
+        # whole RMW. Witch-hunt 2026-04-21 finding H10.
         USER_WEBUI_DIR.mkdir(parents=True, exist_ok=True)
-        user_data = {}
-        if USER_PLUGINS_JSON.exists():
+        with _user_plugins_file_mutex:
+            user_data = {}
+            if USER_PLUGINS_JSON.exists():
+                try:
+                    with open(USER_PLUGINS_JSON, encoding='utf-8') as f:
+                        user_data = json.load(f)
+                except Exception:
+                    pass
+            enabled = list(user_data.get("enabled", []))
+            disabled = list(user_data.get("disabled", []))
+
+            # Determine current state from plugin_loader (handles default_enabled
+            # plugins that aren't in the persisted enabled list).
+            currently_enabled = plugin_name in enabled
             try:
-                with open(USER_PLUGINS_JSON, encoding='utf-8') as f:
-                    user_data = json.load(f)
+                from core.plugin_loader import plugin_loader as _pl
+                info = _pl.get_plugin_info(plugin_name)
+                if info:
+                    currently_enabled = info["enabled"]
             except Exception:
                 pass
-        user_data["enabled"] = enabled
-        tmp_path = USER_PLUGINS_JSON.with_suffix('.tmp')
-        with open(tmp_path, 'w', encoding='utf-8') as f:
-            json.dump(user_data, f, indent=2)
-        tmp_path.replace(USER_PLUGINS_JSON)
+
+            if currently_enabled:
+                if plugin_name in enabled:
+                    enabled.remove(plugin_name)
+                # Record explicit disable so default_enabled plugins stay off across reboots
+                if plugin_name not in disabled:
+                    disabled.append(plugin_name)
+                new_state = False
+            else:
+                if plugin_name not in enabled:
+                    enabled.append(plugin_name)
+                if plugin_name in disabled:
+                    disabled.remove(plugin_name)
+                new_state = True
+
+            user_data["enabled"] = enabled
+            user_data["disabled"] = disabled
+            tmp_path = USER_PLUGINS_JSON.with_suffix('.tmp')
+            with open(tmp_path, 'w', encoding='utf-8') as f:
+                json.dump(user_data, f, indent=2)
+            tmp_path.replace(USER_PLUGINS_JSON)
 
         # Live load/unload — no restart needed for backend plugins
         reload_required = True
@@ -209,19 +277,29 @@ async def toggle_plugin(plugin_name: str, request: Request, _=Depends(require_lo
                     if new_state:
                         with plugin_loader._lock:
                             plugin_loader._plugins[plugin_name]["enabled"] = True
+                        # Re-verify signature on toggle-on — files may have been
+                        # tampered between the original scan and now (e.g. user
+                        # disabled, edited plugin.json, re-enabled). Mirrors
+                        # the re-verify reload_plugin already does.
+                        try:
+                            from core.plugin_verify import verify_plugin
+                            from pathlib import Path as _Path
+                            plugin_path = _Path(plugin_loader._plugins[plugin_name]["path"])
+                            verified, verify_msg, verify_meta = verify_plugin(plugin_path)
+                            with plugin_loader._lock:
+                                plugin_loader._plugins[plugin_name]["verified"] = verified
+                                plugin_loader._plugins[plugin_name]["verify_msg"] = verify_msg
+                                plugin_loader._plugins[plugin_name]["verified_author"] = verify_meta.get("author")
+                        except Exception as _verr:
+                            logger.warning(f"[PLUGINS] toggle re-verify failed for {plugin_name}: {_verr}")
                         loaded = plugin_loader._load_plugin(plugin_name)
                         if not loaded:
-                            # Blocked by verification — revert enabled list
+                            # Load failed (verification/deps). Leave plugins.json
+                            # alone — user intent (enabled) survives so a fix +
+                            # restart reactivates automatically. In-memory state
+                            # reflects reality so UI shows plugin as off.
                             with plugin_loader._lock:
                                 plugin_loader._plugins[plugin_name]["enabled"] = False
-                            if plugin_name in enabled:
-                                enabled.remove(plugin_name)
-                            user_data["enabled"] = enabled
-                            tmp_path = USER_PLUGINS_JSON.with_suffix('.tmp')
-                            with open(tmp_path, 'w', encoding='utf-8') as f:
-                                json.dump(user_data, f, indent=2)
-                            tmp_path.replace(USER_PLUGINS_JSON)
-                            with plugin_loader._lock:
                                 verify_msg = plugin_loader._plugins[plugin_name].get("verify_msg", "unknown")
                             if "unsigned" in verify_msg:
                                 detail = "Unsigned plugin — enable 'Allow Unsigned Plugins' first"
@@ -436,20 +514,58 @@ async def install_plugin(
     tmp_dir = None
     try:
         # ── Download or receive zip ──
+        url_install_method = None  # 'github_url' | 'zip_url' (set below)
         if url:
             import requests as req
-            # Parse GitHub URL → zip download
-            m = re.match(r'https?://github\.com/([^/]+)/([^/]+?)(?:\.git)?/?$', url.strip())
-            if not m:
-                raise HTTPException(status_code=400, detail="Invalid GitHub URL format")
-            owner, repo = m.group(1), m.group(2)
-            zip_url = f"https://github.com/{owner}/{repo}/archive/refs/heads/main.zip"
-            r = req.get(zip_url, stream=True, timeout=30)
-            if r.status_code == 404:
-                zip_url = f"https://github.com/{owner}/{repo}/archive/refs/heads/master.zip"
-                r = req.get(zip_url, stream=True, timeout=30)
-            if r.status_code != 200:
-                raise HTTPException(status_code=400, detail=f"Failed to download from GitHub (HTTP {r.status_code})")
+            clean_url = url.strip()
+            # Direct .zip URL — undocumented fallback for plugin authors without
+            # a reachable GitHub. Downstream validation (zip structure, manifest,
+            # signing gate) catches bad content. Two guards here against SSRF:
+            # require https:// (no plain http) and reject obvious localhost
+            # variants. Doesn't catch DNS rebinding or redirect-to-localhost,
+            # but the realistic attack surface for a single-user app is small.
+            if clean_url.lower().endswith('.zip') and clean_url.startswith('https://'):
+                _lower = clean_url.lower()
+                if any(bad in _lower for bad in (
+                    '://localhost', '://127.', '://0.0.0.0', '://169.254.',
+                    '://[::1]', '://10.', '://192.168.', '://172.16.', '://172.17.',
+                    '://172.18.', '://172.19.', '://172.20.', '://172.21.',
+                    '://172.22.', '://172.23.', '://172.24.', '://172.25.',
+                    '://172.26.', '://172.27.', '://172.28.', '://172.29.',
+                    '://172.30.', '://172.31.',
+                )):
+                    raise HTTPException(status_code=400, detail="Refusing to fetch from localhost / private IP range")
+                zip_url = clean_url
+                url_install_method = 'zip_url'
+                # allow_redirects=False — a 302 from an attacker's https URL to an
+                # internal http://127.0.0.1:... would otherwise bypass the localhost
+                # and https-only SSRF guards above.
+                r = req.get(zip_url, stream=True, timeout=30, allow_redirects=False)
+                if r.status_code != 200:
+                    raise HTTPException(status_code=400, detail=f"Failed to download zip (HTTP {r.status_code})")
+            else:
+                # Parse GitHub URL → zip download
+                m = re.match(r'https?://github\.com/([^/]+)/([^/]+?)(?:\.git)?/?$', clean_url)
+                if not m:
+                    raise HTTPException(status_code=400, detail="Invalid GitHub URL format")
+                owner, repo = m.group(1), m.group(2)
+                zip_url = f"https://github.com/{owner}/{repo}/archive/refs/heads/main.zip"
+                url_install_method = 'github_url'
+                # GitHub serves the zip via 302 -> codeload.github.com; explicit allowlist.
+                r = req.get(zip_url, stream=True, timeout=30, allow_redirects=False)
+                if r.status_code in (301, 302, 303, 307, 308):
+                    loc = r.headers.get('Location', '')
+                    if loc.startswith('https://codeload.github.com/'):
+                        r = req.get(loc, stream=True, timeout=30, allow_redirects=False)
+                if r.status_code == 404:
+                    zip_url = f"https://github.com/{owner}/{repo}/archive/refs/heads/master.zip"
+                    r = req.get(zip_url, stream=True, timeout=30, allow_redirects=False)
+                    if r.status_code in (301, 302, 303, 307, 308):
+                        loc = r.headers.get('Location', '')
+                        if loc.startswith('https://codeload.github.com/'):
+                            r = req.get(loc, stream=True, timeout=30, allow_redirects=False)
+                if r.status_code != 200:
+                    raise HTTPException(status_code=400, detail=f"Failed to download from GitHub (HTTP {r.status_code})")
             content_length = int(r.headers.get("Content-Length", 0))
             if content_length > MAX_ZIP_SIZE:
                 raise HTTPException(status_code=400, detail=f"Zip too large ({content_length // 1024 // 1024}MB, max 50MB)")
@@ -585,8 +701,10 @@ async def install_plugin(
                 with plugin_loader._lock:
                     plugin_loader._plugins.pop(name, None)
 
-                # Delete old plugin dir (state preserved separately)
-                shutil.rmtree(dest)
+                # Delete old plugin dir (state preserved separately).
+                # Uses the plugin_loader helper for Windows read-only tolerance.
+                from core.plugin_loader import _rmtree_robust
+                _rmtree_robust(dest)
 
             # ── Install ──
             USER_PLUGINS_DIR.mkdir(parents=True, exist_ok=True)
@@ -597,7 +715,7 @@ async def install_plugin(
         state = plugin_loader.get_plugin_state(name)
         if url:
             state.save("installed_from", url.strip())
-            state.save("install_method", "github_url")
+            state.save("install_method", url_install_method or "github_url")
         else:
             state.save("install_method", "zip_upload")
         state.save("installed_at", datetime.utcnow().isoformat() + "Z")
@@ -874,9 +992,27 @@ async def get_plugin_settings(plugin_name: str, request: Request, _=Depends(requ
     return {"plugin": plugin_name, "settings": settings}
 
 
+_settings_locks: dict = {}
+_settings_locks_guard = threading.Lock()
+
+def _get_settings_lock(plugin_name: str) -> threading.Lock:
+    """Per-plugin file lock for atomic settings RMW. Lazy-created on first use."""
+    with _settings_locks_guard:
+        lk = _settings_locks.get(plugin_name)
+        if lk is None:
+            lk = threading.Lock()
+            _settings_locks[plugin_name] = lk
+        return lk
+
+
 @router.put("/api/webui/plugins/{plugin_name}/settings")
 async def update_plugin_settings(plugin_name: str, request: Request, _=Depends(require_login)):
-    """Update plugin settings."""
+    """Update plugin settings.
+
+    Holds a per-plugin lock across the read-merge-write so two concurrent PUTs
+    don't lose each other's keys (sibling of the MCP save-destroys-servers
+    bug). Unique tmp suffix prevents shared-.tmp truncation between writers.
+    """
     _require_known_plugin(plugin_name)
     data = await request.json()
     settings = data.get("settings", data)
@@ -889,12 +1025,34 @@ async def update_plugin_settings(plugin_name: str, request: Request, _=Depends(r
 
     USER_PLUGIN_SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
     settings_file = USER_PLUGIN_SETTINGS_DIR / f"{plugin_name}.json"
-    tmp_path = settings_file.with_suffix('.tmp')
-    with open(tmp_path, 'w', encoding='utf-8') as f:
-        json.dump(settings, f, indent=2)
-    tmp_path.replace(settings_file)
 
-    return {"status": "success", "plugin": plugin_name, "settings": settings}
+    # Shallow-merge over existing so side-channel keys (e.g. MCP's `servers`)
+    # and partial patches (e.g. email's single-field updates) don't clobber
+    # unrelated state. Full resets go through DELETE.
+    with _get_settings_lock(plugin_name):
+        existing = {}
+        if settings_file.exists():
+            try:
+                existing = json.loads(settings_file.read_text(encoding='utf-8'))
+                if not isinstance(existing, dict):
+                    existing = {}
+            except Exception:
+                existing = {}
+        merged = {**existing, **settings}
+
+        # Unique tmp suffix per call so concurrent writers can't truncate each
+        # other's tmp file before rename.
+        tmp_path = settings_file.with_suffix(f'.tmp.{os.getpid()}.{id(merged):x}')
+        try:
+            with open(tmp_path, 'w', encoding='utf-8') as f:
+                json.dump(merged, f, indent=2)
+            tmp_path.replace(settings_file)
+        finally:
+            if tmp_path.exists():
+                try: tmp_path.unlink()
+                except Exception: pass
+
+    return {"status": "success", "plugin": plugin_name, "settings": merged}
 
 
 @router.delete("/api/webui/plugins/{plugin_name}/settings")
@@ -1600,18 +1758,68 @@ async def test_ssh_connection(request: Request, _=Depends(require_login)):
 # PLUGIN ROUTE DISPATCHER
 # =============================================================================
 
+def _check_plugin_bearer(plugin_name: str, request: Request) -> bool:
+    """Check if request Authorization header has a valid bearer token registered
+    by the plugin. Plugins register bearer tokens by writing to
+    `user/plugin_state/{plugin_name}_mcp_key.json` with shape `{"key": "..."}`.
+    Used by MCP endpoints where the caller is a tool (e.g. Claude Code) with
+    its own credentials rather than a browser session. Returns False if no
+    token file, or if header doesn't match."""
+    import json
+    import secrets
+    from pathlib import Path
+    auth = request.headers.get('Authorization', '')
+    if not auth.startswith('Bearer '):
+        return False
+    token = auth[len('Bearer '):].strip()
+    if not token:
+        return False
+    project_root = Path(__file__).parent.parent.parent
+    key_file = project_root / 'user' / 'plugin_state' / f'{plugin_name}_mcp_key.json'
+    if not key_file.exists():
+        return False
+    try:
+        expected = json.loads(key_file.read_text()).get('key', '')
+    except Exception:
+        return False
+    if not expected:
+        return False
+    return secrets.compare_digest(token, expected)
+
+
 @router.api_route("/api/plugin/{plugin_name}/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
-async def plugin_route_dispatch(plugin_name: str, path: str, request: Request, _=Depends(require_login)):
+async def plugin_route_dispatch(plugin_name: str, path: str, request: Request):
     """Dispatch requests to plugin-registered HTTP routes.
 
-    Auth and CSRF are enforced by the framework — plugins cannot bypass them.
-    Routes are registered via plugin.json capabilities.routes declarations.
-    """
+    Auth: session by default (require_login). A plugin may ALSO accept bearer
+    tokens by dropping a key file at `user/plugin_state/{plugin}_mcp_key.json`.
+    If the `Authorization: Bearer ...` header matches the plugin's registered
+    key, session login is bypassed. Tools without a bearer fall through to
+    session auth as before. Plugins cannot weaken session CSRF; they can
+    only add an additional bearer-token auth path."""
     from core.plugin_loader import plugin_loader
     from core.auth import check_endpoint_rate
+    import hashlib
 
-    # Rate limit: 30 requests per 60s per session per plugin
-    check_endpoint_rate(request, f"plugin_route:{plugin_name}", max_calls=30)
+    # Bearer-token bypass for plugins that registered a key file. Falls
+    # through to require_login if no bearer or bearer invalid.
+    bearer_ok = _check_plugin_bearer(plugin_name, request)
+    if not bearer_ok:
+        await require_login(request)
+
+    # Rate limit: 30 requests per 60s. For bearer-authenticated requests,
+    # identify by hash of the bearer token instead of IP — otherwise every
+    # MCP client on localhost collapses into one bucket (initialize +
+    # tools/list + first tools/call burns 3 of the 30 at session start).
+    # Scout finding #13 — 2026-04-20.
+    identity = None
+    if bearer_ok:
+        auth = request.headers.get('Authorization', '')
+        token = auth[len('Bearer '):].strip() if auth.startswith('Bearer ') else ''
+        if token:
+            identity = f"bearer:{hashlib.sha256(token.encode()).hexdigest()[:16]}"
+    check_endpoint_rate(request, f"plugin_route:{plugin_name}", max_calls=30,
+                        identity=identity)
 
     result = plugin_loader.get_route_handler(plugin_name, request.method, path)
     if not result:

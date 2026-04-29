@@ -130,43 +130,64 @@ class SettingsManager:
             self._user = {}
     
     def _migrate_providers(self):
-        """Migrate non-core providers from LLM_PROVIDERS to LLM_CUSTOM_PROVIDERS."""
+        """Migrate non-core providers from LLM_PROVIDERS to LLM_CUSTOM_PROVIDERS.
+
+        Writes directly to the nested JSON file to ensure keys are actually removed
+        from LLM_PROVIDERS (not re-merged by save's deep-update). Only runs if
+        non-core keys are found in LLM_PROVIDERS.
+        """
         if 'LLM_PROVIDERS' not in self._user:
             return
         providers = self._user.get('LLM_PROVIDERS', {})
-        custom = self._user.get('LLM_CUSTOM_PROVIDERS', {})
+        if not isinstance(providers, dict):
+            return
 
         core_keys = {'claude', 'openai', 'gemini'}
+        non_core = [k for k in providers if k not in core_keys]
+        if not non_core:
+            return  # Nothing to migrate — skip entirely
+
+        custom = self._user.get('LLM_CUSTOM_PROVIDERS', {})
         template_map = {
             'fireworks': 'openai', 'openai': 'openai', 'claude': 'claude',
             'anthropic': 'anthropic', 'responses': 'responses',
             'gemini': 'gemini',
         }
-        migrated = False
 
-        for key in list(providers.keys()):
-            if key in core_keys:
-                continue
+        for key in non_core:
             config = providers.pop(key)
             ptype = config.get('provider', 'openai')
             config['template'] = template_map.get(ptype, 'openai')
             config.setdefault('display_name', config.get('display_name', key))
-            # Skip empty/unconfigured slots
-            if key == 'other' and not config.get('base_url'):
-                migrated = True
-                continue
-            if key == 'responses' and not config.get('base_url'):
-                migrated = True
+            if key in ('other', 'responses') and not config.get('base_url'):
                 continue
             custom[key] = config
-            migrated = True
 
-        if migrated:
-            self._user['LLM_PROVIDERS'] = providers
-            self._user['LLM_CUSTOM_PROVIDERS'] = custom
-            # Update fallback order — keep all keys
-            logger.info(f"[SETTINGS] Migrated {len(custom)} providers to LLM_CUSTOM_PROVIDERS")
-            self.save()
+        self._user['LLM_PROVIDERS'] = providers
+        self._user['LLM_CUSTOM_PROVIDERS'] = custom
+        logger.info(f"[SETTINGS] Migrated {len(non_core)} providers to LLM_CUSTOM_PROVIDERS")
+
+        # Write directly to the nested file to ensure keys are REMOVED, not re-merged.
+        # save()'s _deep_update_from_flat doesn't delete keys — it only adds/overwrites.
+        user_path = self.BASE_DIR / 'user' / 'settings.json'
+        try:
+            with open(user_path, 'r', encoding='utf-8') as f:
+                nested = json.load(f)
+            llm = nested.get('llm', {})
+            if isinstance(llm.get('LLM_PROVIDERS'), dict):
+                for k in non_core:
+                    llm['LLM_PROVIDERS'].pop(k, None)
+            llm['LLM_CUSTOM_PROVIDERS'] = custom
+            nested['llm'] = llm
+            tmp_path = user_path.with_suffix('.json.tmp')
+            with open(tmp_path, 'w', encoding='utf-8') as f:
+                json.dump(nested, f, indent=2)
+            tmp_path.replace(user_path)
+            # Update mtime immediately — no gap for file watcher
+            self._last_mtime = user_path.stat().st_mtime
+            logger.info(f"[SETTINGS] Migration persisted to disk")
+        except Exception as e:
+            logger.error(f"[SETTINGS] Failed to persist migration: {e}")
 
     def _merge_settings(self):
         """Merge defaults with user overrides, deep-merging LLM_PROVIDERS"""
@@ -407,8 +428,9 @@ class SettingsManager:
             with open(tmp_path, 'w', encoding='utf-8') as f:
                 json.dump(nested, f, indent=2)
             tmp_path.replace(user_path)
-
-            self._update_mtime()
+            # Update mtime IMMEDIATELY after rename — no gap for the file watcher
+            # to see a new mtime before _last_mtime is updated (fixes spurious reloads)
+            self._last_mtime = user_path.stat().st_mtime
             logger.info(f"Saved user settings to {user_path}")
             return True
         except Exception as e:
@@ -489,8 +511,7 @@ class SettingsManager:
                 with open(tmp_path, 'w', encoding='utf-8') as f:
                     json.dump({"_comment": "Your custom settings - edit freely or use web UI"}, f, indent=2)
                 tmp_path.replace(user_path)
-                
-                self._update_mtime()
+                self._last_mtime = user_path.stat().st_mtime
                 logger.info("Settings reset to defaults")
                 return True
             except Exception as e:
@@ -657,26 +678,32 @@ class SettingsManager:
         """Background thread that watches for file changes"""
         user_path = self.BASE_DIR / 'user' / 'settings.json'
         logger.info("File watcher started")
-        
+
         while self._watcher_running:
             try:
                 time.sleep(2)  # Poll every 2 seconds
-                
+
                 if not user_path.exists():
                     continue
-                
+
                 current_mtime = user_path.stat().st_mtime
-                
-                # Check if file was modified
+
+                # Check if file was modified externally (not by our own save/migration)
                 if self._last_mtime is not None and current_mtime != self._last_mtime:
                     # Debounce: wait 0.5s to ensure file write is complete
                     now = time.time()
                     if now - self._last_check < 0.5:
                         continue
-                    
+
                     self._last_check = now
                     time.sleep(0.5)
-                    
+
+                    # Re-check mtime after debounce — our own save() may have
+                    # updated _last_mtime during the sleep, meaning WE wrote
+                    # the file, not an external editor.
+                    if user_path.stat().st_mtime == self._last_mtime:
+                        continue
+
                     # Reload settings
                     logger.info("Detected settings file change, reloading...")
                     self.reload()
@@ -759,7 +786,7 @@ class SettingsManager:
                 with open(tmp_path, 'w', encoding='utf-8') as f:
                     json.dump(nested, f, indent=2)
                 tmp_path.replace(user_path)
-                self._update_mtime()
+                self._last_mtime = user_path.stat().st_mtime
                 logger.debug(f"Removed '{key}' from settings file")
         except Exception as e:
             logger.error(f"Failed to remove key from file: {e}")

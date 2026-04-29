@@ -160,13 +160,26 @@ class ToolCallingEngine:
         
         elapsed = time.time() - start_time
         
-        # Log performance
+        # Log performance + diagnostic trinity (finish_reason, reasoning tokens).
+        # Without these, "short response + fast t/s" is ambiguous — could be
+        # the model legitimately stopping, could be hitting max_tokens, could
+        # be reasoning tokens eating budget invisibly. 2026-04-24.
         try:
-            if response.usage and response.usage.get('completion_tokens'):
-                tps = response.usage['completion_tokens'] / elapsed
-                logger.info(f"LLM ({provider.model}): {elapsed:.2f}s, {len(str(response.content))} chars, {tps:.1f} t/s")
+            usage = response.usage or {}
+            finish = getattr(response, 'finish_reason', None) or '?'
+            reasoning_tok = usage.get('reasoning_tokens', 0)
+            content_chars = len(str(response.content)) if response.content else 0
+            if usage.get('completion_tokens'):
+                tps = usage['completion_tokens'] / elapsed
+                logger.info(
+                    f"LLM ({provider.model}): {elapsed:.2f}s, {content_chars} chars, "
+                    f"{tps:.1f} t/s, finish={finish}, reasoning_tok={reasoning_tok}"
+                )
             else:
-                logger.info(f"LLM ({provider.model}): {elapsed:.2f}s, {len(str(response.content))} chars")
+                logger.info(
+                    f"LLM ({provider.model}): {elapsed:.2f}s, {content_chars} chars, "
+                    f"finish={finish}"
+                )
         except (AttributeError, ZeroDivisionError, TypeError):
             pass
         
@@ -332,12 +345,21 @@ class ToolCallingEngine:
         function_name = function_call_data["function_call"]["name"]
         function_args = function_call_data["function_call"]["arguments"]
 
+        # Some text-based-tool-call providers deliver `arguments` as an already-
+        # JSON-encoded string; others as a dict. json.dumps on a string would
+        # double-encode (writes `"\"{...}\""` to history), bricking the chat
+        # for strict providers on the next turn. Honor whatever the LLM gave us.
+        if isinstance(function_args, str):
+            args_json = function_args
+        else:
+            args_json = json.dumps(function_args)
+
         tool_calls_formatted = [{
             "id": tool_call_id,
             "type": "function",
             "function": {
                 "name": function_name,
-                "arguments": json.dumps(function_args)
+                "arguments": args_json
             }
         }]
         

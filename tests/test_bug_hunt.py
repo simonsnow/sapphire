@@ -447,17 +447,17 @@ class TestScopeSnapshot:
     """Scope snapshots must capture all scope types."""
 
     def test_snapshot_captures_all_scopes(self):
-        """snapshot_scopes should include all 8 scope types."""
+        """snapshot_scopes should include all scope types (11 in current registry)."""
         from core.chat.function_manager import FunctionManager
 
         with patch.object(FunctionManager, '__init__', lambda self: None):
             mgr = FunctionManager()
-            mgr.set_memory_scope("mem_scope")
-            mgr.set_goal_scope("goal_scope")
-            mgr.set_knowledge_scope("know_scope")
-            mgr.set_people_scope("ppl_scope")
-            mgr.set_email_scope("email_scope")
-            mgr.set_bitcoin_scope("btc_scope")
+            mgr.set_scope('memory', "mem_scope")
+            mgr.set_scope('goal', "goal_scope")
+            mgr.set_scope('knowledge', "know_scope")
+            mgr.set_scope('people', "ppl_scope")
+            mgr.set_scope('email', "email_scope")
+            mgr.set_scope('bitcoin', "btc_scope")
             mgr.set_private_chat(True)
             mgr.set_rag_scope("rag_scope")
 
@@ -480,15 +480,15 @@ class TestScopeSnapshot:
 
         with patch.object(FunctionManager, '__init__', lambda self: None):
             mgr = FunctionManager()
-            mgr.set_memory_scope("test_mem")
-            mgr.set_email_scope("test_email")
+            mgr.set_scope('memory', "test_mem")
+            mgr.set_scope('email', "test_email")
             mgr.set_private_chat(True)
 
             snap = mgr.snapshot_scopes()
 
             # Clear scopes
-            mgr.set_memory_scope(None)
-            mgr.set_email_scope(None)
+            mgr.set_scope('memory', None)
+            mgr.set_scope('email', None)
             mgr.set_private_chat(False)
 
             assert scope_memory.get() is None
@@ -524,8 +524,6 @@ class TestChatReadsAllScopes:
             mgr.current_toolset_name = "none"
             mgr.function_modules = {}
             mgr.all_possible_tools = []
-            mgr._story_engine = None
-            mgr._story_engine_enabled = False
 
         # Track apply_scopes and set_rag_scope calls
         apply_calls = []
@@ -560,7 +558,6 @@ class TestChatReadsAllScopes:
             chat_obj.session_manager = mock_session
             chat_obj.history = mock_session
             chat_obj.current_system_prompt = "test prompt"
-            chat_obj._update_story_engine = MagicMock()
             chat_obj._use_new_config = False
             chat_obj.provider_primary = MagicMock()
             chat_obj.provider_primary.health_check.return_value = True
@@ -608,7 +605,6 @@ class TestChatReadsAllScopes:
         mock_main_chat.function_manager = mock_fm
         mock_main_chat.session_manager.get_chat_settings.return_value = chat_settings
         mock_main_chat.session_manager.get_active_chat_name.return_value = "stream_chat"
-        mock_main_chat._update_story_engine = MagicMock()
         mock_main_chat._build_base_messages.return_value = [
             {"role": "system", "content": "sys"},
             {"role": "user", "content": "hi"},
@@ -885,13 +881,11 @@ class TestResetClearsScopes:
         with patch.object(FunctionManager, '__init__', lambda self: None):
             mgr = FunctionManager()
             mgr._tools_lock = threading.Lock()
-            mgr._story_engine = None
-            mgr._story_engine_enabled = False
 
         # Set non-default scopes
-        mgr.set_memory_scope("private")
-        mgr.set_email_scope("work")
-        mgr.set_bitcoin_scope("wallet_a")
+        mgr.set_scope('memory', "private")
+        mgr.set_scope('email', "work")
+        mgr.set_scope('bitcoin', "wallet_a")
         mgr.set_private_chat(True)
 
         with patch.object(LLMChat, '__init__', lambda self: None):
@@ -906,56 +900,6 @@ class TestResetClearsScopes:
         assert scope_email.get() == "default"
         assert scope_bitcoin.get() == "default"
         assert scope_private.get() is False
-
-    def test_reset_clears_story_engine(self):
-        """reset() should clear the story engine."""
-        from core.chat.chat import LLMChat
-        from core.chat.function_manager import FunctionManager
-
-        with patch.object(FunctionManager, '__init__', lambda self: None):
-            mgr = FunctionManager()
-            mgr._tools_lock = threading.Lock()
-            mgr._story_engine = MagicMock()  # Simulate active story engine
-            mgr._story_engine_enabled = True
-
-        with patch.object(LLMChat, '__init__', lambda self: None):
-            chat_obj = LLMChat()
-            chat_obj.function_manager = mgr
-            chat_obj.session_manager = MagicMock()
-
-            chat_obj.reset()
-
-        assert mgr._story_engine is None
-
-
-# =============================================================================
-# M6: switch_chat must clear stale story engine
-# =============================================================================
-
-class TestSwitchChatClearsStoryEngine:
-    """switch_chat must clear story engine so stale state doesn't persist."""
-
-    def test_switch_chat_clears_story_engine(self):
-        """After switch_chat(), story engine should be None."""
-        from core.chat.chat import LLMChat
-        from core.chat.function_manager import FunctionManager
-
-        with patch.object(FunctionManager, '__init__', lambda self: None):
-            mgr = FunctionManager()
-            mgr._tools_lock = threading.Lock()
-            mgr._story_engine = MagicMock()  # Active story engine
-            mgr._story_engine_enabled = True
-
-        with patch.object(LLMChat, '__init__', lambda self: None):
-            chat_obj = LLMChat()
-            chat_obj.function_manager = mgr
-            chat_obj.session_manager = MagicMock()
-            chat_obj.session_manager.set_active_chat.return_value = True
-
-            chat_obj.switch_chat("other_chat")
-
-        assert mgr._story_engine is None
-
 
 # =============================================================================
 # SSH tool: no shell=True (command injection fix)

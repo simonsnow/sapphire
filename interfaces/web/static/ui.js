@@ -416,10 +416,21 @@ export const startTool = (toolId, toolName, args) => {
     Streaming.startTool(toolId, toolName, args, scrollToBottomIfSticky);
 };
 
-// Tool names that affect scope counts
-const GOAL_TOOLS = ['create_goal', 'update_goal', 'delete_goal'];
-const MEMORY_TOOLS = ['save_memory', 'delete_memory'];
-const KNOWLEDGE_TOOLS = ['save_person', 'save_knowledge'];
+// Map of tool name → scope keys the tool writes into. Multiple scopes possible
+// (e.g. save_person affects both knowledge and people dropdowns). When a tool
+// completes, every affected scope's sidebar dropdown gets its counts refreshed.
+// The endpoint for each refresh comes from /api/init scope_declarations, so
+// adding a new plugin scope is zero-touch on the refresh side — only this map
+// needs to know which tools affect which scopes.
+const TOOL_SCOPE_MAP = {
+    'create_goal':    ['goal'],
+    'update_goal':    ['goal'],
+    'delete_goal':    ['goal'],
+    'save_memory':    ['memory'],
+    'delete_memory':  ['memory'],
+    'save_knowledge': ['knowledge'],
+    'save_person':    ['knowledge', 'people'],
+};
 
 const refreshScopeCounts = async (selectId, apiPath) => {
     try {
@@ -436,14 +447,24 @@ const refreshScopeCounts = async (selectId, apiPath) => {
     } catch (e) { /* silent */ }
 };
 
+// Dynamic refresh dispatcher — looks up scope endpoint from /api/init declarations
+// cached by shared/init-data.js (populated on first loadSidebar).
+const refreshScopesForTool = (toolName) => {
+    const scopeKeys = TOOL_SCOPE_MAP[toolName];
+    if (!scopeKeys) return;
+    // Deferred import to avoid circular dependency at module load time
+    import('./shared/init-data.js').then(({ getInitDataSync }) => {
+        const declarations = getInitDataSync()?.scope_declarations || [];
+        for (const key of scopeKeys) {
+            const decl = declarations.find(d => d.key === key);
+            if (decl) refreshScopeCounts(`#sb-${key}-scope`, decl.endpoint);
+        }
+    }).catch(() => { /* silent */ });
+};
+
 export const endTool = (toolId, toolName, result, isError) => {
     Streaming.endTool(toolId, toolName, result, isError, scrollToBottomIfSticky);
-    if (!isError) {
-        if (GOAL_TOOLS.includes(toolName)) refreshScopeCounts('#sb-goal-scope', '/api/goals/scopes');
-        if (MEMORY_TOOLS.includes(toolName)) refreshScopeCounts('#sb-memory-scope', '/api/memory/scopes');
-        if (KNOWLEDGE_TOOLS.includes(toolName)) refreshScopeCounts('#sb-knowledge-scope', '/api/knowledge/scopes');
-        if (toolName === 'save_person') refreshScopeCounts('#sb-people-scope', '/api/knowledge/people/scopes');
-    }
+    if (!isError) refreshScopesForTool(toolName);
 };
 
 export const finishStreaming = async (ephemeral = false) => {
@@ -510,9 +531,9 @@ export const hasVisibleContent = () => {
 // CHAT MANAGEMENT
 // =============================================================================
 
-export const renderChatDropdown = (chats, activeChat, storyChats = [], privateChats = []) => {
+export const renderChatDropdown = (chats, activeChat, _legacyStoryChats = [], privateChats = []) => {
     // Combine all chats for the hidden select (needs all chats for switching)
-    const allChats = [...chats, ...privateChats, ...storyChats];
+    const allChats = [...chats, ...privateChats];
 
     // Update hidden select (state holder used throughout the app)
     const select = document.getElementById('chat-select');
@@ -527,7 +548,7 @@ export const renderChatDropdown = (chats, activeChat, storyChats = [], privateCh
         });
     }
 
-    // Build picker items — regular chats, then private, then story
+    // Build picker items — regular chats, then private
     let itemsHtml = chats.map(c => `
         <button class="chat-picker-item ${c.name === activeChat ? 'active' : ''}"
                 data-chat="${c.name}">
@@ -547,23 +568,11 @@ export const renderChatDropdown = (chats, activeChat, storyChats = [], privateCh
         `).join('');
     }
 
-    if (storyChats.length > 0) {
-        itemsHtml += '<div class="chat-picker-divider"></div>';
-        itemsHtml += storyChats.map(c => `
-            <button class="chat-picker-item chat-picker-story ${c.name === activeChat ? 'active' : ''}"
-                    data-chat="${c.name}">
-                <span class="chat-picker-item-check">${c.name === activeChat ? '\u2713' : ''}</span>
-                <span class="chat-picker-item-name">${escapeHtml(c.display_name)}</span>
-            </button>
-        `).join('');
-    }
-
     // Action buttons at the bottom
     itemsHtml += '<div class="chat-picker-divider"></div>';
     if (!window.__managed) {
         itemsHtml += '<button class="chat-picker-story-btn" data-action="new-private">&#x1F512; New Private...</button>';
     }
-    itemsHtml += '<button class="chat-picker-story-btn" data-action="new-story">&#x1F4D6; New Story...</button>';
 
     // Update sidebar chat picker dropdown
     const sbDropdown = document.getElementById('sb-chat-picker-dropdown');

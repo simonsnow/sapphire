@@ -314,11 +314,6 @@ class ContinuityScheduler:
             "voice": data.get("voice", ""),
             "pitch": data.get("pitch", None),
             "speed": data.get("speed", None),
-            "memory_scope": data.get("memory_scope", "none"),
-            "knowledge_scope": data.get("knowledge_scope", "none"),
-            "people_scope": data.get("people_scope", "none"),
-            "goal_scope": data.get("goal_scope", "none"),
-            "email_scope": data.get("email_scope", "default"),
             "heartbeat": data.get("heartbeat", False),
             "emoji": data.get("emoji", ""),
             "context_limit": data.get("context_limit", 0),
@@ -336,7 +331,13 @@ class ContinuityScheduler:
             "last_response": None,
             "created": _user_now().isoformat()
         }
-        
+
+        # Dynamically include all scope keys from SCOPE_REGISTRY so plugin scopes
+        # propagate without code changes. Default 'none' for new tasks (disabled by default).
+        from core.chat.function_manager import scope_setting_keys
+        for setting_key in scope_setting_keys():
+            task[setting_key] = data.get(setting_key, "none")
+
         # Auto-generate webhook secret if not provided
         if task_type == "webhook":
             tc = task.get("trigger_config", {})
@@ -373,18 +374,20 @@ class ContinuityScheduler:
                 except Exception as e:
                     raise ValueError(f"Invalid cron schedule: {e}")
             
-            # Update allowed fields
+            # Update allowed fields. Scope keys are pulled dynamically from SCOPE_REGISTRY
+            # so new plugin scopes can be updated on tasks without touching this set.
+            from core.chat.function_manager import scope_setting_keys
             allowed = {
                 "name", "type", "enabled", "schedule", "trigger_config", "chance",
                 "provider", "model", "prompt", "toolset", "chat_target",
                 "initial_message", "tts_enabled", "browser_tts", "inject_datetime",
                 "persona", "voice", "pitch", "speed",
-                "memory_scope", "knowledge_scope", "people_scope", "goal_scope", "email_scope",
                 "heartbeat", "emoji",
                 "context_limit", "max_parallel_tools", "max_tool_rounds",
                 "active_hours_start", "active_hours_end",
                 "max_runs", "delete_after_run"
             }
+            allowed.update(scope_setting_keys())
             for key in allowed:
                 if key in data:
                     task[key] = data[key]
@@ -444,7 +447,12 @@ class ContinuityScheduler:
             
             return matched
         except Exception as e:
-            logger.error(f"[Continuity] Cron check failed for '{cron_expr}': {e}")
+            # "failed to find next date" is expected for daemon/webhook tasks that use
+            # impossible schedules like "0 0 31 2 *" (Feb 31) to prevent cron firing.
+            if 'next date' in str(e).lower() or 'next due' in str(e).lower():
+                logger.debug(f"[Continuity] Cron '{cron_expr}' has no next date (expected for daemon/webhook tasks)")
+            else:
+                logger.error(f"[Continuity] Cron check failed for '{cron_expr}': {e}")
             return False
     
     def _make_progress_callback(self, task_id: str):
@@ -607,7 +615,13 @@ class ContinuityScheduler:
                     continue
                 self._task_running[task_id] = True
 
-            # Run on a separate thread so different tasks can run concurrently
+            # Run on a separate thread so different tasks can run concurrently.
+            # LOAD-BEARING: fresh threading.Thread per task is required for scope
+            # isolation. ExecutionContext._build_scopes() mutates ContextVars on
+            # this thread; a threadpool/reused-worker model would leak scope state
+            # from the previous task's scope_memory/scope_rag/etc. If you refactor
+            # this to a pool, you MUST wrap execution in copy_context().run() or
+            # save/reset tokens per-task. See witch hunt 2026-04-17.
             logger.info(f"[Continuity] Triggering task: {task_name}")
             thread = threading.Thread(
                 target=self._execute_task, args=(task,),
@@ -620,7 +634,16 @@ class ContinuityScheduler:
     # =========================================================================
     
     def run_task_now(self, task_id: str) -> Dict[str, Any]:
-        """Manually trigger a task immediately (for testing). Runs synchronously."""
+        """Manually trigger a task immediately (for testing). Runs synchronously.
+
+        Note on concurrent-scope safety: this runs the task on the caller's
+        thread, potentially interleaving with the active chat. Scope bleed is
+        prevented by `ExecutionContext.__enter__` (core/continuity/execution_context.py)
+        which calls `reset_scopes()` at entry — the task always starts with a
+        clean scope slate, never inheriting from whatever request triggered
+        the manual run. Scout-4 "Race #5" (2026-04-19) is architecturally
+        neutralized there; do not re-hunt without checking ExecutionContext.
+        """
         with self._lock:
             task = self._tasks.get(task_id)
 
@@ -760,7 +783,7 @@ class ContinuityScheduler:
 
         # Build response callback — saves last_response + routes reply to daemon source
         internal_cb = self._make_response_callback(task_id)
-        def _make_reply_cb(cur_event_data, cur_reply_callback):
+        def _make_reply_cb(cur_task, cur_event_data, cur_reply_callback):
             def _response_callback(response_text: str):
                 internal_cb(response_text)
                 if cur_reply_callback and response_text:
@@ -769,7 +792,7 @@ class ContinuityScheduler:
                     except (json.JSONDecodeError, TypeError):
                         event_dict = {"raw": cur_event_data}
                     try:
-                        cur_reply_callback(task, event_dict, response_text)
+                        cur_reply_callback(cur_task, event_dict, response_text)
                     except Exception as e:
                         logger.error(f"[Continuity] Reply callback failed for '{task_name}': {e}")
             return _response_callback
@@ -780,7 +803,13 @@ class ContinuityScheduler:
         def _run():
             nonlocal cur_event_data, cur_reply_callback
             while True:
-                # Check task still exists and is enabled
+                # Re-fetch live task per iteration. The outer `task` is a
+                # snapshot from the moment this event fired; if the user
+                # edits the task config, swaps prompt/toolset, or the plugin
+                # reloads between queue-drain iterations, we'd keep running
+                # the stale snapshot forever. Also used for the reply
+                # callback so replies carry the task state as of THIS
+                # iteration (not spawn-time).
                 with self._lock:
                     live_task = self._tasks.get(task_id)
                     if not live_task or not live_task.get("enabled", True):
@@ -788,14 +817,15 @@ class ContinuityScheduler:
                         self._task_running[task_id] = False
                         self._task_progress.pop(task_id, None)
                         break
+                    active_task = dict(live_task)
 
                 self._log_activity(task_id, task_name, "started", {"trigger": task_type})
                 try:
                     result = self.executor.run(
-                        task,
+                        active_task,
                         event_data=cur_event_data,
                         progress_callback=self._make_progress_callback(task_id),
-                        response_callback=_make_reply_cb(cur_event_data, cur_reply_callback),
+                        response_callback=_make_reply_cb(active_task, cur_event_data, cur_reply_callback),
                     )
                     with self._lock:
                         if task_id in self._tasks:

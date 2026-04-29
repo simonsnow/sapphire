@@ -152,11 +152,11 @@
             <div class="form-group">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                 <label for="password">Password</label>
-                <input type="password" id="password" name="password" required autofocus minlength="6">
+                <input type="password" id="password" name="password" required autofocus minlength="10">
             </div>
             <div class="form-group">
                 <label for="confirm">Confirm Password</label>
-                <input type="password" id="confirm" name="confirm" required minlength="6">
+                <input type="password" id="confirm" name="confirm" required minlength="10">
             </div>
             <button type="submit">Create Password</button>
         </form>
@@ -170,7 +170,7 @@
             const errorDiv = document.getElementById('error-message');
             const messages = {
                 'empty': 'Please enter a password',
-                'short': 'Password must be at least 6 characters',
+                'short': 'Password must be at least 10 characters',
                 'mismatch': 'Passwords do not match',
                 'failed': 'Failed to save password. Check server logs.'
             };
@@ -184,9 +184,9 @@
             const confirm = document.getElementById('confirm').value;
             const errorDiv = document.getElementById('error-message');
             
-            if (password.length < 6) {
+            if (password.length < 10) {
                 e.preventDefault();
-                errorDiv.textContent = 'Password must be at least 6 characters';
+                errorDiv.textContent = 'Password must be at least 10 characters';
                 errorDiv.classList.add('show');
                 return;
             }

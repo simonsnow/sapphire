@@ -213,6 +213,11 @@ class Events:
     SPICE_CHANGED = "spice_changed"
     SETTINGS_CHANGED = "settings_changed"
     CHAT_SETTINGS_CHANGED = "chat_settings_changed"
+    # Scope CRUD — fired when memory/knowledge/goal/people scopes are created or
+    # deleted, so the chat sidebar can refresh its dropdowns without a page
+    # reload. Payload: {kind: "memory"|"knowledge"|"goal"|"people", action:
+    # "created"|"deleted", name: "<scope_name>"}.
+    SCOPE_CHANGED = "scope_changed"
     
     # Context threshold events
     CONTEXT_WARNING = "context_warning"    # 80% threshold
@@ -240,6 +245,23 @@ class Events:
     # Daemon/webhook events
     DAEMON_EVENT = "daemon_event"
     WEBHOOK_FIRED = "webhook_fired"
+
+    # Mind-data changed events — fired when the AI writes to memory/goal/
+    # knowledge/people stores so the Mind view can live-refresh instead of
+    # showing stale content after a save. Payload: {domain, scope, action}
+    # where domain in {memory, goal, knowledge, people}, action in
+    # {save, update, delete}. Without this event the user sees "done"
+    # from Sapphire but their Mind tab doesn't update — can't tell the
+    # difference between "tool silently failed" and "tool worked, view
+    # stale." AIX-class bug. (Added 2026-04-19 after Scout 3 dispatch.)
+    MIND_CHANGED = "mind_changed"
+
+    # Re-embed pipeline progress — fired by the background worker as it
+    # walks memories/knowledge_entries/people, re-generating vectors under
+    # the current provider. Payload is the full status snapshot (running,
+    # total, done, current_table, errors, etc). Settings UI uses this to
+    # show a live progress bar without polling.
+    REEMBED_PROGRESS = "reembed_progress"
 
     # Agent events
     AGENT_SPAWNED = "agent_spawned"

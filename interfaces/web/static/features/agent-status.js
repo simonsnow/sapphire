@@ -6,8 +6,10 @@ let bar = null;
 let pollTimer = null;
 let initialized = false;
 let agents = new Map(); // id -> {name, status, mission, chat_name}
-let pendingAgentReport = null;
-let pendingAgentChat = null;
+// pendingReports keyed by chat_name so concurrent batches in different chats
+// don't clobber each other. Each chat's report stays queued independently
+// until that chat is the active one and Sapphire is idle (drainAgentReport).
+const pendingReports = new Map();   // chat_name -> report text
 let draining = false;
 let workspaces = new Map(); // project -> {type, url, running}
 
@@ -15,6 +17,7 @@ const STATUS_COLORS = {
     running: '#f0ad4e',
     pending: '#f0ad4e',
     done: '#5cb85c',
+    degraded: '#e6c229',   // amber — technically completed but output is a placeholder
     failed: '#d9534f',
     cancelled: '#888',
 };
@@ -82,9 +85,15 @@ function renderPills() {
             bar.appendChild(pill);
         }
 
-        pill.dataset.status = agent.status;
-        pill.style.borderColor = STATUS_COLORS[agent.status] || '#888';
-        pill.title = `${agent.name}: ${agent.mission || ''}\nStatus: ${agent.status}`;
+        // If the agent carries a warning (tool-loop exhaustion, context overflow,
+        // empty LLM), render it as 'degraded' — amber, not green. Prevents the
+        // user from trusting a no-op run as success. Scout #15 — 2026-04-20.
+        const effectiveStatus = (agent.status === 'done' && agent.warning)
+            ? 'degraded' : agent.status;
+        pill.dataset.status = effectiveStatus;
+        pill.style.borderColor = STATUS_COLORS[effectiveStatus] || '#888';
+        const warnTip = agent.warning ? `\nWarning: ${agent.warning}` : '';
+        pill.title = `${agent.name}: ${agent.mission || ''}\nStatus: ${effectiveStatus}${warnTip}`;
     }
 
     for (const pill of bar.querySelectorAll('.agent-pill')) {
@@ -221,12 +230,13 @@ function stopPolling() {
 }
 
 async function drainAgentReport() {
-    if (!pendingAgentReport || draining) return;
+    if (pendingReports.size === 0 || draining) return;
     draining = true;
     try {
         const activeChat = getActiveChat();
-        if (pendingAgentChat && pendingAgentChat !== activeChat) {
-            console.log('[Agents] Wrong chat — report is for', pendingAgentChat, 'but active is', activeChat, '— holding');
+        if (!pendingReports.has(activeChat)) {
+            // No report queued for the chat we're currently in. Reports for
+            // other chats stay queued until those chats are activated.
             return;
         }
         const { getIsProc } = await import('../core/state.js');
@@ -234,9 +244,9 @@ async function drainAgentReport() {
             console.log('[Agents] Still processing, will retry on ai_typing_end');
             return;
         }
-        if (!pendingAgentReport) return; // re-check after awaits
-        const report = pendingAgentReport;
-        console.log('[Agents] Sending auto-return report to chat');
+        if (!pendingReports.has(activeChat)) return; // re-check after awaits
+        const report = pendingReports.get(activeChat);
+        console.log('[Agents] Sending auto-return report to chat', activeChat);
 
         // Preserve user's in-progress typing
         const { getElements } = await import('../core/state.js');
@@ -244,11 +254,17 @@ async function drainAgentReport() {
         const savedText = input?.value || '';
 
         const { triggerSendWithText } = await import('../handlers/send-handlers.js');
-        await triggerSendWithText(report);
+        const sent = await triggerSendWithText(report);
+        if (!sent) {
+            // triggerSendWithText silently no-ops when a stream started during
+            // our await chain. Don't clear pending — let ai_typing_end / safety
+            // net / chat-switch handlers retry the drain.
+            console.log('[Agents] triggerSendWithText no-oped (Sapphire streaming) — keeping report queued for retry');
+            return;
+        }
 
-        // Only clear after successful send
-        pendingAgentReport = null;
-        pendingAgentChat = null;
+        // Only clear THIS chat's entry — other chats' reports stay queued
+        pendingReports.delete(activeChat);
 
         // Restore what the user was typing
         if (savedText && input) {
@@ -257,7 +273,7 @@ async function drainAgentReport() {
         }
     } catch (err) {
         console.error('[Agents] Auto-return failed:', err);
-        // Don't clear pendingAgentReport — will retry on next trigger
+        // Don't clear pendingReports — will retry on next trigger
     } finally {
         draining = false;
     }
@@ -272,6 +288,20 @@ export function initAgentStatus() {
     initialized = true;
 
     ensureBar();
+
+    // Same-client chat switch fires a DOM 'chat-activated' event on #chat-select.
+    // The event bus's CHAT_SWITCHED SSE event drops self-originated messages
+    // (intentional — prevents echo) so we'd miss our own chat switch without
+    // this listener. Re-poll + re-render so Chat B's agent pills show up
+    // immediately instead of waiting up to 3s for the next poll tick.
+    const chatSelect = document.getElementById('chat-select');
+    if (chatSelect) {
+        chatSelect.addEventListener('chat-activated', () => {
+            poll();
+            renderPills();
+            if (pendingReports.size > 0) setTimeout(() => drainAgentReport(), 500);
+        });
+    }
 
     eventBus.on('agent_spawned', (data) => {
         agents.set(data.id, {
@@ -289,6 +319,9 @@ export function initAgentStatus() {
         const agent = agents.get(data.id);
         if (agent) {
             agent.status = data.status || 'done';
+            // Warning field = degradation reason (tool-loop exhaustion, overflow,
+            // empty LLM). Stored so the pill can render amber instead of green.
+            agent.warning = data.warning || null;
             renderPills();
         }
     });
@@ -300,9 +333,11 @@ export function initAgentStatus() {
 
     eventBus.on('agent_batch_complete', (data) => {
         console.log('[Agents] Batch complete event received:', data.chat_name, 'agents:', data.agent_count);
-        pendingAgentReport = data.report;
-        pendingAgentChat = data.chat_name;
-        setTimeout(() => drainAgentReport(), 1500);
+        if (data.chat_name) {
+            // Keyed by chat — concurrent batches in different chats coexist.
+            pendingReports.set(data.chat_name, data.report);
+            setTimeout(() => drainAgentReport(), 1500);
+        }
     });
 
     // Workspace ready — show run/open button
@@ -318,14 +353,14 @@ export function initAgentStatus() {
     });
 
     eventBus.on('ai_typing_end', () => {
-        if (!pendingAgentReport) return;
+        if (pendingReports.size === 0) return;
         console.log('[Agents] ai_typing_end — draining queued report');
         setTimeout(() => drainAgentReport(), 800);
     });
 
     eventBus.on(eventBus.Events.CHAT_SWITCHED, () => {
         renderPills();
-        if (!pendingAgentReport) return;
+        if (pendingReports.size === 0) return;
         console.log('[Agents] Chat switched — checking if report can drain');
         setTimeout(() => drainAgentReport(), 500);
     });
@@ -340,7 +375,7 @@ export function initAgentStatus() {
 
     // Safety net: periodically retry stuck reports (e.g. user never returns to agent's chat)
     setInterval(() => {
-        if (!pendingAgentReport) return;
+        if (pendingReports.size === 0) return;
         drainAgentReport();
     }, 15000);
 

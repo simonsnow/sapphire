@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import shutil
+import stat
 import threading
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Callable, Tuple
@@ -16,6 +17,24 @@ from core.hooks import hook_runner
 from core.plugin_verify import verify_plugin
 
 logger = logging.getLogger(__name__)
+
+
+def _rmtree_robust(path):
+    """shutil.rmtree that survives Windows read-only files.
+
+    Plain `shutil.rmtree` crashes on Windows the first time it hits a
+    read-only file (.pyc, git-set permissions, AV-locked caches). The
+    onerror handler clears the read-only bit and retries the single
+    delete — if that still fails, we swallow the exception so a broken
+    file doesn't abort the whole uninstall and leave a half-deleted tree.
+    """
+    def _on_error(func, p, exc_info):
+        try:
+            os.chmod(p, stat.S_IWRITE)
+            func(p)
+        except Exception as e:
+            logger.warning(f"[PLUGINS] rmtree could not remove {p}: {e}")
+    shutil.rmtree(path, onerror=_on_error)
 
 # Plugin search paths (relative to project root)
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -46,14 +65,41 @@ class PluginState:
             try:
                 return json.loads(self._path.read_text(encoding="utf-8"))
             except Exception as e:
-                logger.warning(f"[PLUGIN-STATE] Failed to load {self._path}: {e}")
+                # Quarantine the corrupted file before returning empty dict —
+                # otherwise the next save() silently overwrites whatever was
+                # salvageable (often the only copy of plugin auth/state).
+                from datetime import datetime
+                quarantine = self._path.with_suffix(
+                    f'.json.bad-{datetime.utcnow().strftime("%Y%m%dT%H%M%S")}'
+                )
+                try:
+                    self._path.rename(quarantine)
+                    logger.error(
+                        f"[PLUGIN-STATE] Corrupted state file for '{self._name}': {e}. "
+                        f"Quarantined to {quarantine.name}; starting with empty state."
+                    )
+                except Exception as rename_err:
+                    logger.error(
+                        f"[PLUGIN-STATE] Corrupted {self._path}: {e}. "
+                        f"Could not quarantine ({rename_err}); next save will overwrite."
+                    )
         return {}
 
     def _save(self):
         PLUGIN_STATE_DIR.mkdir(parents=True, exist_ok=True)
-        tmp = self._path.with_suffix('.json.tmp')
-        tmp.write_text(json.dumps(self._data, indent=2), encoding="utf-8")
-        tmp.replace(self._path)
+        # Unique tmp suffix per-process so concurrent writers can't truncate
+        # each other's tmp file before rename. Lock ordering still matters
+        # for content correctness (use update_with_lock for RMW), but this
+        # ensures the on-disk tmp never collides.
+        import os as _os
+        tmp = self._path.with_suffix(f'.json.tmp.{_os.getpid()}.{id(self):x}')
+        try:
+            tmp.write_text(json.dumps(self._data, indent=2), encoding="utf-8")
+            tmp.replace(self._path)
+        finally:
+            if tmp.exists():
+                try: tmp.unlink()
+                except Exception: pass
 
     def get(self, key: str, default=None):
         with self._lock:
@@ -77,6 +123,23 @@ class PluginState:
         with self._lock:
             self._data = {}
             self._save()
+
+    def update_with_lock(self, key: str, mutator, default=None):
+        """Atomic read-modify-write for a single key.
+
+        mutator(current_value) -> new_value, called under self._lock so two
+        concurrent updates can't clobber each other (the bug family that hit
+        MCP, discord, telegram — read the dict, mutate, save, second writer
+        loses the first writer's change).
+
+        Returns the new value.
+        """
+        with self._lock:
+            current = self._data.get(key, default)
+            new_value = mutator(current)
+            self._data[key] = new_value
+            self._save()
+            return new_value
 
 
 class PluginLoader:
@@ -115,12 +178,13 @@ class PluginLoader:
         self._function_manager = function_manager
         self._plugins.clear()
         enabled_list = self._get_enabled_list()
+        disabled_list = self._get_disabled_list()
 
         # System plugins (priority band 0-99)
-        self._scan_dir(SYSTEM_PLUGINS_DIR, band="system", enabled_list=enabled_list)
+        self._scan_dir(SYSTEM_PLUGINS_DIR, band="system", enabled_list=enabled_list, disabled_list=disabled_list)
 
         # User plugins (priority band 100-199)
-        self._scan_dir(USER_PLUGINS_DIR, band="user", enabled_list=enabled_list)
+        self._scan_dir(USER_PLUGINS_DIR, band="user", enabled_list=enabled_list, disabled_list=disabled_list)
 
         # Load enabled plugins
         loaded = 0
@@ -130,21 +194,26 @@ class PluginLoader:
                 if self._load_plugin(name):
                     loaded += 1
                 else:
-                    # Plugin failed to load (unsigned, tampered, validation fail) — disable it
+                    # Plugin failed verification/load. Mark in-memory enabled=False
+                    # so UI and toolset registration reflect reality. DO NOT remove
+                    # from user's enabled list on disk — user intent survives
+                    # temporary failures (e.g. signing regressions, missing deps).
+                    # Next restart with the underlying issue fixed = loads clean,
+                    # no UI click needed.
                     info["enabled"] = False
                     blocked.append(name)
 
-        # Clean up enabled list on disk for blocked plugins
         if blocked:
-            self._remove_from_enabled_list(blocked)
-            logger.info(f"[PLUGINS] Blocked plugins auto-disabled: {blocked}")
+            logger.warning(f"[PLUGINS] Enabled but blocked (intent preserved, retry next restart): {blocked}")
 
         logger.info(f"[PLUGINS] Scan complete: {len(self._plugins)} found, {loaded} loaded")
 
-    def _scan_dir(self, directory: Path, band: str, enabled_list: list):
+    def _scan_dir(self, directory: Path, band: str, enabled_list: list, disabled_list: list = None):
         """Scan a directory for plugin.json manifests."""
         if not directory.exists():
             return
+        if disabled_list is None:
+            disabled_list = []
 
         for child in sorted(directory.iterdir()):
             if not child.is_dir():
@@ -168,8 +237,10 @@ class PluginLoader:
                 logger.debug(f"[PLUGINS] Skipping {name} (managed_hide)")
                 continue
 
-            # Enabled if in user config, or if manifest declares default_enabled
-            is_enabled = name in enabled_list or manifest.get("default_enabled", False)
+            # Enabled if user enabled it, OR manifest default_enabled AND user didn't explicitly disable it
+            is_enabled = (name in enabled_list) or (
+                manifest.get("default_enabled", False) and name not in disabled_list
+            )
 
             # Verify signature on discovery (before any code loads)
             verified, verify_msg, verify_meta = verify_plugin(child)
@@ -232,6 +303,17 @@ class PluginLoader:
                 try:
                     data = json.loads(path.read_text(encoding="utf-8"))
                     return data.get("enabled", [])
+                except Exception as e:
+                    logger.warning(f"[PLUGINS] Failed to read {path}: {e}")
+        return []
+
+    def _get_disabled_list(self) -> list:
+        """Read explicitly-disabled plugins (overrides default_enabled)."""
+        for path in (USER_PLUGINS_JSON, STATIC_PLUGINS_JSON):
+            if path.exists():
+                try:
+                    data = json.loads(path.read_text(encoding="utf-8"))
+                    return data.get("disabled", [])
                 except Exception as e:
                     logger.warning(f"[PLUGINS] Failed to read {path}: {e}")
         return []
@@ -307,6 +389,26 @@ class PluginLoader:
             base_priority = min(base_priority + 100, 199)
 
         capabilities = manifest.get("capabilities", {})
+
+        # Register scope ContextVars BEFORE daemons and tools (Phase 3).
+        # Plugin tool and daemon modules may do `from core.chat.function_manager
+        # import scope_email` (etc.) at call time; those imports resolve via
+        # function_manager.__getattr__ which looks up SCOPE_REGISTRY. If the
+        # scope hasn't been registered yet, the import raises AttributeError.
+        # Order MUST be: scope register → daemons → tools → hooks → routes.
+        scope_defs = capabilities.get("scopes", [])
+        if scope_defs:
+            try:
+                from core.chat.function_manager import register_plugin_scope
+                for scope_def in scope_defs:
+                    key = scope_def.get("key")
+                    if not key:
+                        continue
+                    # Manifest can override the default value (e.g. None for disabled-by-default)
+                    default = scope_def.get("default", "default")
+                    register_plugin_scope(key, plugin_name=name, default=default)
+            except Exception as e:
+                logger.error(f"[PLUGINS] {name}: failed to register scopes: {e}", exc_info=True)
 
         # Register hooks
         hooks = capabilities.get("hooks", {})
@@ -578,11 +680,26 @@ class PluginLoader:
         return None
 
     def unload_plugin(self, name: str):
-        """Unload a plugin — deregister all hooks, tools, routes, providers, schedule tasks, and event sources."""
+        """Unload a plugin — deregister all hooks, tools, routes, providers, schedule tasks, event sources, and scopes."""
         hook_runner.unregister_plugin(name)
         if self._function_manager:
             self._function_manager.unregister_plugin_tools(name)
         self._unregister_routes(name)
+
+        # Unregister scopes this plugin contributed so a later manifest edit
+        # with a different default takes effect on re-register instead of
+        # hitting register_plugin_scope's idempotent early-return.
+        try:
+            info_for_scopes = self._plugins.get(name, {})
+            scope_defs = info_for_scopes.get("manifest", {}).get("capabilities", {}).get("scopes", [])
+            if scope_defs:
+                from core.chat.function_manager import unregister_plugin_scope
+                for sd in scope_defs:
+                    key = sd.get("key")
+                    if key:
+                        unregister_plugin_scope(key)
+        except Exception as e:
+            logger.warning(f"[PLUGINS] {name}: failed to unregister scopes: {e}")
 
         # Unregister providers — reset active setting if it pointed to this plugin
         info = self._plugins.get(name, {})
@@ -741,7 +858,7 @@ class PluginLoader:
         # Delete plugin directory (use actual path, not name — they may differ)
         plugin_dir = info["path"] if info else USER_PLUGINS_DIR / name
         if plugin_dir.exists():
-            shutil.rmtree(plugin_dir)
+            _rmtree_robust(plugin_dir)
 
         # Delete settings
         settings_file = PROJECT_ROOT / "user" / "webui" / "plugins" / f"{name}.json"
@@ -750,6 +867,109 @@ class PluginLoader:
         # Delete state
         state_file = PLUGIN_STATE_DIR / f"{name}.json"
         state_file.unlink(missing_ok=True)
+
+        # Sweep sibling files/dirs in plugin_state whose name starts with
+        # the plugin name (+ '-' or '_' separator). Catches conventions
+        # like `{name}-logs/`, `{name}_sessions/`, `{name}-sessions.json`.
+        # Without this, e.g. uninstalling telegram leaves
+        # `telegram_sessions/` with live credentials on disk (H5).
+        try:
+            for prefix in (f"{name}-", f"{name}_"):
+                for extra in PLUGIN_STATE_DIR.glob(f"{prefix}*"):
+                    try:
+                        if extra.is_dir():
+                            _rmtree_robust(extra)
+                        else:
+                            extra.unlink()
+                        logger.info(f"[PLUGINS] Uninstall: removed sibling {extra.name}")
+                    except Exception as e:
+                        logger.warning(f"[PLUGINS] Could not remove {extra}: {e}")
+        except Exception as e:
+            logger.warning(f"[PLUGINS] Uninstall sibling sweep failed: {e}")
+
+        # Manifest-declared extra cleanup paths — for plugins whose state
+        # files/dirs DON'T follow the `{name}-*` convention (e.g. Google
+        # Calendar's `gcal-csrf.json`). Paths are relative to the user/
+        # sandbox and must ALSO be in a plugin-owned subtree — otherwise
+        # a malicious or buggy manifest could declare
+        # `cleanup_paths: ["chats", "memory.db", "credentials.json"]` and
+        # have Sapphire delete all user data at uninstall. 2026-04-22
+        # day-ruiner finding — pre-fix the guard only blocked `..` escape
+        # out of user/, which left every file under user/ fair game.
+        #
+        # Allowed parents (plugin-namespaced only):
+        #   user/plugin_state/                     (any file/dir prefixed with plugin name)
+        #   user/webui/plugins/                    (settings files, already handled above anyway)
+        #   user/plugins/<name>/                   (for user-plugins-dir files)
+        #
+        # Anything else (chats, memory.db, knowledge.db, credentials.json,
+        # settings.json, logs, etc.) is refused with a loud WARN.
+        try:
+            manifest = info.get("manifest", {}) if info else {}
+            extra_paths = manifest.get("capabilities", {}).get("cleanup_paths", [])
+            user_root = (PROJECT_ROOT / "user").resolve()
+            allowed_parents = [
+                (user_root / "plugin_state").resolve(),
+                (user_root / "webui" / "plugins").resolve(),
+                (user_root / "plugins" / name).resolve(),
+            ]
+            for rel in extra_paths:
+                if not isinstance(rel, str):
+                    continue
+                candidate = (user_root / rel).resolve()
+                # 1. Must stay within user/ (existing guard, kept)
+                try:
+                    candidate.relative_to(user_root)
+                except ValueError:
+                    logger.warning(f"[PLUGINS] Uninstall cleanup refused — outside user/: {rel}")
+                    continue
+                # 2. Must be under a plugin-namespaced parent. Top-level
+                # files/dirs in user/ (chats, credentials.json, etc) are
+                # never OK from a plugin manifest.
+                in_allowed_parent = False
+                for parent in allowed_parents:
+                    try:
+                        candidate.relative_to(parent)
+                        in_allowed_parent = True
+                        break
+                    except ValueError:
+                        continue
+                if not in_allowed_parent:
+                    logger.warning(
+                        f"[PLUGINS] Uninstall cleanup REFUSED — path not in a "
+                        f"plugin-namespaced parent (user/plugin_state/, "
+                        f"user/webui/plugins/, or user/plugins/{name}/): {rel}"
+                    )
+                    continue
+                # 3. For plugin_state targets specifically, the filename
+                # must start with the plugin name (or exactly match it) —
+                # prevents 'foo' plugin from declaring cleanup of 'bar's
+                # state. This covers the common case where the file is
+                # directly under plugin_state/.
+                plugin_state_root = allowed_parents[0]
+                try:
+                    rel_in_state = candidate.relative_to(plugin_state_root)
+                    first_seg = rel_in_state.parts[0] if rel_in_state.parts else ""
+                    if not (first_seg == name or first_seg.startswith(f"{name}-")
+                            or first_seg.startswith(f"{name}_")):
+                        logger.warning(
+                            f"[PLUGINS] Uninstall cleanup REFUSED — state path "
+                            f"must start with plugin name '{name}': {rel}"
+                        )
+                        continue
+                except ValueError:
+                    pass  # Not under plugin_state — other allowed_parent matched
+                if candidate.exists():
+                    try:
+                        if candidate.is_dir():
+                            _rmtree_robust(candidate)
+                        else:
+                            candidate.unlink()
+                        logger.info(f"[PLUGINS] Uninstall: removed declared {rel}")
+                    except Exception as e:
+                        logger.warning(f"[PLUGINS] Could not remove {candidate}: {e}")
+        except Exception as e:
+            logger.warning(f"[PLUGINS] Uninstall manifest-cleanup failed: {e}")
 
         # Evict cached PluginState so reinstall gets fresh instance
         with self._plugin_state_cache_lock:
@@ -829,6 +1049,10 @@ class PluginLoader:
                     if isinstance(current, NullTTSProvider) or current is None:
                         logger.info(f"[PLUGINS] Re-activating TTS provider '{tts_key}' (was null at boot)")
                         system.switch_tts_provider(tts_key)
+                        # switch_tts_provider now re-applies chat settings
+                        # internally (Wolf-Claude finding 2026-04-21), so the
+                        # persona voice survives plugin-driven late activation
+                        # without a second call here.
                         # Notify frontend so voice dropdown and speed range refresh
                         try:
                             from core.event_bus import publish, Events
@@ -874,6 +1098,7 @@ class PluginLoader:
         Returns dict with 'added' and 'removed' plugin name lists.
         """
         enabled_list = self._get_enabled_list()
+        disabled_list = self._get_disabled_list()
         new_found = []
         removed = []
         needs_reload = []
@@ -918,7 +1143,9 @@ class PluginLoader:
                         continue
 
                     verified, verify_msg, verify_meta = verify_plugin(child)
-                    is_enabled = name in enabled_list or manifest.get("default_enabled", False)
+                    is_enabled = (name in enabled_list) or (
+                        manifest.get("default_enabled", False) and name not in disabled_list
+                    )
 
                     try:
                         mtime = manifest_path.stat().st_mtime
@@ -943,10 +1170,10 @@ class PluginLoader:
                     if self._load_plugin(name):
                         logger.info(f"[PLUGINS] Rescan: loaded new plugin '{name}'")
                     else:
-                        # Failed verification — disable so UI reflects reality
+                        # Failed verification — mark in-memory False but preserve
+                        # enabled list on disk so user intent survives.
                         self._plugins[name]["enabled"] = False
-                        self._remove_from_enabled_list([name])
-                        logger.warning(f"[PLUGINS] Rescan: plugin '{name}' failed to load, auto-disabled")
+                        logger.warning(f"[PLUGINS] Rescan: plugin '{name}' enabled but blocked (retry next restart)")
 
         # Reload plugins whose manifests changed on disk (outside lock to avoid deadlock)
         for rname in needs_reload:

@@ -109,8 +109,18 @@ TOOLS:
 - dismiss_agent(agent_id) - cancel/cleanup agent
 
 AGENT TYPES:
-- llm: background LLM + tool loop (default). spawn_args: model, toolset, prompt
-- claude_code: Claude Code CLI session. spawn_args: project_name, session_id
+- llm: background LLM + tool loop. spawn_args: model, toolset, prompt
+  - prompt='agent' (default) = lean worker, no scopes, safe for automation
+  - prompt='self' = inherit current chat's persona + scopes
+  - prompt='<name>' = any persona name
+- claude_code: Claude Code CLI coding session. spawn_args: project_name, session_id
+- claude_code_plugin: Claude Code CLI writing a Sapphire plugin. spawn_args: plugin_name, capabilities, context, session_id
+
+DIRECTOR RULES (caller-side, for spawn_agent):
+- Call agent_options() first to see current available types — don't assume
+- Don't default to 'llm' for coding work — check if claude_code / claude_code_plugin is available
+- For claude_code_plugin: YOU are the director, not the coder. Claude Code already has access to all plugin docs, examples, logs, reference plugins. Just describe WHAT to build (specific requirements, API details, constraints). Do NOT pre-search docs, read source, or run_command before spawning.
+- If an agent returns with errors, spawn it again with the error details. Do NOT troubleshoot manually.
 
 LIFECYCLE:
 - pending → running → done/failed/cancelled

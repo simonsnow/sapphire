@@ -1,38 +1,48 @@
 // trigger-editor/ai-config.js - Shared AI configuration section for all trigger types
 // Persona, AI (prompt/toolset/provider/model), Chat, Voice, Mind (scopes), Execution Limits
 import { fetchPrompts, fetchToolsets, fetchLLMProviders,
-         fetchMemoryScopes, fetchKnowledgeScopes, fetchPeopleScopes, fetchGoalScopes, fetchEmailAccounts,
          fetchPersonas, fetchPersona } from '../continuity-api.js';
+import { getInitData } from '../init-data.js';
+import {
+    renderScopeDropdowns,
+    fetchScopeData,
+    populateScopeOptions,
+    readScopeSettingsFromDom
+} from '../scope-dropdowns.js';
 
 let _ttsVoicesCache = null;
 
 /**
- * Fetch all data needed for AI config fields
- * @returns {Object} { prompts, toolsets, providers, metadata, scopes, personas, voices }
+ * Fetch all data needed for AI config fields.
+ * Scope data is fetched generically via the shared scope-dropdowns renderer,
+ * driven by /api/init scope_declarations — adding a new plugin scope is
+ * zero-touch for this file.
  */
 export async function fetchAIConfigData() {
     let prompts = [], toolsets = [], providers = [], metadata = {};
-    let memoryScopes = [], knowledgeScopes = [], peopleScopes = [], goalScopes = [], emailAccounts = [];
     let personas = [];
+    let scopeDeclarations = [], scopeData = {};
 
     try {
-        const [p, ts, llm, ms, ks, ps, gs, ea, per, ttsV] = await Promise.all([
+        // Grab init data first so we know which scope_declarations to fetch
+        const init = await getInitData();
+        scopeDeclarations = init?.scope_declarations || [];
+
+        const [p, ts, llm, sd, per, ttsV] = await Promise.all([
             fetchPrompts(), fetchToolsets(), fetchLLMProviders(),
-            fetchMemoryScopes(), fetchKnowledgeScopes(), fetchPeopleScopes(), fetchGoalScopes(),
-            fetchEmailAccounts(), fetchPersonas(),
+            fetchScopeData(scopeDeclarations),
+            fetchPersonas(),
             fetch('/api/tts/voices').then(r => r.ok ? r.json() : null)
         ]);
         prompts = p || []; toolsets = ts || [];
         providers = llm.providers || []; metadata = llm.metadata || {};
-        memoryScopes = ms || []; knowledgeScopes = ks || [];
-        peopleScopes = ps || []; goalScopes = gs || [];
-        emailAccounts = ea || [];
+        scopeData = sd || {};
         personas = per || [];
         _ttsVoicesCache = ttsV;
     } catch (e) { console.warn('AI config: failed to fetch options', e); }
 
     return { prompts, toolsets, providers, metadata,
-             memoryScopes, knowledgeScopes, peopleScopes, goalScopes, emailAccounts,
+             scopeDeclarations, scopeData,
              personas, voices: _ttsVoicesCache?.voices || [] };
 }
 
@@ -45,8 +55,9 @@ export async function fetchAIConfigData() {
  */
 export function renderAIConfig(t, data, opts = {}) {
     const { prompts, toolsets, providers, metadata,
-            memoryScopes, knowledgeScopes, peopleScopes, goalScopes, emailAccounts,
             personas, voices } = data;
+    // scopeDeclarations + scopeData are used by wireAIConfig (post-mount renderer);
+    // renderAIConfig just drops a placeholder <div id="ed-scope-dropdowns"></div>
     const { isHeartbeat } = opts;
 
     const enabledProviders = providers.filter(p => p.enabled);
@@ -167,11 +178,7 @@ export function renderAIConfig(t, data, opts = {}) {
         <details class="sched-accordion">
             <summary class="sched-acc-header">Mind</summary>
             <div class="sched-acc-body"><div class="sched-acc-inner">
-                ${_renderScopeField('Memory', 'ed-memory', t.memory_scope, memoryScopes, '/api/memory/scopes')}
-                ${_renderScopeField('Knowledge', 'ed-knowledge', t.knowledge_scope, knowledgeScopes, '/api/knowledge/scopes')}
-                ${_renderScopeField('People', 'ed-people', t.people_scope, peopleScopes, '/api/knowledge/people/scopes')}
-                ${_renderScopeField('Goals', 'ed-goals', t.goal_scope, goalScopes, '/api/goals/scopes')}
-                ${_renderScopeField('Email', 'ed-email', t.email_scope, emailAccounts.map(a => ({name: a.scope, count: null})), null)}
+                <div id="ed-scope-dropdowns"></div>
             </div></div>
         </details>
 
@@ -218,40 +225,106 @@ export function renderAIConfig(t, data, opts = {}) {
 }
 
 /**
- * Wire all AI config event listeners on the modal
+ * Wire all AI config event listeners on the modal. Also mounts the shared
+ * scope-dropdowns renderer into the #ed-scope-dropdowns placeholder that
+ * renderAIConfig() left behind.
+ *
  * @param {HTMLElement} modal - The editor modal element
  * @param {Object} t - Existing task data
  * @param {Object} data - From fetchAIConfigData()
  */
-export function wireAIConfig(modal, t, data) {
-    const { providers, metadata } = data;
+export async function wireAIConfig(modal, t, data) {
+    const { providers, metadata, scopeDeclarations = [], scopeData = {} } = data;
 
-    // Persona auto-fill
+    // ── Mount shared scope dropdowns into the Mind accordion ──
+    const scopeContainer = modal.querySelector('#ed-scope-dropdowns');
+    if (scopeContainer && scopeDeclarations.length) {
+        // Get enabled plugins so the renderer can hide scopes for disabled plugins
+        let enabledPlugins = new Set();
+        try {
+            const init = await getInitData();
+            enabledPlugins = new Set(init?.plugins_config?.enabled || []);
+        } catch (e) { /* fail-soft — all plugin scopes will be visible */ }
+
+        const rendererOptions = {
+            idPrefix: 'ed-',
+            enabledPlugins,
+            // Preserve the legacy bulk-create-across-mind-APIs UX: when the user
+            // clicks "+" on any mind-domain scope, prompt for a name and create
+            // that scope in all 4 mind APIs (memory/knowledge/people/goals) at once.
+            // The renderer only shows "+" on declarations with a mind nav_target,
+            // so plugin scopes won't get a "+" button (matching current behavior).
+            onCreateScope: async (_scopeKey) => {
+                const name = prompt('New scope name (lowercase, no spaces):');
+                if (!name) return;
+                const clean = name.trim().toLowerCase().replace(/[^a-z0-9_]/g, '');
+                if (!clean || clean.length > 32) { alert('Invalid name'); return; }
+                const csrf = document.querySelector('meta[name="csrf-token"]')?.content || '';
+                const apis = ['/api/memory/scopes', '/api/knowledge/scopes',
+                              '/api/knowledge/people/scopes', '/api/goals/scopes'];
+                try {
+                    const results = await Promise.allSettled(apis.map(url =>
+                        fetch(url, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrf },
+                            body: JSON.stringify({ name: clean })
+                        })
+                    ));
+                    const anyOk = results.some(r => r.status === 'fulfilled' && r.value.ok);
+                    if (!anyOk) {
+                        const err = await results[0]?.value?.json?.().catch(() => ({})) || {};
+                        alert(err.error || err.detail || 'Failed');
+                        return;
+                    }
+                    // Add the new option to every mind-domain scope dropdown and
+                    // select it in all of them — mirrors the legacy UX.
+                    const mindDecls = scopeDeclarations.filter(d => d.nav_target?.startsWith('mind:'));
+                    for (const decl of mindDecls) {
+                        const sel = scopeContainer.querySelector(`#ed-${decl.key}-scope`);
+                        if (sel && !sel.querySelector(`option[value="${clean}"]`)) {
+                            const opt = document.createElement('option');
+                            opt.value = clean;
+                            opt.textContent = clean;
+                            sel.appendChild(opt);
+                        }
+                        if (sel) sel.value = clean;
+                    }
+                } catch { alert('Failed to create scope'); }
+            },
+        };
+        renderScopeDropdowns(scopeContainer, scopeDeclarations, t, rendererOptions);
+        await populateScopeOptions(scopeContainer, scopeDeclarations, scopeData, t, rendererOptions);
+    }
+
+    // ── Persona auto-fill ──
     const personaSel = modal.querySelector('#ed-persona');
     personaSel?.addEventListener('change', async () => {
         const name = personaSel.value;
+        const set = (id, val) => { const el = modal.querySelector(id); if (el && val != null) el.value = val; };
+
         if (!name) {
-            const set = (id, val) => { const el = modal.querySelector(id); if (el) el.value = val; };
-            set('#ed-memory', 'none');
-            set('#ed-knowledge', 'none');
-            set('#ed-people', 'none');
-            set('#ed-goals', 'none');
+            // No persona — reset all scope dropdowns to 'none' dynamically
+            for (const decl of scopeDeclarations) {
+                const el = modal.querySelector(`#ed-${decl.key}-scope`);
+                if (el) el.value = 'none';
+            }
             return;
         }
         try {
             const persona = await fetchPersona(name);
             if (!persona?.settings) return;
             const s = persona.settings;
-            const set = (id, val) => { const el = modal.querySelector(id); if (el && val != null) el.value = val; };
             set('#ed-prompt', s.prompt || 'default');
             set('#ed-toolset', s.toolset || 'none');
             set('#ed-voice', s.voice || '');
             set('#ed-pitch', s.pitch ?? '');
             set('#ed-speed', s.speed ?? '');
-            set('#ed-memory', s.memory_scope || 'none');
-            set('#ed-knowledge', s.knowledge_scope || 'none');
-            set('#ed-people', s.people_scope || 'none');
-            set('#ed-goals', s.goal_scope || 'none');
+            // Dynamic scope auto-fill — iterate every registered scope and pull
+            // the persona's value for it. Zero-touch when new plugin scopes land.
+            for (const decl of scopeDeclarations) {
+                const settingKey = `${decl.key}_scope`;
+                set(`#ed-${decl.key}-scope`, s[settingKey] || 'none');
+            }
             if (s.inject_datetime != null) modal.querySelector('#ed-datetime').checked = !!s.inject_datetime;
             if (s.llm_primary) {
                 set('#ed-provider', s.llm_primary);
@@ -330,43 +403,8 @@ export function wireAIConfig(modal, t, data) {
         if (el) el.textContent = modal.querySelector('#ed-chat').value.trim() || 'No history';
     });
 
-    // Scope "+" buttons
-    modal.querySelectorAll('.sched-add-scope').forEach(btn => {
-        btn.addEventListener('click', async () => {
-            const name = prompt('New scope name (lowercase, no spaces):');
-            if (!name) return;
-            const clean = name.trim().toLowerCase().replace(/[^a-z0-9_]/g, '');
-            if (!clean || clean.length > 32) { alert('Invalid name'); return; }
-            const csrf = document.querySelector('meta[name="csrf-token"]')?.content || '';
-            const apis = ['/api/memory/scopes', '/api/knowledge/scopes', '/api/knowledge/people/scopes', '/api/goals/scopes'];
-            try {
-                const results = await Promise.allSettled(apis.map(url =>
-                    fetch(url, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrf },
-                        body: JSON.stringify({ name: clean })
-                    })
-                ));
-                const anyOk = results.some(r => r.status === 'fulfilled' && r.value.ok);
-                if (anyOk) {
-                    modal.querySelectorAll('.sched-add-scope').forEach(b => {
-                        const sel = b.previousElementSibling;
-                        if (sel && !sel.querySelector(`option[value="${clean}"]`)) {
-                            const opt = document.createElement('option');
-                            opt.value = clean;
-                            opt.textContent = clean;
-                            sel.appendChild(opt);
-                        }
-                    });
-                    const sel = btn.previousElementSibling;
-                    if (sel) sel.value = clean;
-                } else {
-                    const err = await results[0]?.value?.json?.().catch(() => ({})) || {};
-                    alert(err.error || err.detail || 'Failed');
-                }
-            } catch { alert('Failed to create scope'); }
-        });
-    });
+    // Scope "+" button handler is now wired via the shared renderer's onCreateScope
+    // callback (see the scopeContainer block above). No separate querySelectorAll needed.
 }
 
 /**
@@ -385,6 +423,13 @@ export function readAIConfig(modal) {
     const pitchVal = modal.querySelector('#ed-pitch')?.value;
     const speedVal = modal.querySelector('#ed-speed')?.value;
 
+    // Read all scope dropdown values by DOM discovery — no declarations list needed.
+    // Each scope field was rendered with a data-scope-key attribute; this helper
+    // iterates them and returns { memory_scope: ..., email_scope: ..., ... }.
+    // Trigger editor tasks default missing-value to 'none' (disabled), not 'default'.
+    const scopeContainer = modal.querySelector('#ed-scope-dropdowns');
+    const scopeFields = readScopeSettingsFromDom(scopeContainer, { missingValue: 'none' });
+
     return {
         persona: modal.querySelector('#ed-persona')?.value || '',
         prompt: modal.querySelector('#ed-prompt')?.value || 'default',
@@ -398,11 +443,7 @@ export function readAIConfig(modal) {
         speed: speedVal ? parseFloat(speedVal) : null,
         tts_enabled: modal.querySelector('#ed-tts')?.checked || false,
         browser_tts: modal.querySelector('#ed-browser-tts')?.checked || false,
-        memory_scope: modal.querySelector('#ed-memory')?.value || 'none',
-        knowledge_scope: modal.querySelector('#ed-knowledge')?.value || 'none',
-        people_scope: modal.querySelector('#ed-people')?.value || 'none',
-        goal_scope: modal.querySelector('#ed-goals')?.value || 'none',
-        email_scope: modal.querySelector('#ed-email')?.value || 'default',
+        ...scopeFields,
         context_limit: parseInt(modal.querySelector('#ed-context-limit')?.value) || 0,
         max_parallel_tools: parseInt(modal.querySelector('#ed-max-parallel')?.value) || 0,
         max_tool_rounds: parseInt(modal.querySelector('#ed-max-rounds')?.value) || 0,
@@ -420,26 +461,8 @@ function _voicePreviewText(t, isHeartbeat) {
     return 'No TTS';
 }
 
-function _renderScopeField(label, id, currentValue, scopes, apiUrl) {
-    const opts = scopes.map(s => {
-        const name = typeof s === 'string' ? s : s.name;
-        const count = typeof s === 'object' && s.count != null ? ` (${s.count})` : '';
-        return `<option value="${name}" ${currentValue === name ? 'selected' : ''}>${name}${count}</option>`;
-    }).join('');
-    const addBtn = apiUrl ? `<button type="button" class="btn-sm sched-add-scope" data-api="${apiUrl}" title="New scope">+</button>` : '';
-    return `
-        <div class="sched-field">
-            <label>${label}</label>
-            <div style="display:flex;gap:8px">
-                <select id="${id}" style="flex:1">
-                    <option value="none" ${!currentValue || currentValue === 'none' ? 'selected' : ''}>None</option>
-                    <option value="default" ${currentValue === 'default' ? 'selected' : ''}>default</option>
-                    ${opts}
-                </select>
-                ${addBtn}
-            </div>
-        </div>`;
-}
+// _renderScopeField deleted in Phase 2d — scope fields are now rendered by the
+// shared scope-dropdowns.js module driven by /api/init scope_declarations.
 
 function _esc(str) {
     if (!str) return '';

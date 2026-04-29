@@ -24,7 +24,13 @@ class ContinuityExecutor:
             system: VoiceChatSystem instance with llm_chat, tts, etc.
         """
         self.system = system
-        self._voice_lock = threading.Lock()  # guards TTS voice snapshot/apply/restore
+        # RLock (reentrant) — guards TTS voice snapshot/apply/restore. Non-reentrant
+        # Lock caused a self-deadlock this morning when the finally block re-entered
+        # via `with self._voice_lock:`. RLock also defends against any future tool
+        # that calls back into the executor while a task is running (spawn_agent,
+        # nested continuity triggers, future cross-task coordination) — that path
+        # would deadlock on re-acquire with a plain Lock. Scout chaos #17/#18.
+        self._voice_lock = threading.RLock()
 
     @staticmethod
     def _format_event_data(event_data: str) -> str:
@@ -106,10 +112,10 @@ class ContinuityExecutor:
         if account:
             parts.append(f"account: {account}")
 
-        # Discord mention hint
+        # Discord mention hint — works for sender and anyone in recent history
         author_id = obj.get("author_id")
         if author_id and channel_id:
-            parts.append(f"To @mention this user in Discord, include <@{author_id}> in your message")
+            parts.append(f"To @mention a Discord user, use <@userid> (e.g. <@{author_id}> for the sender). User IDs appear in [id:...] brackets in the chat history.")
 
         if chat_id or channel_id or account:
             parts.append("")
@@ -141,9 +147,14 @@ class ContinuityExecutor:
         if source.startswith("plugin:"):
             return self._run_plugin_task(task, progress_callback, response_callback)
 
+        # Deepcopy to protect against update_task mutating the dict while we
+        # read it. Scheduler passes live refs from self._tasks.values(), so
+        # a concurrent UI edit of this task would otherwise produce incoherent
+        # merged settings (new persona name + old toolset, etc.)
+        task = copy.deepcopy(task)
+
         # For event-triggered tasks, build message from instructions + event data
         if event_data is not None:
-            task = copy.deepcopy(task)  # don't mutate original (nested dicts like trigger_config)
             event_display = self._format_event_data(event_data)
             instructions = task.get("initial_message", "").strip()
             if instructions:
@@ -152,26 +163,36 @@ class ContinuityExecutor:
                 task["initial_message"] = event_display
 
             # Auto-set plugin scopes from event data (e.g. discord account)
+            # Event source → scope key mapping for auto-fill.
+            # Extracted to a list so adding a new event-emitting plugin only touches this table,
+            # not the surrounding logic. (Future: move this into the scope manifest capability
+            # so plugins can self-declare `"event_source_keyword": "discord"`.)
+            _EVENT_SOURCE_SCOPE_MAP = [
+                ("discord",  "discord_scope"),
+                ("telegram", "telegram_scope"),
+                ("email",    "email_scope"),
+            ]
             try:
                 obj = json.loads(event_data) if isinstance(event_data, str) else event_data
                 if isinstance(obj, dict) and obj.get("account"):
                     trigger = task.get("trigger_config", {})
                     source = trigger.get("source", "") or trigger.get("event_source", "")
-                    if "discord" in source and not task.get("discord_scope"):
-                        task["discord_scope"] = obj["account"]
-                        # Stash channel_id for auto-reply targeting
-                        if obj.get("channel_id"):
-                            task["_discord_reply_channel_id"] = obj["channel_id"]
-                    elif "telegram" in source and not task.get("telegram_scope"):
-                        task["telegram_scope"] = obj["account"]
-                    elif "email" in source and not task.get("email_scope"):
-                        task["email_scope"] = obj["account"]
+                    for keyword, scope_key in _EVENT_SOURCE_SCOPE_MAP:
+                        if keyword in source and not task.get(scope_key):
+                            task[scope_key] = obj["account"]
+                            # Discord needs channel_id for auto-reply targeting
+                            if keyword == "discord" and obj.get("channel_id"):
+                                task["_discord_reply_channel_id"] = obj["channel_id"]
+                            break
             except (json.JSONDecodeError, TypeError):
                 pass
 
-        # Resolve persona defaults into task (task-level fields override persona)
-        task = self._resolve_persona(task)
-
+        # Resolve persona defaults into task (task-level fields override persona).
+        # `_resolve_persona` raises on malformed-persona / lookup failure (today's
+        # change). Build the result dict FIRST so we can return a shaped error
+        # if persona resolution explodes — without this, the raise propagates
+        # before the result dict exists and the scheduler's outer except has
+        # to fabricate state. Witch-hunt 2026-04-21 finding H12.
         result = {
             "success": False,
             "task_id": task.get("id"),
@@ -180,6 +201,14 @@ class ContinuityExecutor:
             "responses": [],
             "errors": []
         }
+        try:
+            task = self._resolve_persona(task)
+        except Exception as e:
+            err = f"Persona resolution failed: {e}"
+            logger.error(f"[Continuity] {err}", exc_info=True)
+            result["errors"].append(err)
+            result["completed_at"] = datetime.now().isoformat()
+            return result
 
         chat_target = task.get("chat_target", "").strip()
 
@@ -192,8 +221,18 @@ class ContinuityExecutor:
     
     @staticmethod
     def _extract_task_settings(task: Dict[str, Any]) -> Dict[str, Any]:
-        """Extract execution settings from a task dict for ExecutionContext."""
-        return {
+        """Extract execution settings from a task dict for ExecutionContext.
+        Scope keys are pulled dynamically from SCOPE_REGISTRY so new plugin scopes
+        propagate to scheduled tasks without code changes.
+
+        Missing scope keys fall back to 'default' for backward compat with
+        tasks created before the scope-registry rollout. But: we warn when
+        that happens so the silent-default class of bugs is visible in logs.
+        A task that SHOULD have been scoped to e.g. 'lookout' but is missing
+        the key will still run, but the warning flags the write as going to
+        shared memory unintentionally. Scout finding 2026-04-19."""
+        from core.chat.function_manager import scope_setting_keys
+        settings = {
             "prompt": task.get("prompt", "default"),
             "toolset": task.get("toolset", "none"),
             "provider": task.get("provider", "auto"),
@@ -202,16 +241,21 @@ class ContinuityExecutor:
             "max_tool_rounds": task.get("max_tool_rounds"),
             "max_parallel_tools": task.get("max_parallel_tools"),
             "context_limit": task.get("context_limit"),
-            "memory_scope": task.get("memory_scope", "default"),
-            "knowledge_scope": task.get("knowledge_scope", "none"),
-            "people_scope": task.get("people_scope", "none"),
-            "goal_scope": task.get("goal_scope", "none"),
-            "email_scope": task.get("email_scope", "default"),
-            "bitcoin_scope": task.get("bitcoin_scope", "default"),
-            "discord_scope": task.get("discord_scope", "default"),
-            "telegram_scope": task.get("telegram_scope", "default"),
-            "gcal_scope": task.get("gcal_scope", "default"),
         }
+        missing_scopes = []
+        for setting_key in scope_setting_keys():
+            if setting_key in task:
+                settings[setting_key] = task[setting_key]
+            else:
+                settings[setting_key] = "default"
+                missing_scopes.append(setting_key)
+        if missing_scopes:
+            logger.warning(
+                f"[Continuity] Task '{task.get('name', '?')}' missing scope keys "
+                f"{missing_scopes} — defaulting to 'default' scope. Writes from "
+                f"this task land in shared memory. Edit the task to set explicit scopes."
+            )
+        return settings
 
     def _run_background(self, task: Dict[str, Any], result: Dict[str, Any],
                         progress_cb=None, response_cb=None) -> Dict[str, Any]:
@@ -308,17 +352,31 @@ class ContinuityExecutor:
 
     def _run_foreground(self, task: Dict[str, Any], result: Dict[str, Any],
                         progress_cb=None, response_cb=None) -> Dict[str, Any]:
-        """Run task with persistent chat history — no UI switching."""
+        """Run task with persistent chat history — no UI switching.
+
+        Voice-lock discipline: the lock is held for the ENTIRE duration of
+        the task (snapshot → apply → LLM → TTS → restore). Before 2026-04-19
+        the lock was released between apply and restore, which let a second
+        concurrent task's `_apply_voice` run over the first's — task A would
+        then speak with B's voice during overlap, and if B finished first
+        and restored "original" (really A's voice), the user could hear
+        half-swapped voices for the rest of A's run. Holding the lock across
+        serializes concurrent foreground tasks but keeps TTS correctness.
+        """
         from core.continuity.execution_context import ExecutionContext
 
         session_manager = self.system.llm_chat.session_manager
-        with self._voice_lock:
+        original_voice: Dict[str, Any] = {}
+        self._voice_lock.acquire()
+        try:
             original_voice = self._snapshot_voice()
-            try:
-                self._apply_voice(task)
-            except Exception:
-                self._restore_voice(original_voice)
-                raise
+            self._apply_voice(task)
+        except Exception:
+            # Apply failed — restore whatever we captured and release BEFORE re-raising.
+            try: self._restore_voice(original_voice)
+            except Exception: pass
+            self._voice_lock.release()
+            raise
         target_chat = task.get("chat_target", "").strip()
 
         try:
@@ -328,6 +386,15 @@ class ContinuityExecutor:
             # Normalize the same way create_chat sanitizes: keep alnum/space/dash/underscore
             normalized = "".join(c for c in target_chat if c.isalnum() or c in (' ', '-', '_')).strip()
             normalized = normalized.replace(' ', '_').lower()
+            # Guard: all-non-alnum chat_target (e.g. "!!!") normalizes to empty.
+            # Proceeding would create/write to a blank-named chat file — bad
+            # on-disk state and session_manager behavior for "" is undefined.
+            # Fail the task loudly instead. Chaos scout #15 — 2026-04-20.
+            if not normalized:
+                raise ValueError(
+                    f"chat_target {target_chat!r} normalizes to empty — "
+                    "refusing to create/write blank-named chat."
+                )
             existing_chats = {c["name"]: c["name"] for c in session_manager.list_chat_files()}
             match = existing_chats.get(normalized)
             if match:
@@ -356,7 +423,16 @@ class ContinuityExecutor:
                     from plugins.discord.tools.discord_tools import _reply_channel_id
                     _reply_channel_id.set(reply_ch)
                 except ImportError:
+                    # Discord plugin not loaded at all — expected path, quiet.
                     pass
+                except Exception as e:
+                    # Plugin loaded but discord_tools broken in some other way.
+                    # Silently ignoring would auto-reply land nowhere visible
+                    # with no diagnostic. Log loudly. Chaos scout #19.
+                    logger.warning(
+                        f"[Continuity] Discord reply channel set failed "
+                        f"(plugin loaded but broken): {e}"
+                    )
 
             tts_enabled = task.get("tts_enabled", True)
             browser_tts = task.get("browser_tts", False)
@@ -371,8 +447,15 @@ class ContinuityExecutor:
                 # Run through isolated ExecutionContext — no singleton contact
                 response = ctx.run(msg, history_messages=history_messages)
 
-                # Persist both messages to target chat WITHOUT switching active chat
-                session_manager.append_to_chat(target_chat, msg, response or "")
+                # Persist the FULL conversation (including tool calls + results)
+                # to the target chat. ctx.new_messages has everything generated
+                # during this run: user msg, assistant+tool_calls, tool results,
+                # and the final assistant response — not just the bookends.
+                if hasattr(ctx, 'new_messages') and ctx.new_messages:
+                    session_manager.append_messages_to_chat(target_chat, ctx.new_messages)
+                else:
+                    # Fallback to simple pair if new_messages not available
+                    session_manager.append_to_chat(target_chat, msg, response or "")
 
                 if response_cb and response:
                     try: response_cb(response)
@@ -422,8 +505,14 @@ class ContinuityExecutor:
             })
 
         finally:
-            with self._voice_lock:
+            # Voice lock is already held by this thread from the acquire above —
+            # re-acquiring via `with self._voice_lock:` would deadlock against
+            # ourselves (threading.Lock is NON-reentrant). Just restore + release.
+            try:
                 self._restore_voice(original_voice)
+            except Exception as _e:
+                logger.warning(f"[Continuity] _restore_voice in finally failed: {_e}")
+            self._voice_lock.release()
 
         result["completed_at"] = datetime.now().isoformat()
         return result
@@ -515,7 +604,10 @@ class ContinuityExecutor:
             ps = persona.get("settings", {})
             resolved = dict(task)
 
-            # Persona provides defaults — task-level fields override
+            # Persona provides defaults — task-level fields override.
+            # Non-scope fields are static; scope fields are pulled dynamically from
+            # SCOPE_REGISTRY so new plugin scopes flow through persona inheritance.
+            from core.chat.function_manager import scope_setting_keys
             field_map = {
                 "prompt": "prompt",
                 "toolset": "toolset",
@@ -525,30 +617,43 @@ class ContinuityExecutor:
                 "llm_primary": "provider",
                 "llm_model": "model",
                 "inject_datetime": "inject_datetime",
-                "memory_scope": "memory_scope",
-                "knowledge_scope": "knowledge_scope",
-                "people_scope": "people_scope",
-                "goal_scope": "goal_scope",
-                "email_scope": "email_scope",
-                "bitcoin_scope": "bitcoin_scope",
-                "discord_scope": "discord_scope",
-                "telegram_scope": "telegram_scope",
-                "gcal_scope": "gcal_scope",
             }
+            # Scope keys: persona key == task key (e.g. memory_scope → memory_scope)
+            scope_keys = set(scope_setting_keys())
+            for setting_key in scope_keys:
+                field_map[setting_key] = setting_key
+            # Sentinel values that mean "no preference, fall through to persona default".
+            # For scope keys, 'none' is EXPLICIT opt-out ("disable this scope") and must
+            # NOT fall through. 'default' is ALSO removed from the scope-key sentinel
+            # list (2026-04-21) — 'default' is a real scope name where user memories
+            # live, so treating it as a "please override me" sentinel meant an explicit
+            # task_val='default' got silently replaced by the persona's scope. Scout
+            # day-ruiner #4. Explicit 'default' now means exactly that: use the
+            # default scope. Non-scope fields keep the legacy sentinel list.
+            _empty_sentinels = ("", "auto", "none", "default", None)
+            _empty_sentinels_scope = ("", "auto", None)  # 'none' AND 'default' excluded
             for persona_key, task_key in field_map.items():
                 persona_val = ps.get(persona_key)
                 task_val = resolved.get(task_key)
-                # Use persona value if task field is empty/default
-                if persona_val and not task_val:
+                if not persona_val:
+                    continue
+                if not task_val:
                     resolved[task_key] = persona_val
-                elif persona_val and task_val in ("", "auto", "none", "default", None):
+                    continue
+                sentinels = _empty_sentinels_scope if task_key in scope_keys else _empty_sentinels
+                if task_val in sentinels:
                     resolved[task_key] = persona_val
 
             logger.info(f"[Continuity] Resolved persona '{persona_name}' into task settings")
             return resolved
         except Exception as e:
-            logger.error(f"[Continuity] Persona resolution failed: {e}")
-            return task
+            # Previously this bare except returned the raw task, which meant
+            # scope keys silently fell to registry defaults ('default', a real
+            # scope) downstream. That's the silent-default class. Raise loudly
+            # so the caller's try/except surfaces the failure to the user
+            # instead of routing writes into the wrong scope. Scout chaos #4/#9.
+            logger.error(f"[Continuity] Persona resolution failed for '{persona_name}': {e}", exc_info=True)
+            raise
 
     def _snapshot_voice(self) -> Dict[str, Any]:
         """Snapshot current TTS voice/pitch/speed for later restore."""
@@ -570,36 +675,60 @@ class ContinuityExecutor:
         return validate_voice(voice)
 
     def _restore_voice(self, snapshot: Dict[str, Any]) -> None:
-        """Restore TTS voice/pitch/speed from snapshot."""
+        """Restore TTS voice/pitch/speed from snapshot. Each setter gets its own
+        try — a single failure can't short-circuit the others, and we log which
+        one failed rather than swallowing the whole restore. Scout chaos #1/#2/#14."""
         if not snapshot:
             return
         tts = getattr(self.system, 'tts', None)
         if not tts:
             return
-        try:
-            if snapshot.get("voice") is not None:
-                tts.set_voice(self._validate_voice(snapshot["voice"]))
-            if snapshot.get("pitch") is not None:
-                tts.set_pitch(snapshot["pitch"])
-            if snapshot.get("speed") is not None:
-                tts.set_speed(snapshot["speed"])
-            logger.debug(f"[Continuity] Restored voice settings: {snapshot}")
-        except Exception as e:
-            logger.warning(f"[Continuity] Failed to restore voice settings: {e}")
+        for field, setter_name in (("voice", "set_voice"), ("pitch", "set_pitch"), ("speed", "set_speed")):
+            val = snapshot.get(field)
+            if val is None:
+                continue
+            try:
+                setter = getattr(tts, setter_name)
+                if field == "voice":
+                    setter(self._validate_voice(val))
+                else:
+                    setter(val)
+            except Exception as e:
+                logger.warning(f"[Continuity] Failed to restore TTS {field}={val!r}: {e}")
+        logger.debug(f"[Continuity] Restored voice settings: {snapshot}")
 
     def _apply_voice(self, task: Dict[str, Any]) -> None:
-        """Apply voice/pitch/speed settings to TTS if available."""
+        """Apply voice/pitch/speed settings to TTS. Per-setter try so a
+        mid-apply failure doesn't silently leave TTS half-configured — we
+        RAISE on any failure so the caller (_run_foreground / _run_background)
+        can restore from snapshot and mark the task errored, rather than
+        continuing with a mixed voice that then persists across tasks.
+        Scout chaos #1/#2/#14 — 2026-04-21."""
         tts = getattr(self.system, 'tts', None)
         if not tts:
             return
-        try:
-            if task.get("voice"):
-                tts.set_voice(self._validate_voice(task["voice"]))
-            if task.get("pitch") is not None:
-                tts.set_pitch(task["pitch"])
-            if task.get("speed") is not None:
-                tts.set_speed(task["speed"])
-        except Exception as e:
-            logger.warning(f"[Continuity] Failed to apply voice settings: {e}")
+        for field, setter_name in (("voice", "set_voice"), ("pitch", "set_pitch"), ("speed", "set_speed")):
+            val = task.get(field)
+            # "voice" uses truthy check (empty string = unset); numeric fields
+            # use is-not-None (0.0 is a legit speed-multiplier on some setups,
+            # although unusual).
+            if field == "voice":
+                if not val:
+                    continue
+            else:
+                if val is None:
+                    continue
+            try:
+                setter = getattr(tts, setter_name)
+                if field == "voice":
+                    setter(self._validate_voice(val))
+                else:
+                    setter(val)
+            except Exception as e:
+                # Re-raise so the caller rolls back to snapshot. Logging here
+                # identifies WHICH setter failed — restore path will log its
+                # own recovery attempt.
+                logger.error(f"[Continuity] TTS apply failed at {field}={val!r}: {e}")
+                raise
 
     # _apply_task_settings removed — ExecutionContext handles all isolation now

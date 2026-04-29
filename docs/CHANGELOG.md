@@ -1,3 +1,53 @@
+# 2.6.0 - Scopes
+- Collective update from 2.5.0
+- Improved core and plugins instead of expanding
+- Those scope dropdowns like memory slot are plugins now
+- Can add more dropdowns via plugin (stuff like SMS, social media, etc)
+- Swappable embeddings for slow computers
+- Claude Code plugin agent to make plugins
+- Pytest coverage
+# 2.5.12 - Tool token reduction
+- Reduced almost every tool description (~27% reduction)
+- Enabled Claude cache by default
+- Moved tool to "call tool without params for help"
+- Enhanced docs tool so AI can get info like toolmaker easier
+# 2.5.11 - Embeddings switch
+- Can swap embeddings model to smaller larger
+- Can make plugin for embedding
+- Has re-embed tool that must be run
+- Memory has new password feature
+- Redid Mind > Memory UX
+# 2.5.10 - Test Suite Expansion
+- Test coverage tripled
+- For self-coding checks
+- Allows plugins to be random .zip urls
+- Clock plugin (stopwatch, timer, alarm, clock)
+# 2.5.9 - Trinity
+- Will be for Patreon users 
+- Published explanation on website of eigenresonance
+- Sapphire can refactor core in a loop she directs
+- Plugin: Clock (timer alarm stopwatch)
+# 2.5.8 - Agents upgrade (Claude Code)
+- Claude Code has plugin agent
+- Plugin agent supercedes toolmaker (if Claude Code is present)
+- Added tools/ask-sapphire.sh for Claude Code to ask sapphire to test
+- Added tools/malbolge.py for 5x simultaneous persona triggers
+- Added examples for plugins for Claude Code
+# 2.5.7 - pytest expansions
+- from 30% coverage to 45%
+- basic route tests
+- mock plugin load
+# 2.5.6 - Beta test of new scope system
+- Complete refactor of scopes (dropdowns for email, etc)
+- Plugins can easily add scopes like new accounts
+- Daemons and heartbeats support those new scopes
+- Personas support all scopes now
+- Memory system is now a plugin
+# 2.5.5 - Prep for major refactor
+- Bots see other bot ids on telegram (critical for @mention)
+- Added telegram add_contact tool, only works in client mode
+- Tool calling errors reach toast UI
+- Deleted personas dont re-appear
 # 2.5.4 - Plugin enhancements
 - Discord cooldown, typing..., and @mention support
 - Telegram supports voice clips as returns

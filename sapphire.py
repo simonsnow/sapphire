@@ -35,10 +35,9 @@ def request_shutdown():
     logger.info("Shutdown requested")
 
 # Bootstrap user files before any modules try to load them
-from core.setup import ensure_prompt_files, ensure_chat_defaults, ensure_story_presets
+from core.setup import ensure_prompt_files, ensure_chat_defaults
 ensure_prompt_files()
 ensure_chat_defaults()
-ensure_story_presets()
 
 # Run data migrations (e.g. persona -> character rename)
 from core.migration import run_all as run_migrations
@@ -97,7 +96,6 @@ class VoiceChatSystem:
         self._prime_default_prompt()
         self._apply_initial_chat_settings()
         self.init_components()
-        self._cleanup_orphaned_rag()
 
         # Agent system — background workers (types registered by plugins during scan)
         from core.agents import AgentManager
@@ -114,12 +112,49 @@ class VoiceChatSystem:
             logger.critical(f"Plugin loader failed — ALL plugins unavailable: {e}", exc_info=True)
             self._plugin_load_error = str(e)
 
+        # Essential-plugin boot assertion — any plugin with manifest.essential=true
+        # MUST be loaded or we scream loud. Silent boot without memory/core tools is
+        # worse than refusing to work. (Doesn't raise — degraded-mode is still better
+        # than dead — but surfaces the failure to the UI and logs.)
+        self._missing_essential_plugins = []
+        try:
+            from core.plugin_loader import plugin_loader as _pl
+            for _name, _info in _pl._plugins.items():
+                if _info.get("manifest", {}).get("essential") and not _info.get("loaded"):
+                    self._missing_essential_plugins.append(_name)
+                    reason = _info.get("verify_msg") or ("disabled" if not _info.get("enabled") else "load failed")
+                    logger.critical(
+                        f"ESSENTIAL PLUGIN NOT LOADED: '{_name}' — reason: {reason}. "
+                        f"Sapphire is running in degraded mode. Fix: re-sign the plugin "
+                        f"(python tools/sign_plugin.py plugins/{_name}) or set ALLOW_UNSIGNED_PLUGINS=true."
+                    )
+                    print(f"\n{'='*60}\nSAPPHIRE WARNING: Essential plugin '{_name}' did not load ({reason})\nRunning in degraded mode — memory/core tools unavailable.\n{'='*60}\n", flush=True)
+            if self._missing_essential_plugins:
+                try:
+                    from core.event_bus import publish, Events
+                    publish(Events.SYSTEM_WARNING if hasattr(Events, 'SYSTEM_WARNING') else 'system_warning',
+                            {"type": "missing_essential_plugins", "plugins": self._missing_essential_plugins})
+                except Exception:
+                    pass
+        except Exception as _e:
+            logger.warning(f"Essential-plugin check failed: {_e}")
+
         # Re-apply toolset now that plugin tools are registered
         # (toolset was applied before plugins loaded, so plugin tools were missed)
         fm = self.llm_chat.function_manager
         if fm.current_toolset_name and fm.current_toolset_name != "none":
             fm.update_enabled_functions([fm.current_toolset_name])
             logger.info(f"Toolset '{fm.current_toolset_name}' re-applied after plugin scan")
+
+        # RAG orphan cleanup runs AFTER plugin_loader.scan() (Phase 4 reorder).
+        # Previously this ran at line 100, BEFORE plugin loading, which meant it
+        # imported memory/knowledge via the regular Python import path before the
+        # plugin loader had a chance to install the exec'd module in sys.modules.
+        # That created a double-module hazard (Scout 3 L1). Now cleanup runs in a
+        # fully-initialized environment — memory plugin is registered, sys.modules
+        # has the canonical entry, and the import here resolves to the SAME module
+        # the plugin loader registered.
+        self._cleanup_orphaned_rag()
 
         logger.info(f"System init took: {(time.time() - start_time)*1000:.1f}ms")
 
@@ -136,7 +171,7 @@ class VoiceChatSystem:
     def _cleanup_orphaned_rag(self):
         """Remove RAG scopes for chats that no longer exist."""
         try:
-            from functions import knowledge
+            from plugins.memory.tools import knowledge_tools as knowledge
             chat_names = [c["name"] for c in self.llm_chat.list_chats()]
             knowledge.cleanup_orphaned_rag_scopes(chat_names)
         except Exception as e:
@@ -152,12 +187,8 @@ class VoiceChatSystem:
             try:
                 chat_settings = self.llm_chat.session_manager.get_chat_settings()
                 prompt_name = chat_settings.get('prompt')
-                # __story__ is a sentinel — story engine loads its own prompt.md via _get_system_prompt
-                if prompt_name and prompt_name != '__story__':
+                if prompt_name:
                     logger.info(f"Startup prompt from chat settings: '{prompt_name}'")
-                elif prompt_name == '__story__':
-                    logger.info("Startup prompt: story chat (prompt loaded from story engine)")
-                    prompt_name = None  # fall through to defaults
             except Exception:
                 pass
 
@@ -241,6 +272,19 @@ class VoiceChatSystem:
             from core.wakeword.wakeword_null import NullAudioRecorder, NullWakeWordDetector
             self.wake_word_recorder = NullAudioRecorder()
             self.wake_detector = NullWakeWordDetector(None)
+            # Publish a loud warning so the UI can surface "wakeword silently
+            # fell back to null." Scout 4 finding: without this event, user
+            # thinks wakeword is up (UI toggle says on) but Sapphire is deaf.
+            try:
+                from core.event_bus import publish, Events
+                publish(Events.CONTINUITY_TASK_ERROR, {
+                    "task": "Wake Word",
+                    "error": f"Wake word initialization failed ({type(e).__name__}: {e}). "
+                             f"Sapphire booted without wake word detection — "
+                             f"check model file and reinitialize via settings.",
+                })
+            except Exception:
+                pass
         
         self.whisper_recorder = WhisperRecorder()
         self.whisper_client = NullWhisperClient()
@@ -322,12 +366,21 @@ class VoiceChatSystem:
                     logger.warning(f"No mic available — STT will work via web UI only: {mic_err}")
                     self.whisper_recorder = NullAudioRecorder()
             logger.info(f"STT provider switched to {provider_name}")
+            try:
+                from core.hooks import hook_runner, HookEvent
+                if hook_runner.has_handlers("provider_switched"):
+                    hook_runner.fire("provider_switched", HookEvent(
+                        metadata={'kind': 'stt', 'provider': provider_name}
+                    ))
+            except Exception as e:
+                logger.debug(f"provider_switched hook fire failed: {e}")
             return True
         except Exception as e:
             logger.error(f"STT provider switch failed: {e}")
             from core.stt.stt_null import NullAudioRecorder as _NullRec
             self.whisper_client = NullWhisperClient()
             self.whisper_recorder = _NullRec()
+            self._publish_stt_fallback_event(provider_name, e)
             return False
 
     def toggle_stt(self, enabled: bool):
@@ -351,9 +404,19 @@ class VoiceChatSystem:
         if base_dir is None:
             base_dir = Path(__file__).parent.resolve()
 
-        # Stop any in-flight playback before swapping
+        # Stop any in-flight playback AND wait for the generation thread to
+        # exit before reassigning. Without the wait, the old TTSClient becomes
+        # orphaned with its background thread still alive (held by the provider
+        # HTTP request) and can publish stale TTS_STOPPED events AFTER the new
+        # TTS client has already started, confusing frontend state.
+        # Scout 4 finding (2026-04-19).
         if hasattr(self, 'tts') and hasattr(self.tts, 'stop'):
             self.tts.stop()
+            if hasattr(self.tts, 'wait'):
+                try:
+                    self.tts.wait(timeout=2)
+                except Exception as e:
+                    logger.warning(f"TTS wait during provider swap timed out: {e}")
 
         if not provider_name or provider_name == 'none':
             self._stop_kokoro_server()
@@ -407,16 +470,71 @@ class VoiceChatSystem:
             self.tts_server_manager = None
             logger.info("Kokoro TTS server stopped")
 
+    def cancel_generation(self, chat_name: str = None) -> bool:
+        """Public cancel for in-progress LLM streaming.
+
+        Since H4 (2026-04-22) streaming is per-request rather than a shared
+        singleton, this delegates to LLMChat.cancel_streams. Optional
+        chat_name scopes the cancel to one chat's active streams; omit to
+        cancel all active streams.
+
+        Called by voice-commands stop hook and any plugin that wants to
+        interrupt generation. Returns True if at least one stream was
+        flagged, False otherwise.
+        """
+        try:
+            llm_chat = getattr(self, 'llm_chat', None)
+            if llm_chat is None or not hasattr(llm_chat, 'cancel_streams'):
+                return False
+            count = llm_chat.cancel_streams(chat_name=chat_name)
+            if count:
+                logger.info(f"cancel_generation: flagged {count} stream(s)")
+                return True
+            return False
+        except Exception as e:
+            logger.warning(f"cancel_generation failed: {e}")
+            return False
+
     def switch_embedding_provider(self, provider_name):
         """Hot-swap embedding provider at runtime."""
         from core.embeddings import switch_embedding_provider as _switch
         _switch(provider_name)
+        try:
+            from core.hooks import hook_runner, HookEvent
+            if hook_runner.has_handlers("provider_switched"):
+                hook_runner.fire("provider_switched", HookEvent(
+                    metadata={'kind': 'embed', 'provider': provider_name}
+                ))
+        except Exception as e:
+            logger.debug(f"provider_switched hook fire failed: {e}")
 
     def switch_tts_provider(self, provider_name):
-        """Hot-swap TTS provider at runtime."""
+        """Hot-swap TTS provider at runtime.
+
+        After the new TTSClient is wired, re-apply the active chat's voice /
+        pitch / speed. Without this, `_init_tts_provider` leaves the fresh
+        client on its hardcoded defaults (af_heart / 1.3 / 0.98) and the
+        persona's voice gets silently clobbered on every provider swap —
+        Wolf's-Claude finding 2026-04-21.
+        """
         logger.info(f"Switching TTS provider to: {provider_name}")
         base_dir = Path(__file__).parent.resolve()
-        return self._init_tts_provider(provider_name, base_dir)
+        ok = self._init_tts_provider(provider_name, base_dir)
+        if ok and provider_name and provider_name != 'none':
+            try:
+                self._apply_initial_chat_settings()
+            except Exception as e:
+                logger.warning(f"Post-swap settings reapply failed: {e}")
+        if ok:
+            try:
+                from core.hooks import hook_runner, HookEvent
+                if hook_runner.has_handlers("provider_switched"):
+                    hook_runner.fire("provider_switched", HookEvent(
+                        metadata={'kind': 'tts', 'provider': provider_name}
+                    ))
+            except Exception as e:
+                logger.debug(f"provider_switched hook fire failed: {e}")
+        return ok
 
     def toggle_tts(self, enabled: bool):
         """Legacy compat — maps to switch_tts_provider. Persists TTS_PROVIDER."""
@@ -468,6 +586,21 @@ class VoiceChatSystem:
 
         return None
 
+    def _publish_stt_fallback_event(self, provider_name, exc):
+        """Emit CONTINUITY_TASK_ERROR when STT fell back to null — mirrors the
+        wakeword pattern in init_components so the UI can surface 'STT silently
+        deaf' instead of lying that it's enabled. H7 fix 2026-04-22."""
+        try:
+            from core.event_bus import publish, Events
+            publish(Events.CONTINUITY_TASK_ERROR, {
+                "task": "STT",
+                "error": f"STT provider '{provider_name}' failed to initialize "
+                         f"({type(exc).__name__}: {exc}). Sapphire fell back to null "
+                         f"— check provider config and reinitialize via settings.",
+            })
+        except Exception:
+            pass
+
     def start_background_services(self):
         provider = getattr(config, 'STT_PROVIDER', 'none')
         # Legacy compat: if STT_PROVIDER missing but STT_ENABLED is true, assume faster_whisper
@@ -492,10 +625,12 @@ class VoiceChatSystem:
             except ImportError as e:
                 logger.error(f"STT provider '{provider}' not available: {e}")
                 self.whisper_client = NullWhisperClient()
+                self._publish_stt_fallback_event(provider, e)
                 return False
             except RuntimeError as e:
                 logger.error(f"Failed to initialize STT provider '{provider}': {e}")
                 self.whisper_client = NullWhisperClient()
+                self._publish_stt_fallback_event(provider, e)
                 return False
         else:
             logger.info("STT disabled - skipping initialization")

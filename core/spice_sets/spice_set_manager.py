@@ -37,19 +37,14 @@ class SpiceSetManager:
         self._load()
 
     def _load(self):
-        """Load spice sets from user file, seeding from core defaults if needed."""
+        """Load spice sets from user file. Seeds from core defaults on first run only.
+
+        After first run, user/spice_sets.json is authoritative — deleted sets
+        stay deleted across restarts. Mirrors the c0b6817 fix for personas.
+        """
         user_path = self.USER_DIR / "spice_sets.json"
         core_path = self.BASE_DIR / "spice_sets.json"
 
-        core_sets = {}
-        try:
-            with open(core_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            core_sets = {k: v for k, v in data.items() if not k.startswith('_')}
-        except Exception as e:
-            logger.error(f"Failed to load core spice sets: {e}")
-
-        self._sets = {}
         if user_path.exists():
             try:
                 with open(user_path, 'r', encoding='utf-8') as f:
@@ -57,21 +52,22 @@ class SpiceSetManager:
                 self._sets = {k: v for k, v in data.items() if not k.startswith('_')}
             except Exception as e:
                 logger.error(f"Failed to load user spice sets: {e}")
+                self._sets = {}
+            logger.info(f"Loaded {len(self._sets)} spice sets")
+            return
 
-        seeded = 0
-        for name, ss in core_sets.items():
-            if name not in self._sets:
-                self._sets[name] = ss
-                seeded += 1
+        # First run — seed from core defaults
+        self._sets = {}
+        try:
+            with open(core_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            self._sets = {k: v for k, v in data.items() if not k.startswith('_')}
+        except Exception as e:
+            logger.error(f"Failed to load core spice sets for first-run seed: {e}")
 
-        if seeded > 0:
-            logger.info(f"Seeded {seeded} new spice sets from defaults")
+        if self._sets:
             self._save_to_user()
-
-        if not self._sets:
-            self._sets = {}
-
-        logger.info(f"Loaded {len(self._sets)} spice sets")
+            logger.info(f"First run — seeded {len(self._sets)} spice sets from defaults")
 
     def reload(self):
         with self._lock:

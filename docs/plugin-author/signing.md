@@ -29,17 +29,17 @@ When enabled, unsigned plugins load with a warning. Tampered plugins are always 
 
 ## Signing Plugins (Official)
 
-The signing tool lives at `user/tools/sign_plugin.py`. It requires `cryptography` (already in sapphire's deps) and the private key at `user/plugin_signing_key.pem`.
+The signing tool lives at `tools/sign_plugin.py`. It requires `cryptography` (already in sapphire's deps) and the private key at `user/plugin_signing_key.pem`.
 
 ```bash
 # Sign a single plugin
-python user/tools/sign_plugin.py plugins/my-plugin/
+python tools/sign_plugin.py plugins/my-plugin/
 
 # Sign multiple
-python user/tools/sign_plugin.py plugins/ssh/ plugins/email/
+python tools/sign_plugin.py plugins/ssh/ plugins/email/
 
 # Sign all plugins in plugins/
-python user/tools/sign_plugin.py --all
+python tools/sign_plugin.py --all
 ```
 
 This hashes all signable files (`.py`, `.json`, `.js`, `.css`, `.html`, `.md`), builds a manifest, signs it with ed25519, and writes `plugin.sig` into the plugin directory.

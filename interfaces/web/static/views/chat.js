@@ -6,13 +6,20 @@ import { getElements, getIsProc } from '../core/state.js';
 import { updateScene, updateSendButtonLLM } from '../features/scene.js';
 import { applyTrimColor } from '../features/chat-settings.js';
 import { handleNewChat, handleDeleteChat, handleChatChange } from '../features/chat-manager.js';
-import { getInitData, refreshInitData } from '../shared/init-data.js';
+import { getInitData, refreshInitData, getInitDataSync } from '../shared/init-data.js';
 import { switchView } from '../core/router.js';
 import { loadPersona, createFromChat, avatarImg, avatarFallback, avatarUrl } from '../shared/persona-api.js';
 import { initAgentStatus } from '../features/agent-status.js';
+import {
+    renderScopeDropdowns,
+    fetchScopeData,
+    populateScopeOptions,
+    readScopeSettings
+} from '../shared/scope-dropdowns.js';
 
 let sidebarLoaded = false;
 let saveTimer = null;
+let pendingSaveChatName = null;  // captured at debounce schedule time, not fire time
 let llmProviders = [];
 let llmMetadata = {};
 let personasList = [];
@@ -21,28 +28,6 @@ let _docClickHandler = null;
 let _personaHandler = null;
 
 const SAVE_DEBOUNCE = 500;
-
-function updateStoryPromptLabel(container) {
-    const promptSel = container.querySelector('#sb-prompt');
-    if (!promptSel) return;
-
-    const existing = promptSel.querySelector('option[data-story]');
-    const hadStoryOption = !!existing;
-    if (existing) existing.remove();
-
-    const enabled = container.querySelector('#sb-story-enabled')?.checked;
-    const preset = container.querySelector('#sb-story-preset')?.value;
-    if (enabled && preset) {
-        const opt = document.createElement('option');
-        opt.value = '__story__';
-        opt.dataset.story = 'true';
-        const name = preset.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
-        opt.textContent = `[STORY] ${name}`;
-        promptSel.insertBefore(opt, promptSel.firstChild);
-        // Only auto-select story prompt on first appearance (entering story mode)
-        if (!hadStoryOption) promptSel.value = '__story__';
-    }
-}
 
 export default {
     init(container) {
@@ -60,10 +45,15 @@ export default {
         const sidebar = container.querySelector('.chat-sidebar');
         if (sidebar && collapsed) sidebar.classList.add('collapsed');
 
-        // Reload sidebar settings whenever active chat changes
+        // Reload sidebar settings whenever active chat changes.
+        // IMPORTANT: we listen for 'chat-activated' (dispatched by handleChatChange
+        // AFTER api.activateChat() succeeds) instead of 'change'. Listening on 'change'
+        // would race with handleChatChange — loadSidebar's GET /api/chats/{name}/settings
+        // would fire before the backend had switched active chats, hitting the fallback
+        // file-lookup path which 404s because chats live in SQLite, not JSON files.
         const chatSelect = getElements().chatSelect || document.getElementById('chat-select');
         if (chatSelect) {
-            chatSelect.addEventListener('change', () => loadSidebar());
+            chatSelect.addEventListener('chat-activated', () => loadSidebar());
             chatSelect.addEventListener('chat-list-ready', () => loadSidebar());
         }
 
@@ -90,12 +80,39 @@ export default {
             if (data?.key === 'LLM_PROVIDERS' || data?.key === 'LLM_CUSTOM_PROVIDERS') loadSidebar();
         });
 
-        // Refresh prompt dropdown when prompts are created/deleted
-        eventBus.on(eventBus.Events.PROMPT_CHANGED, () => loadSidebar());
+        // Refresh prompt dropdown when a user actually saves/deletes a prompt.
+        // IMPORTANT: PROMPT_CHANGED fires with TWO different actions:
+        //   - "saved"  → user modified a prompt in the Prompts view (needs loadSidebar)
+        //   - "loaded" → prompt was applied as a side effect of _apply_chat_settings
+        //                during a chat switch (does NOT need loadSidebar; chat-activated
+        //                already handles it)
+        // Listening on "loaded" was causing a race: during chat switch, flushPendingSave's
+        // PUT for the OLD chat fires PROMPT_CHANGED:loaded via SSE, which arrived before
+        // activateChat had switched the backend. loadSidebar's GET for the NEW chat name
+        // hit the non-active-chat file-lookup path and 404'd.
+        eventBus.on(eventBus.Events.PROMPT_CHANGED, (data) => {
+            if (data?.action === 'loaded') return;  // side effect, not user-initiated
+            loadSidebar();
+        });
         eventBus.on(eventBus.Events.PROMPT_DELETED, () => loadSidebar());
 
         // Refresh spice dropdown when spice sets change
         eventBus.on(eventBus.Events.SPICE_CHANGED, () => loadSidebar());
+
+        // Refresh sidebar scope dropdowns when scopes are created/deleted in
+        // the Mind view. Without this, users see stale options until a full
+        // page refresh — or worse, select a scope in the sidebar that the
+        // backend no longer knows about and silently fall through to 'default'.
+        eventBus.on('scope_changed', () => loadSidebar());
+
+        // Refresh sidebar (incl. scope dropdowns) when a plugin is toggled.
+        // Plugin scopes are only shown when the owning plugin is enabled, so a
+        // toggle changes which dropdowns should be visible. Also refreshes init
+        // data so newly-loaded plugin scope_declarations land.
+        document.addEventListener('sapphire:plugin_toggled', async () => {
+            try { await refreshInitData(); } catch (e) { /* fail-soft */ }
+            loadSidebar();
+        });
 
         // Accordion headers in sidebar (event delegation — handles core + plugin accordions)
         const sbFull = container.querySelector('.sb-full-content');
@@ -137,15 +154,6 @@ export default {
                                 await handleChatChange();
                             }
                         } catch (err) { console.error('Failed to create private chat:', err); }
-                        return;
-                    }
-
-                    // "New Story..." button opens the story picker modal
-                    const storyBtn = e.target.closest('[data-action="new-story"]');
-                    if (storyBtn) {
-                        sbPicker.classList.remove('open');
-                        const { openStoryPicker } = await import('../features/story.js');
-                        openStoryPicker();
                         return;
                     }
 
@@ -211,10 +219,20 @@ export default {
             });
         });
 
-        // Auto-save on any sidebar input change
-        container.querySelectorAll('.chat-sidebar select, .chat-sidebar input, .chat-sidebar textarea').forEach(el => {
-            const event = el.type === 'range' ? 'input' : (el.tagName === 'TEXTAREA' ? 'input' : 'change');
-            el.addEventListener(event, () => {
+        // Auto-save on any sidebar input change.
+        // EVENT DELEGATION: bind ONCE to the chat-sidebar parent so dynamically-added
+        // elements (e.g., scope dropdowns rendered later by shared/scope-dropdowns.js
+        // inside #sb-scope-dropdowns) get caught too. Direct querySelectorAll at init
+        // time would miss them — they don't exist yet.
+        const sidebarRoot = container.querySelector('.chat-sidebar');
+        if (sidebarRoot) {
+            const handleSidebarInput = (e) => {
+                const el = e.target;
+                if (!el || !el.tagName) return;
+                if (!['SELECT', 'INPUT', 'TEXTAREA'].includes(el.tagName)) return;
+                // Don't auto-save on the chat-name input or hidden picker
+                if (el.id === 'sb-chat-name' || el.id === 'sb-chat-picker') return;
+
                 // Immediate visual feedback for specific elements
                 if (el.id === 'sb-pitch') {
                     const label = container.querySelector('#sb-pitch-val');
@@ -237,12 +255,12 @@ export default {
                     const toggle = container.querySelector('#sb-spice-toggle');
                     if (toggle) toggle.textContent = `Spice \u00b7 ${el.value}`;
                 }
-                if (el.id === 'sb-story-enabled' || el.id === 'sb-story-preset') {
-                    updateStoryPromptLabel(container);
-                }
                 debouncedSave(container);
-            });
-        });
+            };
+            // Both 'change' (selects, checkboxes, color) and 'input' (range sliders, textareas)
+            sidebarRoot.addEventListener('change', handleSidebarInput);
+            sidebarRoot.addEventListener('input', handleSidebarInput);
+        }
 
         // Accent circle: double-click to reset to global default
         const accentCircle = container.querySelector('#sb-trim-color');
@@ -256,15 +274,9 @@ export default {
             });
         }
 
-        // "Go to Mind" buttons — navigate to Mind view with target tab + scope
-        container.querySelectorAll('.sb-goto-mind').forEach(btn => {
-            btn.addEventListener('click', () => {
-                const scope = btn.closest('.sb-field-row')?.querySelector('select')?.value;
-                window._mindTab = btn.dataset.tab;
-                if (scope && scope !== 'none') window._mindScope = scope;
-                switchView('mind');
-            });
-        });
+        // "Go to Mind" buttons are now wired by the shared/scope-dropdowns.js renderer
+        // via the onNavigate callback in loadSidebar(). Don't bind here at init() time —
+        // the buttons don't exist in the DOM yet (rendered dynamically with each loadSidebar).
 
         // "Go to view" buttons — navigate to Prompts/Toolsets with selection
         container.querySelectorAll('.sb-goto-view').forEach(btn => {
@@ -300,9 +312,6 @@ export default {
                 }
             });
         }
-
-        // State engine buttons
-        setupStoryButtons(container);
 
         // Document upload handler
         const docUpload = container.querySelector('#sb-doc-upload');
@@ -422,6 +431,10 @@ async function _loadPluginAccordions(container, init) {
     // Clear previous plugin accordions
     slot.innerHTML = '';
 
+    // Build DOM for all accordions first (synchronous, preserves order), then
+    // fire HTML/script fetches in parallel. Previously awaited each plugin's
+    // fetches sequentially which made sidebar load ~N*RTT on chat switch.
+    const pending = [];
     for (const plugin of plugins) {
         const acc = plugin.sidebar_accordion;
         const section = document.createElement('div');
@@ -441,26 +454,25 @@ async function _loadPluginAccordions(container, init) {
         section.appendChild(content);
         slot.appendChild(section);
 
-        // Load HTML content from plugin web dir
         if (acc.content) {
-            try {
-                const htmlResp = await fetch(`/plugin-web/${plugin.name}/${acc.content}`);
-                if (htmlResp.ok) content.innerHTML = await htmlResp.text();
-            } catch (e) {
-                content.innerHTML = `<div class="sb-field" style="color:var(--error)">Failed to load</div>`;
-            }
+            pending.push(
+                fetch(`/plugin-web/${plugin.name}/${acc.content}`)
+                    .then(r => r.ok ? r.text() : Promise.reject())
+                    .then(html => { content.innerHTML = html; })
+                    .catch(() => {
+                        content.innerHTML = `<div class="sb-field" style="color:var(--error)">Failed to load</div>`;
+                    })
+            );
         }
-
-        // Load + init JS module (re-inits on each sidebar reload — module is cached by browser)
         if (acc.script) {
-            try {
-                const mod = await import(`/plugin-web/${plugin.name}/${acc.script}`);
-                if (mod.init) mod.init(content, plugin.name);
-            } catch (e) {
-                console.warn(`[SIDEBAR] Failed to load accordion script for ${plugin.name}:`, e);
-            }
+            pending.push(
+                import(`/plugin-web/${plugin.name}/${acc.script}`)
+                    .then(mod => { if (mod.init) mod.init(content, plugin.name); })
+                    .catch(e => console.warn(`[SIDEBAR] Failed to load accordion script for ${plugin.name}:`, e))
+            );
         }
     }
+    await Promise.all(pending);
 }
 
 async function loadSidebar() {
@@ -472,20 +484,17 @@ async function loadSidebar() {
     if (!chatName) return;
 
     try {
-        const [settingsResp, initData, llmResp, scopesResp, goalScopesResp, knowledgeScopesResp, peopleScopesResp, emailAccountsResp, bitcoinWalletsResp, gcalAccountsResp, telegramAccountsResp, discordAccountsResp, presetsResp, spiceSetsResp, personasResp, ttsVoicesResp, toolsetCurrentResp] = await Promise.allSettled([
+        // Get init data first so we know which scope_declarations to fetch.
+        // (Phase 2: scope fetches are no longer hardcoded — driven by /api/init.)
+        const initDataPromise = getInitData();
+        const initEarly = await initDataPromise;
+        const scopeDeclarations = initEarly?.scope_declarations || [];
+
+        const [settingsResp, initData, llmResp, scopeDataResp, spiceSetsResp, personasResp, ttsVoicesResp, toolsetCurrentResp] = await Promise.allSettled([
             api.getChatSettings(chatName),
-            getInitData(),
+            initDataPromise,
             fetch('/api/llm/providers').then(r => r.ok ? r.json() : null),
-            fetch('/api/memory/scopes').then(r => r.ok ? r.json() : null),
-            fetch('/api/goals/scopes').then(r => r.ok ? r.json() : null),
-            fetch('/api/knowledge/scopes').then(r => r.ok ? r.json() : null),
-            fetch('/api/knowledge/people/scopes').then(r => r.ok ? r.json() : null),
-            fetch('/api/email/accounts').then(r => r.ok ? r.json() : null),
-            fetch('/api/bitcoin/wallets').then(r => r.ok ? r.json() : null),
-            fetch('/api/gcal/accounts').then(r => r.ok ? r.json() : null),
-            fetch('/api/plugin/telegram/accounts').then(r => r.ok ? r.json() : null),
-            fetch('/api/plugin/discord/accounts').then(r => r.ok ? r.json() : null),
-            fetch('/api/story/presets').then(r => r.ok ? r.json() : null),
+            fetchScopeData(scopeDeclarations),
             fetch('/api/spice-sets').then(r => r.ok ? r.json() : null),
             fetch('/api/personas').then(r => r.ok ? r.json() : null),
             fetch('/api/tts/voices').then(r => r.ok ? r.json() : null),
@@ -503,16 +512,7 @@ async function loadSidebar() {
         ui.setCurrentPersona(settings.persona || null);
         const init = initData.status === 'fulfilled' ? initData.value : null;
         const llmData = llmResp.status === 'fulfilled' ? llmResp.value : null;
-        const scopesData = scopesResp.status === 'fulfilled' ? scopesResp.value : null;
-        const goalScopesData = goalScopesResp.status === 'fulfilled' ? goalScopesResp.value : null;
-        const knowledgeScopesData = knowledgeScopesResp.status === 'fulfilled' ? knowledgeScopesResp.value : null;
-        const peopleScopesData = peopleScopesResp.status === 'fulfilled' ? peopleScopesResp.value : null;
-        const emailAccountsData = emailAccountsResp.status === 'fulfilled' ? emailAccountsResp.value : null;
-        const bitcoinWalletsData = bitcoinWalletsResp.status === 'fulfilled' ? bitcoinWalletsResp.value : null;
-        const gcalAccountsData = gcalAccountsResp.status === 'fulfilled' ? gcalAccountsResp.value : null;
-        const telegramAccountsData = telegramAccountsResp.status === 'fulfilled' ? telegramAccountsResp.value : null;
-        const discordAccountsData = discordAccountsResp.status === 'fulfilled' ? discordAccountsResp.value : null;
-        const presetsData = presetsResp.status === 'fulfilled' ? presetsResp.value : null;
+        const scopeFetchedData = scopeDataResp.status === 'fulfilled' ? scopeDataResp.value : {};
         const spiceSetsData = spiceSetsResp.status === 'fulfilled' ? spiceSetsResp.value : null;
         const personasData = personasResp.status === 'fulfilled' ? personasResp.value : null;
         const ttsVoicesData = ttsVoicesResp.status === 'fulfilled' ? ttsVoicesResp.value : null;
@@ -541,17 +541,6 @@ async function loadSidebar() {
                 .map(t => `<option value="${t.name}">${t.name} (${t.function_count})</option>`)
                 .join('');
             setSelect(toolsetSel, settings.toolset || settings.ability || 'all');
-        }
-
-        // Patch toolset label with live story tool count
-        const liveToolset = toolsetCurrentResp.status === 'fulfilled' ? toolsetCurrentResp.value : null;
-        if (toolsetSel && liveToolset?.story_tools > 0) {
-            const selected = toolsetSel.options[toolsetSel.selectedIndex];
-            if (selected) {
-                const name = liveToolset.name || selected.value;
-                const total = liveToolset.function_count || 0;
-                selected.textContent = `${name} + Story (${total})`;
-            }
         }
 
         // Populate spice set dropdown (fresh from API, not cached init)
@@ -592,116 +581,29 @@ async function loadSidebar() {
             }
         }
 
-        // Populate memory scope dropdown
-        const scopeSel = container.querySelector('#sb-memory-scope');
-        if (scopeSel && scopesData) {
-            scopeSel.innerHTML = '<option value="none">None</option>' +
-                (scopesData.scopes || []).map(s =>
-                    `<option value="${s.name}">${s.name} (${s.count})</option>`
-                ).join('');
-            setSelect(scopeSel, settings.memory_scope || 'default');
-        }
-
-        // Populate goal scope dropdown
-        const goalScopeSel = container.querySelector('#sb-goal-scope');
-        if (goalScopeSel && goalScopesData) {
-            goalScopeSel.innerHTML = '<option value="none">None</option>' +
-                (goalScopesData.scopes || []).map(s =>
-                    `<option value="${s.name}">${s.name} (${s.count})</option>`
-                ).join('');
-            setSelect(goalScopeSel, settings.goal_scope || 'default');
-        }
-
-        // Populate knowledge scope dropdown
-        const knowledgeScopeSel = container.querySelector('#sb-knowledge-scope');
-        if (knowledgeScopeSel && knowledgeScopesData) {
-            knowledgeScopeSel.innerHTML = '<option value="none">None</option>' +
-                (knowledgeScopesData.scopes || []).map(s =>
-                    `<option value="${s.name}">${s.name} (${s.count})</option>`
-                ).join('');
-            setSelect(knowledgeScopeSel, settings.knowledge_scope || 'default');
-        }
-
-        // Populate people scope dropdown
-        const peopleScopeSel = container.querySelector('#sb-people-scope');
-        if (peopleScopeSel && peopleScopesData) {
-            peopleScopeSel.innerHTML = '<option value="none">None</option>' +
-                (peopleScopesData.scopes || []).map(s =>
-                    `<option value="${s.name}">${s.name} (${s.count})</option>`
-                ).join('');
-            setSelect(peopleScopeSel, settings.people_scope || 'default');
-        }
-
-        // Populate email scope dropdown (from configured email accounts)
-        const emailScopeSel = container.querySelector('#sb-email-scope');
-        if (emailScopeSel) {
-            const accounts = emailAccountsData?.accounts || [];
-            emailScopeSel.innerHTML = '<option value="none">None</option>' +
-                accounts.map(a =>
-                    `<option value="${a.scope}">${a.scope}${a.address ? ' (' + a.address + ')' : ''}</option>`
-                ).join('');
-            setSelect(emailScopeSel, settings.email_scope || 'default');
-        }
-
-        // Populate bitcoin scope dropdown (from configured wallets)
-        const btcScopeSel = container.querySelector('#sb-bitcoin-scope');
-        if (btcScopeSel) {
-            const wallets = bitcoinWalletsData?.wallets || [];
-            btcScopeSel.innerHTML = '<option value="none">None</option>' +
-                wallets.map(w =>
-                    `<option value="${w.scope}">${w.scope}${w.address ? ' (' + w.address.slice(0, 8) + '...)' : ''}</option>`
-                ).join('');
-            setSelect(btcScopeSel, settings.bitcoin_scope || 'default');
-        }
-
-        // Populate google calendar scope dropdown
-        const gcalScopeSel = container.querySelector('#sb-gcal-scope');
-        if (gcalScopeSel) {
-            const accounts = gcalAccountsData?.accounts || [];
-            gcalScopeSel.innerHTML = '<option value="none">None</option>' +
-                accounts.map(a =>
-                    `<option value="${a.scope}">${a.label || a.scope}${a.has_token ? ' ✓' : ''}</option>`
-                ).join('');
-            setSelect(gcalScopeSel, settings.gcal_scope || 'default');
-        }
-
-        // Populate telegram scope dropdown
-        const telegramScopeSel = container.querySelector('#sb-telegram-scope');
-        if (telegramScopeSel) {
-            const accounts = telegramAccountsData?.accounts || [];
-            telegramScopeSel.innerHTML = '<option value="none">None</option>' +
-                accounts.map(a =>
-                    `<option value="${a.name}">${a.type === 'bot' ? '\u{1F916}' : '\u{1F4F1}'} ${a.label || a.name}${a.username ? ' (@' + a.username + ')' : ''}</option>`
-                ).join('');
-            setSelect(telegramScopeSel, settings.telegram_scope || 'default');
-        }
-
-        // Populate discord scope dropdown
-        const discordScopeSel = container.querySelector('#sb-discord-scope');
-        if (discordScopeSel) {
-            const accounts = discordAccountsData?.accounts || [];
-            discordScopeSel.innerHTML = '<option value="none">None</option>' +
-                accounts.map(a =>
-                    `<option value="${a.name}">${a.bot_name || a.name}${a.connected ? '' : ' (offline)'}</option>`
-                ).join('');
-            setSelect(discordScopeSel, settings.discord_scope || 'default');
-        }
-
-        // Hide plugin scope dropdowns when their plugin is disabled
-        const enabledPlugins = new Set(init?.plugins_config?.enabled || []);
-        container.querySelectorAll('[data-plugin-scope]').forEach(el => {
-            const pluginName = el.dataset.pluginScope;
-            el.style.display = enabledPlugins.has(pluginName) ? '' : 'none';
-        });
-
-        // Populate state preset dropdown
-        const presetSel = container.querySelector('#sb-story-preset');
-        if (presetSel && presetsData) {
-            presetSel.innerHTML = '<option value="">None</option>' +
-                (presetsData.presets || []).map(p =>
-                    `<option value="${p.name}">${p.display_name} (${p.key_count} keys)</option>`
-                ).join('');
-            setSelect(presetSel, settings.story_preset ?? '');
+        // Render + populate all scope dropdowns from /api/init scope_declarations.
+        // This is the shared renderer used by sidebar, persona editor, and trigger editor.
+        // Phase 2 replaced 9 hardcoded blocks (~100 lines) with this single call.
+        const scopeContainer = container.querySelector('#sb-scope-dropdowns');
+        if (scopeContainer && scopeDeclarations.length) {
+            const enabledPlugins = new Set(init?.plugins_config?.enabled || []);
+            const rendererOptions = {
+                idPrefix: 'sb-',
+                enabledPlugins,
+                onNavigate: (navTarget, scopeValue) => {
+                    // navTarget is e.g. "mind:memories" — split into view and tab
+                    const [view, tab] = navTarget.split(':');
+                    if (tab) window._mindTab = tab;
+                    // Carry the currently-selected scope value into the Mind view
+                    // so it lands on the same scope the user was looking at.
+                    if (scopeValue && scopeValue !== 'none') {
+                        window._mindScope = scopeValue;
+                    }
+                    if (view) switchView(view);
+                },
+            };
+            renderScopeDropdowns(scopeContainer, scopeDeclarations, settings, rendererOptions);
+            await populateScopeOptions(scopeContainer, scopeDeclarations, scopeFetchedData, settings, rendererOptions);
         }
 
         // Populate voice dropdown from active TTS provider
@@ -740,14 +642,6 @@ async function loadSidebar() {
         setToggle(container, '#sb-spice-toggle', settings.spice_enabled !== false,
             `Spice \u00b7 ${settings.spice_turns || 3}`);
         setToggle(container, '#sb-datetime-toggle', settings.inject_datetime === true);
-        const storyEnabled = settings.story_engine_enabled === true;
-        const storyPreset = settings.story_preset;
-        setChecked(container, '#sb-story-enabled', storyEnabled);
-        setChecked(container, '#sb-story-in-prompt', settings.story_in_prompt !== false);
-        setChecked(container, '#sb-story-vars', settings.story_vars_in_prompt === true);
-
-        // Show [STORY] prefix on prompt when story engine is active
-        updateStoryPromptLabel(container);
 
         // Trim color
         const trimInput = container.querySelector('#sb-trim-color');
@@ -774,16 +668,9 @@ async function loadSidebar() {
         if (pitchSlider) updateSliderFill(pitchSlider);
         if (speedSlider) updateSliderFill(speedSlider);
 
-        // Swap tab label and content based on story chat
-        const isStoryChat = settings.story_chat === true;
         const firstTab = container.querySelector('.sb-mode-tab[data-mode="easy"]');
-        if (firstTab) firstTab.textContent = isStoryChat ? 'Story' : 'Persona';
-
-        if (isStoryChat) {
-            await updateStoryMode(container, settings);
-        } else {
-            updateEasyMode(container, settings, init);
-        }
+        if (firstTab) firstTab.textContent = 'Persona';
+        updateEasyMode(container, settings, init);
 
         // RAG context level
         setVal(container, '#sb-rag-context', settings.rag_context || 'normal');
@@ -802,18 +689,43 @@ async function loadSidebar() {
 
 function debouncedSave(container) {
     clearTimeout(saveTimer);
-    saveTimer = setTimeout(() => saveSettings(container), SAVE_DEBOUNCE);
+    // CAPTURE the chat name NOW, before any chat switch. When the debounce fires
+    // (or flushPendingSave runs during a chat switch), chatSelect.value may have
+    // already moved to the new chat, but the save belongs to the OLD chat.
+    const chatSelect = getElements().chatSelect || document.getElementById('chat-select');
+    pendingSaveChatName = chatSelect?.value || null;
+    saveTimer = setTimeout(() => saveSettings(container, pendingSaveChatName), SAVE_DEBOUNCE);
 }
 
 /** Cancel any pending debounced save — called on chat switch to prevent cross-chat writes */
 export function cancelPendingSave() {
     clearTimeout(saveTimer);
     saveTimer = null;
+    pendingSaveChatName = null;
 }
 
-async function saveSettings(container) {
+/** Flush any pending debounced save — fires the save synchronously for the OLD chat
+ *  before a chat switch proceeds. Uses the chat name captured at debounce-schedule
+ *  time, NOT the current chatSelect.value (which may already point at the new chat). */
+export async function flushPendingSave() {
+    if (!saveTimer) return;
+    clearTimeout(saveTimer);
+    saveTimer = null;
+    const chatName = pendingSaveChatName;
+    pendingSaveChatName = null;
+    const container = document.getElementById('view-chat');
+    if (container && chatName) {
+        try { await saveSettings(container, chatName); }
+        catch (e) { console.warn('Flush-pending save failed:', e); }
+    }
+}
+
+async function saveSettings(container, chatNameOverride = null) {
+    // Prefer the override (set by debouncedSave / flushPendingSave) over the live
+    // chatSelect.value — the override is the chat the user was on when they made
+    // the change, which may differ from the current chat if they switched fast.
     const chatSelect = getElements().chatSelect || document.getElementById('chat-select');
-    const chatName = chatSelect?.value;
+    const chatName = chatNameOverride || chatSelect?.value;
     if (!chatName) return;
 
     const settings = collectSettings(container);
@@ -832,9 +744,8 @@ async function saveSettings(container) {
                 const selected = toolsetSel.options[toolsetSel.selectedIndex];
                 if (selected) {
                     const name = result.toolset.name || selected.value;
-                    const total = (result.functions?.length || 0) + (result.state_tools?.length || 0);
-                    const st = result.toolset.story_tools || 0;
-                    selected.textContent = st ? `${name} + Story (${total})` : `${name} (${total})`;
+                    const total = (result.functions?.length || 0);
+                    selected.textContent = `${name} (${total})`;
                 }
             }
         }
@@ -846,6 +757,15 @@ async function saveSettings(container) {
 function collectSettings(container) {
     const trimInput = container.querySelector('#sb-trim-color');
     const trimColor = trimInput?.dataset.cleared === 'true' ? '' : (trimInput?.value || '');
+
+    // Pull scope values from the shared renderer's dropdowns.
+    // Init data is cached after the first /api/init call, so getInitDataSync()
+    // returns the same scope_declarations the renderer was built from.
+    const scopeDecls = getInitDataSync()?.scope_declarations || [];
+    const scopeContainer = container.querySelector('#sb-scope-dropdowns');
+    const scopeValues = scopeContainer
+        ? readScopeSettings(scopeContainer, scopeDecls, { idPrefix: 'sb-' })
+        : {};
 
     return {
         prompt: getVal(container, '#sb-prompt'),
@@ -861,19 +781,7 @@ function collectSettings(container) {
         llm_primary: getVal(container, '#sb-llm-primary') || 'auto',
         llm_model: getSelectedModel(container),
         trim_color: trimColor,
-        memory_scope: getVal(container, '#sb-memory-scope') || 'default',
-        goal_scope: getVal(container, '#sb-goal-scope') || 'default',
-        knowledge_scope: getVal(container, '#sb-knowledge-scope') || 'default',
-        people_scope: getVal(container, '#sb-people-scope') || 'default',
-        email_scope: getVal(container, '#sb-email-scope') || 'default',
-        bitcoin_scope: getVal(container, '#sb-bitcoin-scope') || 'default',
-        gcal_scope: getVal(container, '#sb-gcal-scope') || 'default',
-        telegram_scope: getVal(container, '#sb-telegram-scope') || 'default',
-        discord_scope: getVal(container, '#sb-discord-scope') || 'default',
-        story_engine_enabled: getChecked(container, '#sb-story-enabled'),
-        story_preset: getVal(container, '#sb-story-preset') || null,
-        story_in_prompt: getChecked(container, '#sb-story-in-prompt'),
-        story_vars_in_prompt: getChecked(container, '#sb-story-vars'),
+        ...scopeValues,
         rag_context: getVal(container, '#sb-rag-context') || 'normal'
     };
 }
@@ -927,36 +835,6 @@ function getSelectedModel(container) {
         return (container.querySelector('#sb-llm-model-custom')?.value || '').trim();
     }
     return '';
-}
-
-function setupStoryButtons(container) {
-    container.querySelector('#sb-story-view')?.addEventListener('click', async () => {
-        const chatName = (getElements().chatSelect || document.getElementById('chat-select'))?.value;
-        if (!chatName) return;
-        try {
-            const resp = await fetch(`/api/story/${encodeURIComponent(chatName)}`);
-            if (resp.ok) {
-                const data = await resp.json();
-                const str = Object.entries(data.state || {})
-                    .map(([k, v]) => `${v.label || k}: ${JSON.stringify(v.value)}`).join('\n');
-                alert(`State:\n\n${str || '(empty)'}`);
-            }
-        } catch (e) { ui.showToast('Failed', 'error'); }
-    });
-
-    container.querySelector('#sb-story-reset')?.addEventListener('click', async () => {
-        const chatName = (getElements().chatSelect || document.getElementById('chat-select'))?.value;
-        if (!chatName || !confirm('Reset story?')) return;
-        const preset = getVal(container, '#sb-story-preset');
-        try {
-            await fetch(`/api/story/${encodeURIComponent(chatName)}/reset`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ preset: preset || null })
-            });
-            ui.showToast('Story reset', 'success');
-        } catch (e) { ui.showToast('Failed', 'error'); }
-    });
 }
 
 // === Easy/Full sidebar mode ===
@@ -1222,203 +1100,6 @@ function updateEasyMode(container, settings, init) {
             if (p?.tagline && el) el.textContent = p.tagline;
         })
         .catch(() => {});
-}
-
-// ==================== Story Mode Tab ====================
-
-async function updateStoryMode(container, settings) {
-    const gridEl = container.querySelector('#sb-persona-grid');
-    const detailEl = container.querySelector('#sb-persona-detail');
-    if (!gridEl && !detailEl) return;
-
-    const chatSelect = getElements().chatSelect || document.getElementById('chat-select');
-    const chatName = chatSelect?.value;
-    const presetName = settings.story_preset ?? '';
-
-    // Fetch state and save slots in parallel
-    const [stateResp, slotsResp] = await Promise.allSettled([
-        chatName ? fetch(`/api/story/${encodeURIComponent(chatName)}`).then(r => r.ok ? r.json() : null) : null,
-        presetName ? fetch(`/api/story/saves/${encodeURIComponent(presetName)}`).then(r => r.ok ? r.json() : null) : null,
-    ]);
-    const stateData = stateResp.status === 'fulfilled' ? stateResp.value : null;
-    const slotsData = slotsResp.status === 'fulfilled' ? slotsResp.value : null;
-
-    // Story display name
-    const storyDisplay = (settings.story_display_name || presetName || 'Story').replace(/^\[STORY\]\s*/, '');
-
-    // Hide persona grid, use detail area for story content
-    if (gridEl) gridEl.innerHTML = '';
-
-    if (!detailEl) return;
-
-    // Build state variable rows
-    const state = stateData?.state || {};
-    const stateKeys = Object.keys(state).filter(k => !k.startsWith('_'));
-    let stateRows = '';
-    if (stateKeys.length === 0) {
-        stateRows = '<div class="sb-story-empty">No state variables</div>';
-    } else {
-        stateRows = stateKeys.map(k => {
-            const v = state[k];
-            const label = v.label || k;
-            const val = v.value ?? '';
-            const displayVal = typeof val === 'object' ? JSON.stringify(val) : String(val);
-            return `
-                <div class="sb-story-var" data-key="${escapeHtml(k)}">
-                    <span class="sb-story-var-label">${escapeHtml(label)}</span>
-                    <span class="sb-story-var-value" title="Click to edit">${escapeHtml(displayVal)}</span>
-                </div>`;
-        }).join('');
-    }
-
-    // Build save slot buttons
-    const slots = slotsData?.slots || [];
-    const slotButtons = (action) => {
-        let html = '';
-        for (let i = 1; i <= 5; i++) {
-            const slot = slots.find(s => s.slot === i);
-            const isEmpty = !slot || slot.empty;
-            const timestamp = isEmpty ? 'Empty' : formatSlotTime(slot.timestamp);
-            const turn = isEmpty ? '' : ` \u2022 Turn ${slot.turn}`;
-            html += `<button class="sb-story-slot" data-action="${action}" data-slot="${i}">
-                <span class="sb-story-slot-num">${i}</span>
-                <span class="sb-story-slot-info">${timestamp}${turn}</span>
-            </button>`;
-        }
-        return html;
-    };
-
-    // Progress info
-    const turnCount = stateData?.key_count || 0;
-    const presetLabel = stateData?.preset || presetName;
-
-    detailEl.innerHTML = `
-        <div class="sb-story-header">
-            <span class="sb-story-title">${escapeHtml(storyDisplay)}</span>
-            <span class="sb-story-meta">${turnCount} variables \u2022 ${escapeHtml(presetLabel)}</span>
-        </div>
-        ${easyAccordion('State', `<div class="sb-story-vars">${stateRows}</div>`, { desc: `${stateKeys.length} vars` })}
-        ${easyAccordion('Save', `<div class="sb-story-slots">${slotButtons('save')}</div>`, { desc: 'Save progress' })}
-        ${easyAccordion('Load', `<div class="sb-story-slots">${slotButtons('load')}</div>`, { desc: 'Restore progress' })}
-        <div class="sb-story-actions">
-            <button class="sb-btn-sm sb-story-reset-btn">Reset Story</button>
-        </div>
-    `;
-
-    // Wire state variable editing
-    detailEl.querySelectorAll('.sb-story-var-value').forEach(el => {
-        el.addEventListener('click', () => {
-            if (el.querySelector('input')) return; // already editing
-            const row = el.closest('.sb-story-var');
-            const key = row?.dataset.key;
-            if (!key) return;
-
-            const current = el.textContent;
-            const input = document.createElement('input');
-            input.type = 'text';
-            input.className = 'sb-story-var-input';
-            input.value = current;
-            el.textContent = '';
-            el.appendChild(input);
-            input.focus();
-            input.select();
-
-            const commit = async () => {
-                const newVal = input.value;
-                el.textContent = newVal;
-                if (newVal !== current && chatName) {
-                    try {
-                        await fetch(`/api/story/${encodeURIComponent(chatName)}/set`, {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ key, value: newVal })
-                        });
-                    } catch (e) {
-                        el.textContent = current; // revert on error
-                        ui.showToast('Failed to update variable', 'error');
-                    }
-                }
-            };
-            input.addEventListener('blur', commit, { once: true });
-            input.addEventListener('keydown', e => {
-                if (e.key === 'Enter') { e.preventDefault(); input.blur(); }
-                if (e.key === 'Escape') { el.textContent = current; }
-            });
-        });
-    });
-
-    // Wire save/load slots
-    detailEl.querySelectorAll('.sb-story-slot').forEach(btn => {
-        btn.addEventListener('click', async () => {
-            const action = btn.dataset.action;
-            const slot = parseInt(btn.dataset.slot);
-            if (!chatName) return;
-
-            if (action === 'save') {
-                try {
-                    await fetch(`/api/story/${encodeURIComponent(chatName)}/save`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ slot })
-                    });
-                    ui.showToast(`Saved to slot ${slot}`, 'success');
-                    await updateStoryMode(container, settings); // refresh slots
-                } catch (e) {
-                    ui.showToast('Save failed', 'error');
-                }
-            } else if (action === 'load') {
-                const slotData = slots.find(s => s.slot === slot);
-                if (!slotData || slotData.empty) {
-                    ui.showToast(`Slot ${slot} is empty`, 'info');
-                    return;
-                }
-                if (!confirm(`Load save from slot ${slot}? Chat history and state will be restored.`)) return;
-                try {
-                    await fetch(`/api/story/${encodeURIComponent(chatName)}/load`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ slot })
-                    });
-                    ui.showToast(`Loaded slot ${slot}`, 'success');
-                    // Refresh chat messages + story state
-                    const { setHistLen, refresh } = await import('../core/state.js');
-                    const len = await refresh(false);
-                    setHistLen(len);
-                    await updateStoryMode(container, settings);
-                } catch (e) {
-                    ui.showToast('Load failed', 'error');
-                }
-            }
-        });
-    });
-
-    // Wire reset button
-    detailEl.querySelector('.sb-story-reset-btn')?.addEventListener('click', async () => {
-        if (!confirm('Reset story progress? This will restart from the beginning.')) return;
-        if (!chatName) return;
-        try {
-            await fetch(`/api/story/${encodeURIComponent(chatName)}/reset`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ preset: presetName || null })
-            });
-            ui.showToast('Story reset', 'success');
-            await updateStoryMode(container, settings);
-        } catch (e) {
-            ui.showToast('Reset failed', 'error');
-        }
-    });
-
-    // Accordion headers are handled by delegated click on #sb-persona-detail (bound once in init)
-}
-
-function formatSlotTime(isoString) {
-    if (!isoString) return 'Empty';
-    try {
-        const d = new Date(isoString);
-        return d.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ' ' +
-               d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-    } catch { return 'Saved'; }
 }
 
 function easyAccordion(title, content, opts = {}) {

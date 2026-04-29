@@ -243,15 +243,21 @@ class TestGlobalEventBus:
         assert bus1 is bus2
 
     def test_publish_convenience_function(self):
-        """publish() should publish to global bus."""
+        """publish() should publish to global bus.
+
+        Verified by inspecting the replay buffer's most recent entry, not by
+        counting length — the buffer is a bounded deque (replay_size=50) and
+        other tests may have filled it already, so `len == initial + 1` is
+        unreliable under a full buffer (oldest gets evicted on append).
+        """
         from core.event_bus import publish, get_event_bus
 
         bus = get_event_bus()
-        initial_count = len(bus._replay_buffer)
-
         publish("test_convenience", {"value": 123})
 
-        assert len(bus._replay_buffer) == initial_count + 1
+        last = bus._replay_buffer[-1]
+        assert last["type"] == "test_convenience"
+        assert last["data"] == {"value": 123}
 
 
 class TestEventBusThreadSafety:

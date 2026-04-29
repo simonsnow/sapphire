@@ -134,7 +134,9 @@
         "enabled": false,
         "use_as_fallback": true,
         "thinking_enabled": true,
-        "thinking_budget": 10000
+        "thinking_budget": 10000,
+        "cache_enabled": true,
+        "cache_ttl": "5m"
       },
       "openai": {
         "provider": "openai",

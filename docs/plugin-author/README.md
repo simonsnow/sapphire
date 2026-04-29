@@ -97,6 +97,24 @@ User plugin priorities are automatically offset into the 100-199 range.
 
 ---
 
+## Plugin Tests
+
+Tests for a plugin live alongside it, at `plugins/<name>/tests/test_*.py`. They travel with the plugin on install/uninstall so authors can maintain them next to the code they cover.
+
+```
+plugins/my-plugin/
+  plugin.json
+  tools/my_tool.py
+  tests/
+    test_my_tool.py        # no __init__.py
+```
+
+Run from the repo root with `pytest` — the root `pytest.ini` sets `testpaths = tests plugins` and skips `user/`, `infra/`, and `tmp/`.
+
+**Do not add an `__init__.py` to `tests/`.** pytest collects tests across every plugin's `tests/` dir simultaneously; an `__init__.py` turns each one into the same import name (`tests`) and triggers import-name collisions. Leave the directory as plain, non-package — pytest's rootdir-relative collection handles it fine.
+
+---
+
 ## Complete Example
 
 A plugin combining hooks, tools, voice commands, and a scheduled task:

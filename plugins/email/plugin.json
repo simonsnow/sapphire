@@ -8,6 +8,17 @@
   "priority": 50,
   "capabilities": {
     "tools": ["tools/email_tool.py"],
+    "scopes": [
+      {
+        "key": "email",
+        "label": "email",
+        "endpoint": "/api/email/accounts",
+        "data_key": "accounts",
+        "value_field": "scope",
+        "name_field": "scope",
+        "label_template": "{scope}"
+      }
+    ],
     "daemon": {
       "entry": "daemon.py",
       "event_sources": [{
@@ -35,8 +46,8 @@
             "key": "auto_reply",
             "type": "boolean",
             "label": "Auto-reply to sender",
-            "default": false,
-            "help": "When enabled, the AI's response is automatically sent as an email reply to the sender."
+            "default": true,
+            "help": "ON (default): AI's response is sent as an email reply to the sender — the common case. OFF: the daemon still triggers the AI on incoming mail, but no reply email goes out (useful for filing, memory-only monitoring, or letting the AI decide per-message via explicit tool calls)."
           }
         ]
       }]

@@ -170,12 +170,77 @@ async def update_settings_batch(request: Request, _=Depends(require_login)):
         if locked:
             logger.warning(f"[MANAGED] Batch: filtered locked keys: {locked}")
         settings_dict = {k: v for k, v in settings_dict.items() if not settings.is_locked(k)}
+    # Server-side gate for EMBEDDING_PROVIDER swap. The JS shows a count-of-affected
+    # confirmation dialog, but that gate is client-side only — a direct curl, a stale
+    # browser tab, or a toolmaker-generated plugin could silently swap the provider
+    # and leave N memories/knowledge rows invisible to search. Require explicit
+    # `confirm_embedding_swap: true` when the swap would invalidate vectors.
+    # Scout finding #3 — 2026-04-20.
+    if 'EMBEDDING_PROVIDER' in settings_dict:
+        new_provider = settings_dict['EMBEDDING_PROVIDER']
+        current_provider = settings.get('EMBEDDING_PROVIDER')
+        if new_provider and new_provider != current_provider and not data.get('confirm_embedding_swap'):
+            try:
+                from core.embeddings import integrity_report
+                # to_thread — see /api/embedding/integrity for rationale
+                # (scout #14). Same 6-select blocking scan.
+                report = await asyncio.to_thread(integrity_report)
+                tables = report.get('tables', {}) or {}
+                def _count(t):
+                    return (t.get('matching_active') or 0) + (t.get('legacy_unstamped') or 0)
+                affected = sum(_count(tables.get(t, {})) for t in ('memories', 'knowledge_entries', 'people'))
+                if affected > 0:
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "error": "embedding_swap_requires_confirmation",
+                            "affected_vectors": affected,
+                            "message": (
+                                f"Swapping EMBEDDING_PROVIDER would make {affected} stored "
+                                "vectors invisible to semantic search until re-embedded. "
+                                "Resubmit with `confirm_embedding_swap: true` to proceed."
+                            ),
+                        },
+                    )
+            except HTTPException:
+                raise
+            except Exception as e:
+                # 2026-04-22 fix C — fail CLOSED, not open. Pre-fix, a transient
+                # integrity_report failure (DB busy >10s during re-embed/VACUUM/
+                # heavy-search) caused the gate to silently pass, proceeding with
+                # a destructive swap the user would have refused if the warning
+                # had rendered. The only cases where that's acceptable are ones
+                # the caller explicitly opts into via `confirm_embedding_swap`.
+                logger.error(f"Embedding swap gate: integrity check failed: {e}")
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "error": "embedding_swap_gate_unavailable",
+                        "reason": str(e),
+                        "message": (
+                            "Cannot verify swap safety — integrity check failed "
+                            "(DB may be busy with re-embed, VACUUM, or heavy "
+                            "search). Wait for the busy operation to finish, or "
+                            "resubmit with `confirm_embedding_swap: true` to "
+                            "bypass the gate if you accept the risk of "
+                            "invalidating stored vectors."
+                        ),
+                    },
+                )
     results = []
     # Defer provider switches until after all settings are applied
     # (e.g. API key must be in config before provider init reads it)
     deferred_actions = []
     deferred_keys = set()
     persisted_keys = {}  # Collect keys for single disk write
+    # Provider-switch keys that must only persist AFTER their deferred switch
+    # succeeds. Previously all keys persisted eagerly and the switch ran
+    # afterward — if the switch raised (e.g. re-embed running blocked the
+    # swap), settings.json had the new provider but `_embedder` singleton was
+    # still old. Next process restart would boot with the wrong provider
+    # silently. These get added to persisted_keys in the deferred-action loop
+    # only on successful switch. Scout race #4 — 2026-04-21.
+    _PROVIDER_SWITCH_KEYS = {'STT_PROVIDER', 'TTS_PROVIDER', 'EMBEDDING_PROVIDER'}
     # Service API keys that should route to credentials manager
     _SERVICE_CRED_MAP = {
         'STT_FIREWORKS_API_KEY': 'stt_fireworks',
@@ -192,7 +257,8 @@ async def update_settings_batch(request: Request, _=Depends(require_login)):
                 continue
             tier = settings.validate_tier(key)
             settings.set(key, value, persist=False)
-            if persist:
+            # Provider-switch keys defer their persist until post-switch success.
+            if persist and key not in _PROVIDER_SWITCH_KEYS:
                 persisted_keys[key] = value
             results.append({"key": key, "status": "success", "tier": tier})
             if key == 'WAKE_WORD_ENABLED':
@@ -229,24 +295,46 @@ async def update_settings_batch(request: Request, _=Depends(require_login)):
                 publish(Events.SETTINGS_CHANGED, {"key": key, "value": value, "tier": tier})
         except Exception as e:
             results.append({"key": key, "status": "error", "error": str(e)})
-    # Persist all settings in one disk write (instead of N individual saves)
-    if persist and persisted_keys:
-        with settings._lock:
-            settings._user.update(persisted_keys)
-            for key in persisted_keys:
-                settings._runtime.pop(key, None)
-            settings.save()
-    # Execute deferred provider switches (config values are now set)
+    # Execute deferred provider switches (runtime values are already set via
+    # settings.set above; persistence for provider-switch keys is held until
+    # we confirm the switch succeeded, then written to persisted_keys below.
+    # Scout race #4 — persist-before-switch caused settings.json / singleton
+    # divergence on switch failure).
     system = get_system()
     for action, value, key, tier in deferred_actions:
+        switch_ok = False
         try:
             if action == 'switch_embedding':
                 from core.embeddings import switch_embedding_provider
                 switch_embedding_provider(value)
             else:
                 await asyncio.to_thread(getattr(system, action), value)
+            switch_ok = True
         except Exception as e:
             logger.error(f"Deferred action {action} failed: {e}")
+            # Switch failed — undo the runtime set so the runtime layer stays
+            # aligned with what's actually persisted (the old value).
+            if key in _PROVIDER_SWITCH_KEYS:
+                try:
+                    # settings.get falls back to _persisted / _defaults when
+                    # runtime isn't populated — we did NOT persist, so this
+                    # returns the pre-swap value.
+                    settings._runtime.pop(key, None)
+                except Exception as rollback_err:
+                    logger.warning(f"Runtime rollback for {key} failed: {rollback_err}")
+            # Record the failure in results so the UI can surface it.
+            results.append({"key": key, "status": "error", "error": f"{action}: {e}"})
+        if switch_ok and persist and key in _PROVIDER_SWITCH_KEYS:
+            # Only now does this provider key earn its seat in persisted_keys.
+            persisted_keys[key] = value
+    # Persist all settings in ONE disk write, now that provider switches have
+    # had a chance to succeed/fail and update persisted_keys accordingly.
+    if persist and persisted_keys:
+        with settings._lock:
+            settings._user.update(persisted_keys)
+            for key in persisted_keys:
+                settings._runtime.pop(key, None)
+            settings.save()
     # Re-apply chat settings so voice gets validated for new provider
     if any(a[0].startswith('switch_tts') or a[0] == 'toggle_tts' for a in deferred_actions):
         try:
@@ -803,6 +891,23 @@ async def get_stt_providers(request: Request, _=Depends(require_login)):
     from core.stt.providers import stt_registry
     active = stt_registry.get_active_key()
     providers = stt_registry.get_all()
+    for p in providers:
+        p['is_active'] = p['key'] == active
+    return {"providers": providers, "active": active}
+
+
+@router.get("/api/embedding/providers")
+async def get_embedding_providers(request: Request, _=Depends(require_login)):
+    """List available embedding providers (core + plugin). Mirrors the TTS/STT
+    endpoints so the Settings UI's `mergeRegistryProviders` helper can surface
+    plugin-registered providers in the dropdown. Without this, a plugin
+    provider (e.g. minilm) doesn't appear in the EMBEDDING_PROVIDER selector —
+    the backend swap works via API but the UI dropdown renders the setting as
+    'Disabled' because the current value doesn't match any hardcoded option.
+    2026-04-21."""
+    from core.embeddings import embedding_registry
+    active = embedding_registry.get_active_key()
+    providers = embedding_registry.get_all()
     for p in providers:
         p['is_active'] = p['key'] == active
     return {"providers": providers, "active": active}

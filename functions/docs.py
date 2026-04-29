@@ -147,6 +147,46 @@ def _extract_ai_section(filepath: Path, full: bool = False) -> tuple[str, str]:
     return (summary, ai_section)
 
 
+def _search_across_docs(query: str, available: dict, max_results: int = 6,
+                        snippet_chars: int = 180) -> list:
+    """Case-insensitive substring search across every doc's AI section.
+
+    Returns list of (doc_name, match_count, snippet) tuples, highest count
+    first. Snippet centers on the first match with surrounding context so
+    the caller sees enough to judge relevance.
+
+    Used when an AI doesn't know which doc to pull — schema-cited pattern
+    (e.g. spawn_agent → search_help_docs('agents')) breaks down when the
+    AI has a vague topic rather than a known doc name.
+    """
+    if not query:
+        return []
+    q = query.lower().strip()
+    results = []
+    for name, filepath in available.items():
+        _, content = _extract_ai_section(filepath)
+        if not content:
+            continue
+        lower = content.lower()
+        count = lower.count(q)
+        if count == 0:
+            continue
+        # Snippet around first match
+        idx = lower.find(q)
+        start = max(0, idx - snippet_chars // 2)
+        end = min(len(content), idx + len(q) + snippet_chars // 2)
+        snippet = content[start:end].strip()
+        if start > 0:
+            snippet = '...' + snippet
+        if end < len(content):
+            snippet = snippet + '...'
+        # Collapse whitespace for compact display
+        snippet = re.sub(r'\s+', ' ', snippet)
+        results.append((name, count, snippet))
+    results.sort(key=lambda r: -r[1])
+    return results[:max_results]
+
+
 def _match_doc_name(query: str, available: dict) -> str | None:
     """Loose matching for doc names. Returns matched key or None."""
     query = query.lower().strip()
@@ -187,17 +227,21 @@ TOOLS = [
         "is_local": True,
         "function": {
             "name": "search_help_docs",
-            "description": f"Get Sapphire documentation. Available docs: {_doc_list}. Call without arguments for summaries of all docs.",
+            "description": f"Get Sapphire docs. Available: {_doc_list}\n  query='X' — search all docs (snippets + doc pointers)\n  doc_name='X' — full AI reference for that doc\n  doc_name='X' + full=true — human docs\n  (none) — list all",
             "parameters": {
                 "type": "object",
                 "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search term across all doc AI sections. Returns top matches with snippets and which doc has more."
+                    },
                     "doc_name": {
                         "type": "string",
-                        "description": "Doc name to read (e.g., 'installation', 'troubleshooting')"
+                        "description": "Doc name (e.g. 'agents', 'installation'). Fuzzy match."
                     },
                     "full": {
                         "type": "boolean",
-                        "description": "If true, returns full human-readable doc instead of AI summary. Default false."
+                        "description": "Return human-readable doc instead of AI ref. Default false."
                     }
                 },
                 "required": []
@@ -214,24 +258,42 @@ def execute(function_name: str, arguments: dict, config) -> tuple[str, bool]:
         return f"Unknown function: {function_name}", False
     
     doc_name = arguments.get('doc_name', '').strip()
+    query = arguments.get('query', '').strip()
     full = arguments.get('full', False)
     available = _get_available_docs()
-    
+
     if not available:
         return "No documentation files found in docs/ directory.", False
-    
+
+    # Query mode: cross-doc search. Routes the AI to the right doc without
+    # it having to read each one blindly. Paired with schemas that cite
+    # search_help_docs('topic') when the AI vaguely remembers a topic but
+    # not the doc name.
+    if query:
+        hits = _search_across_docs(query, available)
+        if not hits:
+            return f"No matches for '{query}'. Available docs: {', '.join(sorted(available.keys()))}", True
+        lines = [f"Matches for '{query}':", ""]
+        for name, count, snippet in hits:
+            lines.append(f"[{name}] ({count} match{'es' if count != 1 else ''})")
+            lines.append(f"  {snippet}")
+            lines.append("")
+        lines.append(f"Use search_help_docs(doc_name='<name>') for full AI reference.")
+        return "\n".join(lines), True
+
     # No argument: list all docs with summaries
     if not doc_name:
         lines = ["SAPPHIRE DOCUMENTATION", ""]
-        
+
         for name in sorted(available.keys()):
             summary, _ = _extract_ai_section(available[name])
             lines.append(f"  {name} - {summary}")
-        
+
         lines.append("")
-        lines.append("Use search_help_docs(\"name\") for full AI reference on that topic.")
-        lines.append("Use search_help_docs(\"name\", full=true) for complete human docs.")
-        
+        lines.append("Use search_help_docs(doc_name='<name>') for full AI reference.")
+        lines.append("Use search_help_docs(query='<term>') to search across all docs.")
+        lines.append("Use search_help_docs(doc_name='<name>', full=true) for human docs.")
+
         return "\n".join(lines), True
     
     # With argument: get specific doc's content

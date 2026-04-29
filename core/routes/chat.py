@@ -14,7 +14,6 @@ from core.auth import require_login, check_endpoint_rate
 from core.api_fastapi import get_system, _apply_chat_settings, PROJECT_ROOT
 from core.event_bus import publish, Events
 from core import prompts
-from core.story_engine import STORY_TOOL_NAMES
 from core.stt.stt_null import NullWhisperClient as _NullWhisperClient
 from core.stt.utils import can_transcribe
 from core.wakeword.wakeword_null import NullWakeWordDetector as _NullWakeWordDetector
@@ -217,14 +216,16 @@ async def handle_chat_stream(request: Request, _=Depends(require_login), system=
     images = data.get('images', [])
     files = data.get('files', [])
 
-    system.llm_chat.streaming_chat.cancel_flag = False
+    # Per-request StreamingChat instance. Each /api/chat call gets its own
+    # — no more singleton stomping between tabs. H4 2026-04-22.
+    stream, sid, active_chat = system.llm_chat.begin_stream()
     system.web_active_inc()
 
     def generate():
         try:
             chunk_count = 0
-            for event in system.llm_chat.chat_stream(data['text'], prefill=prefill, skip_user_message=skip_user_message, images=images, files=files):
-                if system.llm_chat.streaming_chat.cancel_flag:
+            for event in stream.chat_stream(data['text'], prefill=prefill, skip_user_message=skip_user_message, images=images, files=files):
+                if stream.cancel_flag:
                     logger.info(f"STREAMING CANCELLED at chunk {chunk_count}")
                     yield f"data: {json.dumps({'cancelled': True})}\n\n"
                     break
@@ -257,9 +258,9 @@ async def handle_chat_stream(request: Request, _=Depends(require_login), system=
                         else:
                             yield f"data: {json.dumps({'type': 'content', 'text': str(event)})}\n\n"
 
-            if not system.llm_chat.streaming_chat.cancel_flag:
-                ephemeral = system.llm_chat.streaming_chat.ephemeral
-                logger.info(f"STREAMING COMPLETE: {chunk_count} chunks, ephemeral={ephemeral}")
+            if not stream.cancel_flag:
+                ephemeral = stream.ephemeral
+                logger.info(f"STREAMING COMPLETE: {chunk_count} chunks, ephemeral={ephemeral}, chat={active_chat!r}")
                 yield f"data: {json.dumps({'done': True, 'ephemeral': ephemeral})}\n\n"
 
         except ConnectionError as e:
@@ -273,7 +274,7 @@ async def handle_chat_stream(request: Request, _=Depends(require_login), system=
             msg = friendly_llm_error(e) or str(e)
             yield f"data: {json.dumps({'error': msg})}\n\n"
         finally:
-            system.llm_chat.streaming_chat.cancel_flag = True
+            system.llm_chat.end_stream(sid, active_chat)
             system.web_active_dec()
 
     return StreamingResponse(
@@ -289,11 +290,31 @@ async def handle_chat_stream(request: Request, _=Depends(require_login), system=
 
 @router.post("/api/cancel")
 async def handle_cancel(request: Request, _=Depends(require_login), system=Depends(get_system)):
-    """Cancel ongoing streaming generation."""
+    """Cancel ongoing streaming generation.
+
+    Optional `chat` query param scopes the cancel to that chat's active
+    streams (every tab concurrently on the chat gets cancelled together).
+    Without the param, every active stream is flagged. H4/H5 2026-04-22.
+    """
     try:
-        system.llm_chat.streaming_chat.cancel_flag = True
-        logger.info("CANCEL: Flag set")
-        return {"status": "success", "message": "Cancellation requested"}
+        requested_chat = request.query_params.get('chat')
+        count = system.llm_chat.cancel_streams(chat_name=requested_chat)
+        if count == 0:
+            if requested_chat:
+                logger.info(f"CANCEL: no-op — no active stream for chat '{requested_chat}'")
+                return {
+                    "status": "no-op",
+                    "message": f"No stream active for chat '{requested_chat}'.",
+                }
+            logger.info("CANCEL: no-op — no active streams")
+            return {"status": "no-op", "message": "No active streams."}
+        scope = f"chat '{requested_chat}'" if requested_chat else "all chats"
+        logger.info(f"CANCEL: Flagged {count} stream(s) in {scope}")
+        return {
+            "status": "success",
+            "message": f"Cancellation requested ({count} stream{'s' if count != 1 else ''} flagged).",
+            "cancelled": count,
+        }
     except Exception as e:
         logger.error(f"Error during cancellation: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -340,10 +361,6 @@ async def get_unified_status(request: Request, _=Depends(require_login), system=
             except Exception:
                 pass
 
-        story_enabled = chat_settings.get('story_engine_enabled', False)
-        if story_enabled and not system.llm_chat.function_manager.get_story_engine():
-            system.llm_chat._update_story_engine()
-
         prompt_state = prompts.get_current_state()
         prompt_name = prompts.get_active_preset_name()
         prompt_char_count = prompts.get_prompt_char_count()
@@ -360,7 +377,9 @@ async def get_unified_status(request: Request, _=Depends(require_login), system=
 
         tts_playing = getattr(system.tts, '_is_playing', False)
         active_chat = system.llm_chat.get_active_chat()
-        is_streaming = getattr(system.llm_chat.streaming_chat, 'is_streaming', False)
+        # H4 2026-04-22: was `streaming_chat.is_streaming` singleton read;
+        # now aggregates across per-request streams.
+        is_streaming = system.llm_chat.any_streaming() if hasattr(system.llm_chat, 'any_streaming') else False
 
         context_limit = getattr(config, 'CONTEXT_LIMIT', 32000)
         raw_messages = system.llm_chat.session_manager.get_messages()
@@ -380,48 +399,7 @@ async def get_unified_status(request: Request, _=Depends(require_login), system=
         total_used = history_tokens + prompt_tokens
         context_percent = min(100, int((total_used / context_limit) * 100)) if context_limit > 0 else 0
 
-        story_status = None
-        try:
-            story_enabled_status = chat_settings.get('story_engine_enabled', False)
-            story_preset = chat_settings.get('story_preset', '')
-            if story_enabled_status:
-                story_status = {
-                    "enabled": True,
-                    "preset": story_preset,
-                    "preset_display": story_preset.replace('_', ' ').title() if story_preset else ''
-                }
-                live_engine = system.llm_chat.function_manager.get_story_engine()
-                if live_engine and live_engine.story_prompt:
-                    story_status["has_prompt"] = True
-                if live_engine and hasattr(live_engine, 'preset_config'):
-                    story_status["turn"] = getattr(live_engine, 'current_turn', 0)
-                    visible_state = live_engine.get_visible_state() if hasattr(live_engine, 'get_visible_state') else {}
-                    story_status["key_count"] = len(visible_state)
-                    preset_config = live_engine.preset_config or {}
-                    iterator_key = preset_config.get('progressive_prompt', {}).get('iterator', 'scene')
-                    iterator_val = live_engine.get_state(iterator_key) if hasattr(live_engine, 'get_state') else None
-                    if iterator_val is not None:
-                        story_status["iterator_key"] = iterator_key
-                        story_status["iterator_value"] = iterator_val
-                        state_def = preset_config.get('initial_state', {}).get(iterator_key, {})
-                        if state_def.get('type') == 'integer' and state_def.get('max'):
-                            story_status["iterator_max"] = state_def['max']
-        except Exception as e:
-            logger.warning(f"Error getting story status: {e}")
-
-        # Collect all story tool names (built-in + custom)
-        all_story_names = set(STORY_TOOL_NAMES)
-        live_engine = system.llm_chat.function_manager.get_story_engine()
-        if live_engine:
-            all_story_names |= live_engine.story_tool_names
-
-        state_tools = [f for f in function_names if f in all_story_names]
-        user_tools = [f for f in function_names if f not in all_story_names]
-
-        # Story prompt override: prefix prompt name so user knows story prompt is active
-        if live_engine and live_engine.story_prompt:
-            prompt_name = f"[STORY] {prompt_name}"
-            prompt_char_count = len(live_engine.story_prompt)
+        user_tools = list(function_names)
 
         return {
             "prompt_name": prompt_name,
@@ -430,7 +408,7 @@ async def get_unified_status(request: Request, _=Depends(require_login), system=
             "prompt": prompt_state,
             "toolset": toolset_info,
             "functions": user_tools,
-            "state_tools": state_tools,
+            "state_tools": [],
             "has_cloud_tools": has_cloud_tools,
             "tts_enabled": config.TTS_ENABLED,
             "tts_provider": getattr(config, 'TTS_PROVIDER', 'none'),
@@ -454,7 +432,6 @@ async def get_unified_status(request: Request, _=Depends(require_login), system=
                 "limit": context_limit,
                 "percent": context_percent
             },
-            "story": story_status,
             "chats": system.llm_chat.list_chats(),
             "chat_settings": chat_settings
         }
@@ -590,6 +567,46 @@ async def get_init_data(request: Request, _=Depends(require_login), system=Depen
         # Plugins config (merged: static + user overrides)
         plugins_config = _get_merged_plugins()
 
+        # Scope declarations — frontend uses this to render scope dropdowns dynamically
+        # in the chat sidebar, trigger editor, persona editor, etc.
+        #
+        # After Phase 4: ALL scope declarations come from plugin manifests. The memory
+        # plugin contributes memory/goal/knowledge/people (with `plugin: "memory"`).
+        # The 5 other plugins (email/bitcoin/gcal/telegram/discord) contribute their
+        # own scope each. This loop is now the ONLY source of scope declarations.
+        scope_declarations = []
+        for plugin_name, info in plugin_loader._plugins.items():
+            if not info.get("loaded") or not info.get("enabled"):
+                continue
+            manifest = info.get("manifest", {}) or {}
+            for scope_def in manifest.get("capabilities", {}).get("scopes", []):
+                # Defensive extraction: a sloppy third-party plugin manifest with
+                # missing `key` or `endpoint` must not break /api/init for all users.
+                # plugin_loader uses .get() and tolerates missing fields, so a
+                # malformed scope makes it into _plugins — we skip it here with a
+                # warning log instead of raising KeyError and bricking the sidebar.
+                if not isinstance(scope_def, dict):
+                    logger.warning(f"Plugin '{plugin_name}' has non-dict scope entry, skipping: {scope_def!r}")
+                    continue
+                key = scope_def.get("key")
+                endpoint = scope_def.get("endpoint")
+                if not key or not endpoint:
+                    logger.warning(f"Plugin '{plugin_name}' has malformed scope (missing key or endpoint), skipping: {scope_def!r}")
+                    continue
+                scope_declarations.append({
+                    "key": key,
+                    "label": scope_def.get("label", key),
+                    "plugin": plugin_name,
+                    "endpoint": endpoint,
+                    "data_key": scope_def.get("data_key", "accounts"),
+                    "value_field": scope_def.get("value_field", "name"),
+                    "name_field": scope_def.get("name_field", "name"),
+                    "label_template": scope_def.get("label_template", "{name}"),
+                    "format_js": (f"/plugin-web/{plugin_name}/{scope_def['format_js']}"
+                                  if scope_def.get("format_js") else None),
+                    "nav_target": scope_def.get("nav_target"),
+                })
+
         return {
             "toolsets": {
                 "list": toolsets_list,
@@ -622,6 +639,7 @@ async def get_init_data(request: Request, _=Depends(require_login), system=Depen
             "wizard_step": wizard_step,
             "avatars": avatars,
             "plugins_config": plugins_config,
+            "scope_declarations": scope_declarations,
             "load_errors": _get_load_errors()
         }
     except Exception as e:
@@ -657,23 +675,6 @@ async def remove_history_messages(request: Request, _=Depends(require_login), sy
             session_manager = system.llm_chat.session_manager
             chat_name = session_manager.get_active_chat_name()
             session_manager.clear()
-
-            chat_settings = session_manager.get_chat_settings()
-            story_enabled = chat_settings.get('story_engine_enabled', False)
-            if story_enabled:
-                from core.story_engine import StoryEngine
-                db_path = PROJECT_ROOT / "user" / "history" / "sapphire_history.db"
-                if db_path.exists() and chat_name:
-                    engine = StoryEngine(chat_name, db_path)
-                    preset = chat_settings.get('story_preset')
-                    if preset:
-                        engine.load_preset(preset, 1)
-                    else:
-                        engine.clear_all()
-
-                    live_engine = system.llm_chat.function_manager.get_story_engine()
-                    if live_engine and live_engine.chat_name == chat_name:
-                        live_engine.reload_from_db()
 
             origin = request.headers.get('X-Session-ID')
             publish(Events.CHAT_CLEARED, {"chat_name": chat_name, "origin": origin})
@@ -789,13 +790,9 @@ async def import_history(request: Request, _=Depends(require_login), system=Depe
 
 @router.get("/api/chats")
 async def list_chats(request: Request, type: str = None, _=Depends(require_login), system=Depends(get_system)):
-    """List chats. Optional ?type=regular|story to filter."""
+    """List chats."""
     try:
         chats = system.llm_chat.list_chats()
-        if type == "regular":
-            chats = [c for c in chats if not c.get("story_chat")]
-        elif type == "story":
-            chats = [c for c in chats if c.get("story_chat")]
         active_chat = system.llm_chat.get_active_chat()
         return {"chats": chats, "active_chat": active_chat}
     except Exception as e:
@@ -877,7 +874,7 @@ async def delete_chat(chat_name: str, request: Request, _=Depends(require_login)
                 _apply_chat_settings(system, settings)
             # Cleanup per-chat RAG documents
             try:
-                from functions import knowledge
+                from plugins.memory.tools import knowledge_tools as knowledge
                 knowledge.delete_scope(f"__rag__:{chat_name}")
             except Exception:
                 pass
@@ -923,25 +920,22 @@ async def get_active_chat(request: Request, _=Depends(require_login), system=Dep
 
 @router.get("/api/chats/{chat_name}/settings")
 async def get_chat_settings(chat_name: str, request: Request, _=Depends(require_login), system=Depends(get_system)):
-    """Get settings for a specific chat."""
+    """Get settings for a specific chat.
+
+    Reads from SQLite (same storage used by every other chat operation).
+    Legacy pre-SQLite code path checked a JSON file that no longer exists
+    post-migration, causing every non-active chat to 404 here — which in
+    turn made `tools/ask-sapphire.sh` and any other external caller
+    silently fall back to default scopes + sapphire persona. Root cause of
+    the silent-default class we found on 2026-04-19."""
     try:
         session_manager = system.llm_chat.session_manager
         if chat_name == session_manager.active_chat_name:
             return {"settings": session_manager.get_chat_settings()}
 
-        chat_path = session_manager._get_chat_path(chat_name)
-        if not chat_path.exists():
+        settings = session_manager.read_chat_settings(chat_name)
+        if settings is None:
             raise HTTPException(status_code=404, detail=f"Chat '{chat_name}' not found")
-
-        with open(chat_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-
-        if isinstance(data, dict) and "settings" in data:
-            settings = data["settings"]
-        else:
-            from core.chat.history import SYSTEM_DEFAULTS
-            settings = SYSTEM_DEFAULTS.copy()
-
         return {"settings": settings}
     except HTTPException:
         raise
@@ -975,20 +969,13 @@ async def update_chat_settings(chat_name: str, request: Request, _=Depends(requi
         fm = system.llm_chat.function_manager
         toolset_info = fm.get_current_toolset_info()
         function_names = fm.get_enabled_function_names()
-        from core.story_engine import STORY_TOOL_NAMES
-        all_story_names = set(STORY_TOOL_NAMES)
-        engine = fm.get_story_engine()
-        if engine:
-            all_story_names |= engine.story_tool_names
-        state_tools = [f for f in function_names if f in all_story_names]
-        user_tools = [f for f in function_names if f not in all_story_names]
 
         return {
             "status": "success",
             "message": f"Settings updated for '{chat_name}'",
             "toolset": toolset_info,
-            "functions": user_tools,
-            "state_tools": state_tools,
+            "functions": list(function_names),
+            "state_tools": [],
         }
     except HTTPException:
         raise

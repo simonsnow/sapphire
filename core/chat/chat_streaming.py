@@ -21,6 +21,11 @@ class StreamingChat:
         self.current_stream = None
         self.ephemeral = False
         self.is_streaming = False
+        # Name of the chat currently streaming — lets /api/cancel refuse to
+        # cancel a DIFFERENT chat's stream (was global, cross-chat tabs
+        # interfered). Full per-request streaming state is H4 architecture
+        # work; this is the narrow scoping fix. H5 2026-04-22.
+        self.active_chat_name = None
 
     def _cleanup_stream(self):
         """Safely close current stream if it exists."""
@@ -78,10 +83,15 @@ class StreamingChat:
             self.cancel_flag = False
             self.current_stream = None
             self.ephemeral = False
-            self.main_chat.session_manager._is_streaming = True
-
-            # Update story engine FIRST (before building messages) based on current settings
-            self.main_chat._update_story_engine()
+            try:
+                self.active_chat_name = self.main_chat.session_manager.get_active_chat_name()
+            except Exception:
+                self.active_chat_name = None
+            # H4 follow-up 2026-04-22: was `_is_streaming = True` (single bool).
+            # Two concurrent streams on same chat had the first finisher set
+            # False while the second was still running → append_messages_to_chat
+            # guard failed → mid-turn history corruption. Counter fix.
+            self.main_chat.session_manager.begin_streaming()
 
             # Plugin pre_chat hook — can modify input, bypass LLM, or stop propagation
             if hook_runner.has_handlers("pre_chat"):
@@ -147,6 +157,11 @@ class StreamingChat:
                 yield {"type": "content", "text": force_prefill}
             
             # Set scopes for this chat context
+            # Reset first to prevent bleed across chats when plugin scopes come and go
+            # (a chat saved before a plugin was enabled wouldn't have its scope key in settings,
+            # and apply_scopes only sets keys present in the dict → stale value survives).
+            from core.chat.function_manager import reset_scopes
+            reset_scopes()
             chat_settings = self.main_chat.session_manager.get_chat_settings()
             self.main_chat.function_manager.apply_scopes(chat_settings)
             chat_name = self.main_chat.session_manager.get_active_chat_name()
@@ -780,5 +795,6 @@ class StreamingChat:
             self._cleanup_stream()
             self.cancel_flag = False
             self.is_streaming = False
-            self.main_chat.session_manager._is_streaming = False
+            self.active_chat_name = None
+            self.main_chat.session_manager.end_streaming()
             publish(Events.AI_TYPING_END)

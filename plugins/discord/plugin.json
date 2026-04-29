@@ -11,6 +11,17 @@
   "settingsUI": "plugin",
   "capabilities": {
     "tools": ["tools/discord_tools.py"],
+    "scopes": [
+      {
+        "key": "discord",
+        "label": "discord",
+        "endpoint": "/api/plugin/discord/accounts",
+        "data_key": "accounts",
+        "value_field": "name",
+        "name_field": "name",
+        "label_template": "{bot_name}"
+      }
+    ],
     "daemon": {
       "entry": "daemon.py",
       "event_sources": [{
@@ -42,8 +53,8 @@
             "key": "auto_reply",
             "type": "boolean",
             "label": "Auto-reply in channel",
-            "default": false,
-            "help": "When enabled, the AI's response is sent back to the channel."
+            "default": true,
+            "help": "ON (default): AI's response posts back to the channel — what you want for a mention-reply bot. OFF: listen-only mode (e.g. pipe to TTS, save to memory, or trigger other tools without replying in Discord). The 5-second cooldown floor protects your bot token from rate-limit bans either way."
           },
           {
             "key": "cooldown",

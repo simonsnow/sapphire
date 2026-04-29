@@ -317,6 +317,84 @@ class TestFireEventTask:
         assert result["success"] is False
         assert "disabled" in result["error"].lower()
 
+    def test_fire_event_task_uses_live_task_not_stale_snapshot(self, tmp_path):
+        """[REGRESSION_GUARD] fire_event_task re-fetches the task per drain
+        iteration instead of closure-capturing the spawn-time snapshot.
+        Without this, editing a daemon task (prompt/toolset/trigger_config)
+        while events are queued keeps running the stale version until the
+        queue drains. Scout finding 2026-04-19."""
+        import time
+        sched = self._make_scheduler(tmp_path)
+        task = sched.create_task({
+            "name": "LiveTask",
+            "type": "daemon",
+            "schedule": "0 0 31 2 *",
+            "trigger_config": {"source": "test"},
+            "prompt": "original",
+        })
+
+        # Block the executor on the first call so we can mutate the task,
+        # then release and let a queued event drain under the new config.
+        call_count = {"n": 0}
+        observed_prompts = []
+        release = threading.Event()
+
+        def _blocking_run(task_arg, **kwargs):
+            call_count["n"] += 1
+            observed_prompts.append(task_arg.get("prompt"))
+            if call_count["n"] == 1:
+                # Hold until Krem mutates the task then releases us
+                release.wait(timeout=2)
+            return {"success": True, "responses": [], "errors": []}
+
+        sched.executor.run.side_effect = _blocking_run
+
+        # Fire first event — worker thread starts, blocks in executor.run
+        r1 = sched.fire_event_task(task["id"], '{"n": 1}')
+        assert r1["success"] is True and not r1.get("queued")
+
+        # Wait until the thread is actually inside executor.run
+        for _ in range(100):
+            if call_count["n"] >= 1:
+                break
+            time.sleep(0.01)
+        assert call_count["n"] == 1
+
+        # Queue a second event while the first is still running
+        r2 = sched.fire_event_task(task["id"], '{"n": 2}')
+        assert r2["success"] is True and r2.get("queued") is True
+
+        # REPLACE the task dict in the registry (simulating plugin reload
+        # that re-registers a task, which creates a new dict). Pure in-place
+        # mutation wouldn't catch the stale-snapshot bug because the
+        # closure-captured `task` would point at the same dict. A plugin
+        # reload / full update path produces a new dict — that's what the
+        # fix needs to handle.
+        with sched._lock:
+            old = sched._tasks[task["id"]]
+            replacement = dict(old)
+            replacement["prompt"] = "mutated"
+            sched._tasks[task["id"]] = replacement
+
+        # Release the blocked first iteration; the drain should see the new prompt
+        release.set()
+
+        # Wait for the drain
+        for _ in range(200):
+            if call_count["n"] >= 2:
+                break
+            time.sleep(0.01)
+        assert call_count["n"] == 2, "second drain iteration never ran"
+
+        # First iteration ran with the original config (captured at fire time).
+        # Second (drain) iteration MUST have observed the mutated prompt,
+        # proving fire_event_task re-fetched live task per iteration.
+        assert observed_prompts[0] == "original"
+        assert observed_prompts[1] == "mutated", (
+            f"stale snapshot bug — drain iteration saw {observed_prompts[1]!r}, "
+            f"expected 'mutated'"
+        )
+
 
 # ============================================================================
 # Scheduler: cron check skips daemon/webhook
@@ -369,10 +447,13 @@ class TestExecutorEventData:
     """Test that executor formats event data and passes to ExecutionContext."""
 
     def test_event_data_formatted(self):
-        """Event data with 'text' field should be formatted as clean message."""
+        """Event data with 'text' field should be formatted as clean message.
+        Output now also includes a leading 'Current time: ...' line so the LLM
+        has temporal context — assert structure rather than exact equality."""
         from core.continuity.executor import ContinuityExecutor
         result = ContinuityExecutor._format_event_data('{"first_name": "Bob", "text": "hello"}')
-        assert result == ">>> Bob: hello"
+        assert result.startswith("Current time: "), f"missing time prefix: {result!r}"
+        assert result.endswith(">>> Bob: hello"), f"missing sender/message: {result!r}"
 
     def test_event_data_raw_passthrough(self):
         """Event data without 'text' field passes through as-is."""

@@ -40,12 +40,23 @@ async def create_backup(request: Request, _=Depends(require_login)):
     if backup_type not in ('daily', 'weekly', 'monthly', 'manual'):
         raise HTTPException(status_code=400, detail="Invalid backup type")
 
-    filename = backup_manager.create_backup(backup_type)
-    if filename:
-        backup_manager.rotate_backups()
-        return {"status": "success", "filename": filename}
-    else:
-        raise HTTPException(status_code=500, detail="Backup creation failed")
+    # Hold the backup lock across create + rotate so this manual trigger
+    # can't interleave with the 3am scheduled cycle. Witch-hunt 2026-04-21
+    # finding R5 — without this, overlapping runs could delete an in-flight
+    # partial via rotation mtime sort.
+    # Health gate: don't create new backups while corruption sentinels are
+    # active — the whole point is to preserve last-known-good. R1.
+    if backup_manager._active_corruption_sentinels():
+        raise HTTPException(status_code=409, detail=(
+            "Corruption sentinel active — backup creation halted to preserve "
+            "last-known-good tarballs. See user/health/CORRUPT_*.flag."
+        ))
+    with backup_manager._backup_op_lock:
+        filename = backup_manager.create_backup(backup_type)
+        if filename:
+            backup_manager.rotate_backups()
+            return {"status": "success", "filename": filename}
+    raise HTTPException(status_code=500, detail="Backup creation failed")
 
 
 @router.delete("/api/backup/delete/{filename}")
@@ -512,10 +523,17 @@ async def request_system_shutdown(request: Request, _=Depends(require_login)):
 
 @router.get("/api/system/update-check")
 async def check_for_update(request: Request, _=Depends(require_login)):
-    """Check GitHub for a newer Sapphire version."""
+    """Return cached update status. Fires a background GitHub check if cache is stale.
+    Non-blocking: the dashboard shouldn't wait 4s on a network round-trip.
+    Users who want a fresh check can call ?force=1 (or POST /api/system/update-check-now)."""
     from core.updater import updater
     from core.settings_manager import settings
-    status = updater.check_for_update(force=True)
+    force = request.query_params.get('force') in ('1', 'true', 'yes')
+    if force:
+        status = updater.check_for_update(force=True)
+    else:
+        updater.check_for_update_async()
+        status = updater.status()
     status['docker'] = settings.is_docker()
     status['managed'] = settings.is_managed()
     return status
@@ -523,24 +541,48 @@ async def check_for_update(request: Request, _=Depends(require_login)):
 
 @router.post("/api/system/update")
 async def do_update(request: Request, _=Depends(require_login)):
-    """Run git pull to update Sapphire, then restart."""
+    """Schedule a deferred update. Pre-flights everything; refuses with a
+    specific reason if anything's weird. On success, writes a pending-update
+    marker and requests restart — main.py runs the pull + pip install before
+    re-spawning sapphire.py. Result is readable via /api/system/last-update-result.
+    """
     from core.updater import updater
     from core.settings_manager import settings
+    import asyncio
 
     if settings.is_docker() or settings.is_managed():
         raise HTTPException(status_code=403, detail="Use docker compose pull to update Docker installations")
 
     success, message = updater.do_update()
     if not success:
-        raise HTTPException(status_code=500, detail=message)
+        raise HTTPException(status_code=400, detail=message)
 
-    # Trigger restart to load new code
+    # Return the HTTP response BEFORE triggering the restart — otherwise the
+    # socket can be torn down mid-response and the client sees "update failed"
+    # when it actually scheduled fine. Schedule restart on a short delay so
+    # the response has time to flush.
     from core.api_fastapi import get_restart_callback
     callback = get_restart_callback()
     if callback:
-        callback()
+        async def _delayed_restart():
+            await asyncio.sleep(0.5)
+            try:
+                callback()
+            except Exception:
+                pass
+        asyncio.create_task(_delayed_restart())
 
-    return {"status": "updated", "message": message}
+    return {"status": "scheduled", "message": message}
+
+
+@router.get("/api/system/last-update-result")
+async def last_update_result(request: Request, _=Depends(require_login)):
+    """Return the result of the most recent deferred update attempt, then
+    clear it so the UI only shows the toast once per update cycle."""
+    from core.updater import read_last_update_result
+    clear = request.query_params.get('clear', '1') in ('1', 'true', 'yes')
+    result = read_last_update_result(clear=clear)
+    return {"result": result}
 
 
 # =============================================================================

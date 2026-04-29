@@ -360,13 +360,14 @@ export async function handleStop() {
 export async function triggerSendWithText(text) {
     if (getIsProc()) {
         console.log('Already processing, ignoring transcribed text');
-        return;
+        return false;
     }
-    
+
     const { input } = getElements();
     input.value = text;
     input.dispatchEvent(new Event('input'));
     await handleSend();
+    return true;
 }
 
 let _userTypingTimer = null;

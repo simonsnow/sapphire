@@ -17,17 +17,17 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "telegram_send",
-            "description": "Send a message to a Telegram chat. Uses the account selected in sidebar scope.",
+            "description": "Send a Telegram message. Uses sidebar-scoped account.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "chat_id": {
                         "type": ["string", "integer"],
-                        "description": "Telegram chat ID (number) or @username"
+                        "description": "Chat id (number) or @username"
                     },
                     "text": {
                         "type": "string",
-                        "description": "Message text to send"
+                        "description": "Message text"
                     }
                 },
                 "required": ["chat_id", "text"]
@@ -38,13 +38,13 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "telegram_get_chats",
-            "description": "List recent Telegram chats with last message preview and unread count. One call gives you the full picture.",
+            "description": "Recent Telegram chats with last-message preview + unread count.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "limit": {
                         "type": "integer",
-                        "description": "Max chats to return (default 15)",
+                        "description": "Max chats (default 15)",
                         "default": 15
                     }
                 },
@@ -56,17 +56,17 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "telegram_read_messages",
-            "description": "Read recent messages from a specific Telegram chat. Use telegram_get_chats first to find chat IDs.",
+            "description": "Read recent messages from a Telegram chat. Get chat_id from telegram_get_chats.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "chat_id": {
                         "type": ["string", "integer"],
-                        "description": "Telegram chat ID (number) or @username"
+                        "description": "Chat id (number) or @username"
                     },
                     "limit": {
                         "type": "integer",
-                        "description": "Max messages to return (default 20)",
+                        "description": "Max messages (default 20)",
                         "default": 20
                     }
                 },
@@ -78,17 +78,17 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "telegram_send_image",
-            "description": "Send the most recently generated image to a Telegram chat. Use this after generating an image (via comfy_generate, flux_generate, etc.) to share it. You'll see the image too so you can comment on it. The chat_id is provided in daemon event context.",
+            "description": "Send the most recently generated image to a Telegram chat. You see it too and can comment.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "chat_id": {
                         "type": ["string", "integer"],
-                        "description": "Telegram chat ID from the daemon event context"
+                        "description": "Chat id (from daemon event context)"
                     },
                     "caption": {
                         "type": "string",
-                        "description": "Caption for the image"
+                        "description": "Image caption"
                     }
                 },
                 "required": ["chat_id"]
@@ -99,20 +99,46 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "telegram_send_voice",
-            "description": "Send a voice note to a Telegram chat. Your message is spoken aloud using TTS and sent as a playable voice bubble. Great for personal messages, reminders, and when voice feels more natural than text.",
+            "description": "Send a TTS voice note to a Telegram chat (playable voice bubble).",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "chat_id": {
                         "type": ["string", "integer"],
-                        "description": "Telegram chat ID (number) or @username"
+                        "description": "Chat id (number) or @username"
                     },
                     "text": {
                         "type": "string",
-                        "description": "What to say in the voice note"
+                        "description": "What to say"
                     }
                 },
                 "required": ["chat_id", "text"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "telegram_add_contact",
+            "description": "Add a Telegram contact (client mode only). Required to message someone new.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "phone": {
+                        "type": "string",
+                        "description": "Phone with country code (e.g. +15551234567)"
+                    },
+                    "first_name": {
+                        "type": "string",
+                        "description": "First name"
+                    },
+                    "last_name": {
+                        "type": "string",
+                        "description": "Last name",
+                        "default": ""
+                    }
+                },
+                "required": ["phone", "first_name"]
             }
         }
     }
@@ -180,6 +206,8 @@ def execute(function_name, arguments, config):
             result = telegram_send_voice(arguments, config)
         elif function_name == "telegram_send_image":
             result = telegram_send_image(arguments, config)
+        elif function_name == "telegram_add_contact":
+            result = telegram_add_contact(arguments, config)
         else:
             return f"Unknown function: {function_name}", False
         # Inner functions return error strings on failure
@@ -405,3 +433,55 @@ def telegram_read_messages(args, config):
     except Exception as e:
         logger.error(f"[TELEGRAM] Read messages failed: {e}")
         return f"Failed to read messages: {e}"
+
+
+def telegram_add_contact(args, config):
+    ready = _check_ready()
+    if isinstance(ready, str):
+        return ready
+    client, loop = ready
+
+    # Bots can't add contacts — client accounts only
+    account = _get_account()
+    if account:
+        from core.plugin_loader import plugin_loader
+        state = plugin_loader.get_plugin_state("telegram")
+        meta = (state.get("accounts", {}) if state else {}).get(account, {})
+        if meta.get("type") == "bot":
+            return "Cannot add contacts — this is a bot account. Only client accounts can manage contacts."
+
+    phone = args.get("phone", "").strip()
+    first_name = args.get("first_name", "").strip()
+    last_name = args.get("last_name", "").strip()
+    if not phone or not first_name:
+        return "Missing required fields: phone, first_name"
+
+    try:
+        async def _add():
+            from telethon.tl.functions.contacts import ImportContactsRequest
+            from telethon.tl.types import InputPhoneContact
+            result = await client(ImportContactsRequest(contacts=[
+                InputPhoneContact(
+                    client_id=0,
+                    phone=phone,
+                    first_name=first_name,
+                    last_name=last_name
+                )
+            ]))
+            if result.imported:
+                user = result.users[0] if result.users else None
+                if user:
+                    label = f"@{user.username}" if user.username else f"{user.first_name}"
+                    return f"Contact added: {label} (ID: {user.id}). You can now message them."
+                return f"Contact imported for {phone}."
+            elif result.retry_contacts:
+                return f"Failed — {phone} is not registered on Telegram."
+            else:
+                return f"Contact already exists or could not be imported for {phone}."
+
+        future = asyncio.run_coroutine_threadsafe(_add(), loop)
+        return future.result(timeout=15)
+
+    except Exception as e:
+        logger.error(f"[TELEGRAM] Add contact failed: {e}")
+        return f"Failed to add contact: {e}"

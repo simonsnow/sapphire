@@ -275,71 +275,17 @@
                             <button type="button" class="sb-toggle" id="sb-datetime-toggle" data-active="false">Date/Time</button>
                         </div>
 
-                        <!-- Mind Scopes Accordion -->
+                        <!-- Mind Scopes Accordion — populated by shared/scope-dropdowns.js
+                             from /api/init scope_declarations. Each editor that needs
+                             scope dropdowns (sidebar, persona, trigger editor) uses the
+                             same renderer; adding a new scope means editing one manifest. -->
                         <div class="sidebar-section sidebar-accordion">
                             <div class="sidebar-accordion-header">
                                 <span class="accordion-arrow">&#x25B6;</span>
                                 <span>&#x1F9E0; Mind</span>
                             </div>
                             <div class="sidebar-accordion-content" style="display:none">
-                            <div class="sb-field">
-                                <label for="sb-memory-scope">memory</label>
-                                <div class="sb-field-row">
-                                    <select id="sb-memory-scope"><option value="none">None</option><option value="default">default</option></select>
-                                    <button type="button" class="sb-btn-sm sb-goto-mind" data-tab="memories" title="Open in Mind">&#x2197;</button>
-                                </div>
-                            </div>
-                            <div class="sb-field">
-                                <label for="sb-goal-scope">goals</label>
-                                <div class="sb-field-row">
-                                    <select id="sb-goal-scope"><option value="none">None</option><option value="default">default</option></select>
-                                    <button type="button" class="sb-btn-sm sb-goto-mind" data-tab="goals" title="Open in Mind">&#x2197;</button>
-                                </div>
-                            </div>
-                            <div class="sb-field">
-                                <label for="sb-knowledge-scope">knowl.</label>
-                                <div class="sb-field-row">
-                                    <select id="sb-knowledge-scope"><option value="none">None</option><option value="default">default</option></select>
-                                    <button type="button" class="sb-btn-sm sb-goto-mind" data-tab="knowledge" title="Open in Mind">&#x2197;</button>
-                                </div>
-                            </div>
-                            <div class="sb-field">
-                                <label for="sb-people-scope">people</label>
-                                <div class="sb-field-row">
-                                    <select id="sb-people-scope"><option value="none">None</option><option value="default">default</option></select>
-                                    <button type="button" class="sb-btn-sm sb-goto-mind" data-tab="people" title="Open in Mind">&#x2197;</button>
-                                </div>
-                            </div>
-                            <div class="sb-field" data-plugin-scope="email">
-                                <label for="sb-email-scope">email</label>
-                                <div class="sb-field-row">
-                                    <select id="sb-email-scope"><option value="none">None</option><option value="default">default</option></select>
-                                </div>
-                            </div>
-                            <div class="sb-field" data-plugin-scope="bitcoin">
-                                <label for="sb-bitcoin-scope">bitcoin</label>
-                                <div class="sb-field-row">
-                                    <select id="sb-bitcoin-scope"><option value="none">None</option><option value="default">default</option></select>
-                                </div>
-                            </div>
-                            <div class="sb-field" data-plugin-scope="google-calendar">
-                                <label for="sb-gcal-scope">calendar</label>
-                                <div class="sb-field-row">
-                                    <select id="sb-gcal-scope"><option value="none">None</option><option value="default">default</option></select>
-                                </div>
-                            </div>
-                            <div class="sb-field" data-plugin-scope="telegram">
-                                <label for="sb-telegram-scope">telegram</label>
-                                <div class="sb-field-row">
-                                    <select id="sb-telegram-scope"><option value="none">None</option><option value="default">default</option></select>
-                                </div>
-                            </div>
-                            <div class="sb-field" data-plugin-scope="discord">
-                                <label for="sb-discord-scope">discord</label>
-                                <div class="sb-field-row">
-                                    <select id="sb-discord-scope"><option value="none">None</option><option value="default">default</option></select>
-                                </div>
-                            </div>
+                                <div id="sb-scope-dropdowns"></div>
                             </div>
                         </div>
 
@@ -408,33 +354,6 @@
                             </div>
                         </div>
 
-                        <!-- Story Engine Accordion -->
-                        <div class="sidebar-section sidebar-accordion">
-                            <div class="sidebar-accordion-header">
-                                <span class="accordion-arrow">&#x25B6;</span>
-                                <span>Story Engine</span>
-                            </div>
-                            <div class="sidebar-accordion-content" style="display:none">
-                                <div class="sb-field">
-                                    <label><input type="checkbox" id="sb-story-enabled"> Enable</label>
-                                </div>
-                                <div class="sb-field">
-                                    <label for="sb-story-preset">preset</label>
-                                    <select id="sb-story-preset"><option value="">None</option></select>
-                                </div>
-                                <div class="sb-field">
-                                    <label><input type="checkbox" id="sb-story-in-prompt" checked> Story in prompt</label>
-                                </div>
-                                <div class="sb-field">
-                                    <label><input type="checkbox" id="sb-story-vars"> Variables in prompt</label>
-                                </div>
-                                <div class="sb-field sb-actions">
-                                    <button type="button" id="sb-story-view" class="sb-btn-sm">View</button>
-                                    <button type="button" id="sb-story-reset" class="sb-btn-sm">Reset</button>
-                                </div>
-                            </div>
-                        </div>
-
                         <!-- Plugin-registered accordions (injected by JS) -->
                         <div id="sb-plugin-accordions"></div>
 
@@ -465,25 +384,25 @@
         <div id="view-prompts" class="view" style="display:none">
             <div class="view-placeholder">
                 <h2>Prompts</h2>
-                <p>Prompt editor - coming next</p>
+                <p>Loading...</p>
             </div>
         </div>
         <div id="view-toolsets" class="view" style="display:none">
             <div class="view-placeholder">
                 <h2>Toolsets</h2>
-                <p>Ability manager - coming next</p>
+                <p>Loading...</p>
             </div>
         </div>
         <div id="view-spices" class="view" style="display:none">
             <div class="view-placeholder">
                 <h2>Spices</h2>
-                <p>Spice manager - coming next</p>
+                <p>Loading...</p>
             </div>
         </div>
         <div id="view-schedule" class="view" style="display:none">
             <div class="view-placeholder">
                 <h2>Schedule</h2>
-                <p>Continuity manager - coming next</p>
+                <p>Loading...</p>
             </div>
         </div>
         <div id="view-mind" class="view" style="display:none">
@@ -495,7 +414,7 @@
         <div id="view-settings" class="view" style="display:none">
             <div class="view-placeholder">
                 <h2>Settings</h2>
-                <p>System settings - coming next</p>
+                <p>Loading...</p>
             </div>
         </div>
         <div id="view-apps" class="view" style="display:none">
@@ -546,19 +465,6 @@
             <button id="image-modal-prev" class="image-modal-nav image-modal-prev-btn">&#8249;</button>
             <button id="image-modal-next" class="image-modal-nav image-modal-next-btn">&#8250;</button>
             <div id="image-modal-counter" class="image-modal-counter"></div>
-        </div>
-    </div>
-
-    <!-- Story Picker Modal -->
-    <div id="story-picker-modal" class="story-modal-overlay" style="display:none">
-        <div class="story-modal">
-            <div class="story-modal-header">
-                <h3>Start a Story</h3>
-                <button class="btn-icon" id="story-modal-close">&times;</button>
-            </div>
-            <div class="story-modal-body">
-                <div class="story-preset-grid" id="story-preset-grid"></div>
-            </div>
         </div>
     </div>
 

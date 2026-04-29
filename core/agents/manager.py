@@ -157,12 +157,19 @@ class AgentManager:
 
     def _check_batch_complete(self, agent_id, chat_name):
         """Called when an agent finishes. If all agents for this chat are done, publish batch report."""
+        logger.info(f"[batch-gate] ENTER _check_batch_complete agent_id={agent_id} chat={chat_name!r}")
         with self._lock:
             chat_agents = [a for a in self._agents.values() if a.chat_name == chat_name]
             if not chat_agents:
+                logger.info(f"[batch-gate] chat={chat_name!r} no agents in registry (agent_id={agent_id} already popped?) — skipping batch fire")
                 return
-            if any(a.status == 'running' for a in chat_agents):
+            statuses = [(a.name, a.status) for a in chat_agents]
+            still_running = [a.name for a in chat_agents if a.status == 'running']
+            if still_running:
+                logger.info(f"[batch-gate] chat={chat_name!r} batch NOT ready — "
+                            f"all agents: {statuses}, still running: {still_running}")
                 return
+            logger.info(f"[batch-gate] chat={chat_name!r} ALL DONE — firing batch with {len(chat_agents)} agents")
 
             report_lines = []
             for a in chat_agents:

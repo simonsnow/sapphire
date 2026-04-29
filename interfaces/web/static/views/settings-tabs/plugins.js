@@ -3,8 +3,11 @@ import * as ui from '../../ui.js';
 import { showDangerConfirm } from '../../shared/danger-confirm.js';
 import pluginsAPI from '../../shared/plugins-api.js';
 
-// Infrastructure plugins hidden from toggle list
-const HIDDEN = new Set(['setup-wizard', 'backup', 'continuity']);
+// Infrastructure plugins hidden from toggle list.
+// (Phase 2 v7: backup + continuity were dead core-ui leftovers; the real backup
+// UI lives at views/settings-tabs/backup.js and the real continuity UI is the
+// schedule view. setup-wizard is the only live core-ui plugin.)
+const HIDDEN = new Set(['setup-wizard']);
 
 // Danger confirmation configs for risky plugins
 const DANGER_PLUGINS = {

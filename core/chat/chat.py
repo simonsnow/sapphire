@@ -66,6 +66,10 @@ def friendly_llm_error(e):
             return "Model not found or not loaded. If using LM Studio, make sure a model is loaded and running."
         if any(k in error_str for k in ('image', 'vision', 'multimodal', 'content_type')):
             return "This model doesn't support images. Load a vision model to use image attachments."
+        if 'invalid tool call' in error_str or 'tool call arguments' in error_str:
+            return "This provider rejected a tool call in your chat history (strict tool-call validation). Try starting a new chat, or switch to a more lenient provider (OpenAI, Fireworks)."
+        if 'tool' in error_str and any(k in error_str for k in ('not support', "doesn't support", 'unsupported')):
+            return "This model doesn't support tool calls. Switch to a tool-capable model or disable your toolset."
         return f"LLM request rejected (400). {str(e)[:200]}"
 
     if status == 401:
@@ -150,9 +154,77 @@ class LLMChat:
         self.function_manager = FunctionManager()
         
         self.tool_engine = ToolCallingEngine(self.function_manager)
-        self.streaming_chat = StreamingChat(self)
-        
+
+        # Per-request StreamingChat isolation — H4 2026-04-22.
+        # Was: `self.streaming_chat = StreamingChat(self)` (one shared
+        # instance; two tabs corrupt each other's state).
+        # Now: each chat_stream call gets its own StreamingChat via
+        # begin_stream(); tracked in dicts below so /api/cancel can target
+        # per-chat, and status can report any-streaming. Enables the
+        # many-personas/heartbeats isolation Krem wants.
+        import threading as _threading
+        self._streams_by_id = {}       # {stream_id: StreamingChat}
+        self._streams_by_chat = {}     # {chat_name: set(stream_id)}
+        self._streams_lock = _threading.Lock()
+
         logger.info("LLMChat.__init__ completed")
+
+    # ── Per-request streaming state API ──
+
+    def begin_stream(self, chat_name=None):
+        """Create a fresh StreamingChat, register it. Caller owns the ref.
+
+        Returns (stream, stream_id, chat_name_used). Pair with end_stream().
+        """
+        import secrets as _secrets
+        stream = StreamingChat(self)
+        sid = _secrets.token_hex(8)
+        if chat_name is None:
+            try:
+                chat_name = self.session_manager.get_active_chat_name() or ''
+            except Exception:
+                chat_name = ''
+        with self._streams_lock:
+            self._streams_by_id[sid] = stream
+            self._streams_by_chat.setdefault(chat_name, set()).add(sid)
+        stream.active_chat_name = chat_name
+        return stream, sid, chat_name
+
+    def end_stream(self, stream_id, chat_name):
+        """Unregister a stream. Idempotent."""
+        with self._streams_lock:
+            self._streams_by_id.pop(stream_id, None)
+            ids = self._streams_by_chat.get(chat_name)
+            if ids is not None:
+                ids.discard(stream_id)
+                if not ids:
+                    self._streams_by_chat.pop(chat_name, None)
+
+    def cancel_streams(self, chat_name=None):
+        """Set cancel_flag on active streams. If chat_name given, only that
+        chat's streams (including every tab concurrently on it). Otherwise
+        all active streams across all chats. Returns count of streams flagged.
+        """
+        with self._streams_lock:
+            if chat_name:
+                ids = list(self._streams_by_chat.get(chat_name, set()))
+            else:
+                ids = list(self._streams_by_id.keys())
+            targets = [self._streams_by_id[i] for i in ids if i in self._streams_by_id]
+        for s in targets:
+            s.cancel_flag = True
+        return len(targets)
+
+    def any_streaming(self):
+        """True if at least one stream is active."""
+        with self._streams_lock:
+            return bool(self._streams_by_id)
+
+    def streams_for_chat(self, chat_name):
+        """List of active StreamingChat instances for a chat (may be empty)."""
+        with self._streams_lock:
+            ids = list(self._streams_by_chat.get(chat_name, set()))
+            return [self._streams_by_id[i] for i in ids if i in self._streams_by_id]
 
     def _init_provider_legacy(self, llm_config, name):
         """Initialize an LLM provider from legacy config dict."""
@@ -232,21 +304,6 @@ class LLMChat:
         context_parts = []
         chat_settings = self.session_manager.get_chat_settings()
 
-        # Debug logging for story engine
-        story_enabled = chat_settings.get('story_engine_enabled', False)
-        story_engine = self.function_manager.get_story_engine()
-        logger.info(f"[STORY] _get_system_prompt: enabled={story_enabled}, engine_exists={story_engine is not None}")
-
-        # Story prompt override: use prompt.md unless user explicitly picked a different prompt
-        active_prompt = chat_settings.get('prompt', '')
-        if story_enabled and story_engine and active_prompt in ('__story__', ''):
-            story_prompt = story_engine.story_prompt
-            if story_prompt:
-                prompt = story_prompt.replace("{user_name}", username).replace("{ai_name}", ai_name)
-                logger.info(f"[STORY] Using story prompt override ({len(story_prompt)} chars)")
-        elif story_enabled and story_engine:
-            logger.info(f"[STORY] User override: using '{active_prompt}' instead of story prompt")
-
         # Inject datetime if enabled (user's timezone)
         if chat_settings.get('inject_datetime', False):
             from datetime import datetime
@@ -265,30 +322,6 @@ class LLMChat:
         if custom_ctx:
             context_parts.append(custom_ctx)
 
-        # Inject story engine block if enabled
-        # Static story content goes into context_parts (cached with system prompt)
-        # Dynamic story content goes into dynamic_context (separate uncached block)
-        dynamic_context = []
-        if story_enabled:
-            if story_engine:
-                vars_in_prompt = chat_settings.get('story_vars_in_prompt', False)
-                story_in_prompt = chat_settings.get('story_in_prompt', True)
-
-                logger.info(f"[STORY] Prompt injection: vars={vars_in_prompt}, story={story_in_prompt}, preset={story_engine.preset_name}")
-
-                if vars_in_prompt or story_in_prompt:
-                    turn = self.session_manager.get_turn_count() + 1
-                    static_block, dynamic_block = story_engine.format_for_prompt_split(
-                        include_vars=vars_in_prompt,
-                        include_story=story_in_prompt,
-                        current_turn=turn
-                    )
-                    if static_block:
-                        context_parts.append(f"<story>\n{static_block}\n</story>")
-                    if dynamic_block:
-                        dynamic_context.append(f"<state turn=\"{turn}\">\n{dynamic_block}\n</state>")
-                    logger.info(f"[STORY] Static: {len(static_block)} chars, Dynamic: {len(dynamic_block)} chars")
-        
         # Plugin prompt_inject hook — append to context_parts
         if hook_runner.has_handlers("prompt_inject"):
             inject_event = HookEvent(context_parts=context_parts, config=config)
@@ -298,64 +331,7 @@ class LLMChat:
         if context_parts:
             prompt = f"{prompt}\n\n{chr(10).join(context_parts)}"
 
-        # Dynamic context returned separately for cache-friendly injection
-        dynamic = "\n".join(dynamic_context) if dynamic_context else None
-
-        return prompt, username, dynamic
-
-    def _update_story_engine(self):
-        """Initialize or update story engine based on chat settings."""
-        chat_settings = self.session_manager.get_chat_settings()
-
-        # Fast path: story engine disabled (99% of users)
-        story_enabled = chat_settings.get('story_engine_enabled', False)
-        if not story_enabled:
-            if self.function_manager.get_story_engine():
-                self.function_manager.set_story_engine(None)
-                logger.debug("[STORY] Story engine disabled")
-            return
-
-        # Story engine is enabled - check if current engine is still valid
-        chat_name = self.session_manager.get_active_chat_name()
-        new_preset = chat_settings.get('story_preset')
-        current_engine = self.function_manager.get_story_engine()
-
-        # Fast path: existing engine is valid for this chat+preset
-        if (current_engine and
-            current_engine.chat_name == chat_name and
-            current_engine.preset_name == new_preset):
-            return
-
-        # Need to create or update engine
-        from core.story_engine import StoryEngine
-        db_path = self.session_manager._db_path
-
-        if current_engine and current_engine.preset_name != new_preset:
-            logger.info(f"[STORY] Preset changed: '{current_engine.preset_name}' → '{new_preset}'")
-
-        # Create new story engine for this chat
-        engine = StoryEngine(chat_name, db_path)
-
-        if new_preset:
-            db_preset = engine.preset_name
-            needs_fresh_load = (db_preset != new_preset) or engine.is_empty()
-
-            if needs_fresh_load:
-                turn = self.session_manager.get_turn_count()
-                success, msg = engine.load_preset(new_preset, turn)
-                if success:
-                    logger.info(f"[STORY] Loaded preset '{new_preset}' for chat '{chat_name}'")
-                else:
-                    logger.warning(f"[STORY] Failed to load preset '{new_preset}': {msg}")
-            else:
-                engine.reload_preset_config(new_preset)
-                logger.info(f"[STORY] Reloaded config for existing state in '{chat_name}'")
-
-        self.function_manager.set_story_engine(
-            engine,
-            lambda: self.session_manager.get_turn_count()
-        )
-        logger.info(f"[STORY] Story engine enabled for chat '{chat_name}'")
+        return prompt, username, None
 
     def _build_base_messages(self, user_input: str, images: list = None, files: list = None):
         system_prompt, user_name, dynamic_context = self._get_system_prompt()
@@ -422,7 +398,7 @@ class LLMChat:
         rag_scope = f"__rag__:{chat_name}"
 
         try:
-            from functions import knowledge
+            from plugins.memory.tools import knowledge_tools as knowledge
             entries = knowledge.get_entries_by_scope(rag_scope)
             if not entries:
                 return None
@@ -445,17 +421,11 @@ class LLMChat:
             logger.error(f"[RAG] Failed to get context: {e}", exc_info=True)
             return f"[RAG documents are configured but failed to load: {e}]"
 
-    def chat_stream(self, user_input: str, prefill: str = None, skip_user_message: bool = False, images: list = None, files: list = None):
-        return self.streaming_chat.chat_stream(user_input, prefill=prefill, skip_user_message=skip_user_message, images=images, files=files)
-
     def chat(self, user_input: str):
         try:
             chat_start_time = time.time()
             self.refresh_spice_if_needed()
             logger.info(f"[CHAT] CHAT: user said something here")
-
-            # Update story engine FIRST (before building messages) based on current settings
-            self._update_story_engine()
 
             # Plugin pre_chat hook — can modify input, bypass LLM, or stop propagation
             if hook_runner.has_handlers("pre_chat"):
@@ -474,6 +444,12 @@ class LLMChat:
             self.session_manager.add_user_message(user_input)
             
             # Set scopes for this chat context
+            # Reset first to prevent bleed: when a chat's saved settings don't include
+            # a newly-registered plugin scope, apply_scopes would leave the previous
+            # chat's value in place. reset_scopes() puts every scope back to its default
+            # before we apply the chat's specific values on top.
+            from core.chat.function_manager import reset_scopes
+            reset_scopes()
             chat_settings = self.session_manager.get_chat_settings()
             self.function_manager.apply_scopes(chat_settings)
             chat_name = self.session_manager.get_active_chat_name()
@@ -927,7 +903,6 @@ class LLMChat:
         self.session_manager.clear()
         from core.chat.function_manager import reset_scopes
         reset_scopes()
-        self.function_manager.set_story_engine(None)
         return True
 
     def list_chats(self) -> List[Dict[str, Any]]:
@@ -940,9 +915,6 @@ class LLMChat:
         return self.session_manager.delete_chat(chat_name)
 
     def switch_chat(self, chat_name: str) -> bool:
-        # Clear story engine so stale engine from previous chat doesn't persist
-        # _update_story_engine will recreate it on the next chat() call if needed
-        self.function_manager.set_story_engine(None)
         return self.session_manager.set_active_chat(chat_name)
 
     def get_active_chat(self) -> str:

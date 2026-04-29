@@ -3,10 +3,13 @@
   "version": "1.1.0",
   "files": {
     "README.md": "sha256:1f2aa61758e03c7e77ddce1f1e1ce0a147b2b99dacf679f0d747c03e6b853e76",
-    "daemon.py": "sha256:7e78736f5b6ed2203afa502a5640e81e08fa761bdd91371bc6b3adc9af74984a",
-    "plugin.json": "sha256:7f82d09be4f07be2dc280b2f20283101c11dd3e6c53a6f73d06e83c19f2e250d",
-    "tools/email_tool.py": "sha256:d5a892bddad9b8156b51df1f73e5f3619a640ff167c131ddfe1e411e0620cd2b",
+    "daemon.py": "sha256:d98d87e409e88f5f82904e402351bb392662ddcd71534c8c49addd1104c0e6a8",
+    "plugin.json": "sha256:baf20e70ec1ed389b87812b7ed54c2a7d66d40616eb950978aa24f218f3883f9",
+    "tests/test_archive_partial_success.py": "sha256:04f3d1e9f3c68a5fbb56ced21656cfc7a55877e54190fe120594113327948470",
+    "tests/test_oauth_refresh_error.py": "sha256:038dbc93d434de7185bfa5a53db785d5c587a20771016b7a1ad49e684e57d10e",
+    "tests/test_send_email_mutex.py": "sha256:279220d7b548b86428b3e843027327ef490f89236ded03b7fbb510b58bcc6c1f",
+    "tools/email_tool.py": "sha256:13df7b7b906a637044cbf104866a1494cd59421dda6b447658243d56057c0cda",
     "web/index.js": "sha256:7a06bb92b017588fe24610152faaa45365e2a44b4c277a596223cc3cf01e317f"
   },
-  "signature": "jOdFk1rYZPEe7Iqx1EJSnwhhKjcs+eA61aSAAt9JFhDjAtpivr1k5tXAUrS7mJO45j51Tm2YlF3R+EVB5W8KCA=="
+  "signature": "yPnf5i0bUNUFkZbSfx3qsuQsT4AWjnrTTiQF2SA/8Lv6DnRuSikg5jhDVeg18HEcbhlJqY7jHoTKDwLasQ3pCA=="
 }

@@ -161,18 +161,76 @@ class MyProvider(BaseSTTProvider):
 
 ### Embedding — `BaseEmbeddingProvider`
 
-```python
-from core.embeddings.base import BaseEmbeddingProvider
+Embedding providers are the most contract-sensitive of the four systems — every vector your provider writes is stamped with your provider's identity, so changing identity later invalidates the data. Read this section carefully.
 
-class MyProvider(BaseEmbeddingProvider):
-    def embed(self, texts: list, prefix: str = 'search_document') -> list | None:
-        """Embed a list of texts. Return list of float lists, or None."""
-        ...
+The registry enforces a duck-typed contract at register time (`_validate_plugin_provider_class`): subclassing `BaseEmbeddingProvider` is optional. Required members are `embed()`, `available`, and `PROVIDER_ID`. Subclass if you like the structure; otherwise just implement the contract.
+
+```python
+import numpy as np
+
+class MyProvider:  # or: class MyProvider(BaseEmbeddingProvider)
+    # REQUIRED — stable identifier stamped on every stored vector. Read-path
+    # filters by this; changing it invalidates all prior writes until the user
+    # runs a re-embed. Don't rename casually. Include the model version so
+    # upgrading the model is a clean swap, not a silent semantic shift.
+    PROVIDER_ID = 'my-plugin:my-model-v1'
+
+    # Advertised dimension — the actual dim stamped on write is derived from
+    # the vector returned by embed(). This constant is used for contract
+    # checks at register time.
+    DIMENSION = 384
+
+    @property
+    def provider_id(self) -> str:
+        return self.PROVIDER_ID
+
+    @property
+    def dimension(self) -> int:
+        return self.DIMENSION
 
     @property
     def available(self) -> bool:
+        """True once the model is loaded and ready. Called frequently — make
+        this cheap (cache the load state)."""
+        ...
+
+    def embed(self, texts: list, prefix: str = 'search_document'):
+        """Embed a list of strings.
+
+        Returns a numpy array of shape (N, DIMENSION), dtype=float32, with
+        every row L2-normalized (unit length). Return None on failure.
+
+        The `prefix` arg is a task hint (e.g. 'search_document', 'search_query')
+        used by some models (Nomic). If your model doesn't use prefixes, ignore
+        it.
+        """
         ...
 ```
+
+**Canary contract** — at register-time, Sapphire runs `_canary_embed()` to verify your provider is actually usable. It embeds a short test string and checks:
+
+1. `embed()` returns a numpy-convertible array of shape `(1, D)` with `D > 0`.
+2. Dtype is `float32` (call `.astype(np.float32)` on your output).
+3. All values are finite (no NaN/Inf).
+4. L2 norm of the vector is in `[0.90, 1.10]` (the unit-vector drift band). Outside that: hard fail, provider falls back to `NullEmbedder`. In the drift zone `[0.90, 0.95]` or `[1.05, 1.10]`: accepted, but a warning is logged pointing at your normalization — tighten it before it drifts further.
+
+A provider that fails the canary is **disabled** at the registry level and Sapphire boots with `NullEmbedder` (vector search off, FTS still works). The failure reason is logged loudly.
+
+**Provenance & re-embed flow** — every stored vector row carries `(embedding, embedding_provider, embedding_dim)`. When a user switches providers:
+
+1. `GET /api/embedding/integrity` reports how many rows are stamped with what provider/dim. The Settings UI warns before the swap.
+2. `PUT /api/settings/batch` with `EMBEDDING_PROVIDER` + `confirm_embedding_swap: true` → swap fires.
+3. Old vectors are still on disk but invisible to vector search (filtered out by `embedding_provider = ?` in SELECTs). FTS text search still works on all rows.
+4. `POST /api/embedding/reembed` walks every orphaned row, regenerates embeddings under the new active provider, re-stamps the row with new `(provider, dim)`.
+
+Your plugin doesn't have to do anything special — this all works as long as your `PROVIDER_ID` is stable and your `embed()` contract is honored.
+
+**Reference implementation:** `plugins/embedder-minilm/` — 384-dim all-MiniLM-L6-v2 wrapper via the `transformers` library. Shows the full pattern: lazy load, CPU inference, mean-pool + L2-normalize, canary-clean output.
+
+**Gotchas:**
+- The registry calls your class's `__init__()` with no arguments. Lazy-load the model inside `available` or inside `embed()`, not in `__init__` — otherwise boot stalls on every restart.
+- `stamp_embedding(vec, embedder)` requires passing your embedder instance explicitly. Don't use the no-arg form from plugin code; the default path reads the active singleton, which may be a DIFFERENT provider by the time you get to the call (race during swap). Hold your reference.
+- If your provider talks to a remote API, handle `is_available` correctly — returning False when unconfigured is a legal state (canary passes with "provider reports unavailable, skipping canary"). Returning True while the API is down causes the canary to fail loudly, which is also fine.
 
 ### LLM — `BaseProvider`
 
@@ -237,3 +295,4 @@ If a provider plugin is the configured provider (e.g., `TTS_PROVIDER=elevenlabs`
 ## Examples
 
 - `plugins/elevenlabs/` — TTS provider with API key, model selection, voice picker
+- `plugins/embedder-minilm/` — Embedding provider (384-dim all-MiniLM-L6-v2 via `transformers`). Minimal, no extra deps beyond torch + transformers, good template for CPU-inference-based embedders. Exercises the full swap + re-embed + provenance path.

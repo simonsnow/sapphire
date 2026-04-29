@@ -89,15 +89,39 @@ def _generate_self_signed_cert():
         .sign(key, hashes.SHA256())
     )
 
-    # Write key file
-    with open(KEY_FILE, "wb") as f:
-        f.write(key.private_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PrivateFormat.TraditionalOpenSSL,
-            encryption_algorithm=serialization.NoEncryption(),
-        ))
+    # Write key file with 0600 mode from the first byte — not write-then-chmod.
+    # The write-then-chmod pattern left a micro-window where another local UID
+    # could open the key for read before the mode restricted it. Mirrors the
+    # MCP-key fix (2026-04-20) and matches the finding from the 2026-04-22
+    # auth audit. On Windows, os.open ignores mode bits — behavior falls back
+    # to default ACLs (same as previous path).
+    key_bytes = key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.TraditionalOpenSSL,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
     if sys.platform != 'win32':
-        os.chmod(KEY_FILE, 0o600)  # Restrict key permissions
+        # O_EXCL would block overwriting an existing key; we DO want to
+        # overwrite on regen, so drop EXCL but keep the mode = 0o600 on create.
+        # If the file exists, open() below will still land on 0o600 because
+        # we delete first.
+        try:
+            if os.path.exists(KEY_FILE):
+                os.remove(KEY_FILE)
+            fd = os.open(KEY_FILE, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                os.write(fd, key_bytes)
+            finally:
+                os.close(fd)
+        except Exception:
+            # Fallback to write-then-chmod if anything in the atomic path
+            # fails (NFS mounts, AppArmor, etc). Least-bad recovery.
+            with open(KEY_FILE, "wb") as f:
+                f.write(key_bytes)
+            os.chmod(KEY_FILE, 0o600)
+    else:
+        with open(KEY_FILE, "wb") as f:
+            f.write(key_bytes)
 
     # Write cert file
     with open(CERT_FILE, "wb") as f:

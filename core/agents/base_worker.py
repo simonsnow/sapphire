@@ -16,6 +16,12 @@ class BaseWorker:
         self.result = None
         self.error = None
         self.tool_log = []
+        # Non-fatal degradation signal. Subclasses set this when the run
+        # technically completed but the output is a placeholder — tool-loop
+        # exhaustion, context overflow, empty LLM. Surfaces to the frontend
+        # via AGENT_COMPLETED so the pill can render amber-with-tooltip
+        # instead of green-success. None = clean run. Scout #15 — 2026-04-20.
+        self.warning = None
         self._start_time = None
         self._end_time = None
         self._cancelled = threading.Event()
@@ -54,6 +60,9 @@ class BaseWorker:
         if self.status == 'running':
             self.status = 'cancelled'
             self._end_time = time.time()
+        # Clear result so recall() doesn't return partial output for a
+        # dismissed agent. User said "I don't want this" — honor that.
+        self.result = None
 
     def _run_wrapper(self):
         from core.event_bus import publish, Events
@@ -61,6 +70,9 @@ class BaseWorker:
             self.run()
             if self._cancelled.is_set():
                 self.status = 'cancelled'
+                # Cancellation voids the result — run() may have finished
+                # between cancel() firing and its check, leaving stale output
+                self.result = None
             elif self.status == 'running':
                 self.status = 'done'
         except Exception as e:
@@ -70,17 +82,39 @@ class BaseWorker:
             self.error = str(e)
         finally:
             self._end_time = time.time()
-            publish(Events.AGENT_COMPLETED, {
-                'id': self.id,
-                'name': self.name,
-                'status': self.status,
-                'elapsed': self.elapsed,
-            })
+            # Guard every step of post-run cleanup — any exception here kills
+            # the thread silently and prevents _on_complete (batch fire) from
+            # ever running, which hides the completion from everything
+            # downstream. This was a real bug: `getattr(self, 'tool_log',
+            # ['unknown'])[0]` blew up with IndexError because tool_log is
+            # initialized to [], making `getattr` return [] (the attribute
+            # exists) and `[0]` then throwing.
+            try:
+                publish(Events.AGENT_COMPLETED, {
+                    'id': self.id,
+                    'name': self.name,
+                    'status': self.status,
+                    'elapsed': self.elapsed,
+                    'result': self.result,
+                    'error': self.error,
+                    'warning': self.warning,
+                    'agent_type': getattr(self, '_agent_type', 'unknown'),
+                })
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).error(
+                    f"Agent {self.name}: publish AGENT_COMPLETED raised: {e}",
+                    exc_info=True,
+                )
             if self._on_complete:
                 try:
                     self._on_complete(self.id, self.chat_name)
-                except Exception:
-                    pass
+                except Exception as e:
+                    import logging
+                    logging.getLogger(__name__).error(
+                        f"Agent {self.name}: on_complete raised: {e}",
+                        exc_info=True,
+                    )
 
     def run(self):
         """Override this in subclasses. Set self.result on success, self.error on failure."""
@@ -95,6 +129,12 @@ class BaseWorker:
             'elapsed': self.elapsed,
             'has_result': self.result is not None,
             'error': self.error,
-            'tool_log': self.tool_log,
+            'warning': self.warning,
+            # Cap the tool_log payload — a runaway agent with max_tool_rounds=0
+            # can accumulate thousands of entries, and this dict ships on every
+            # 3s /api/agents/status poll. The full log stays intact on the
+            # worker; we only truncate the serialized view. Scout longevity #3
+            # — 2026-04-20.
+            'tool_log': self.tool_log[-200:] if len(self.tool_log) > 200 else self.tool_log,
             'chat_name': self.chat_name,
         }

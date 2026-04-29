@@ -284,6 +284,13 @@ def _reply_handler(task, event_data: dict, response_text: str):
 
     trigger_config = task.get("trigger_config", {})
     if not trigger_config.get("auto_reply"):
+        # Was a completely silent skip before — admin had no way to tell
+        # why the email bot "went quiet." Task default is True as of
+        # 2026-04-24; an OFF here is a deliberate user choice or legacy task.
+        logger.info(
+            f"[EMAIL] auto_reply OFF — skipping reply to {event_data.get('from_address', '?')} "
+            f"(task '{task.get('name', '?')}'). Enable in Schedule if unintended."
+        )
         return
 
     from_addr = event_data.get("from_address", "")
@@ -301,6 +308,10 @@ def _reply_handler(task, event_data: dict, response_text: str):
     clean = re.sub(r'^[\s\S]*</(?:seed:think|seed:cot_budget_reflect|think)>', '', clean, flags=re.IGNORECASE)
     clean = clean.strip()
     if not clean:
+        logger.warning(
+            f"[EMAIL] Empty reply after think-tag strip — raw response was "
+            f"{len(response_text)} chars. Raw: {response_text[:200]!r}"
+        )
         return
 
     try:

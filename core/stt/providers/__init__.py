@@ -23,11 +23,17 @@ class STTProviderRegistry(BaseProviderRegistry):
         self._core_registered = True
         from core.stt.providers.faster_whisper import FasterWhisperProvider
         from core.stt.providers.fireworks_whisper import FireworksWhisperProvider
+        from core.stt.providers.sapphire_router import SapphireRouterSTTProvider
         from core.stt.stt_null import NullWhisperClient
         self.register_core('faster_whisper', FasterWhisperProvider, 'Faster Whisper (Local)',
                           is_local=True)
         self.register_core('fireworks_whisper', FireworksWhisperProvider, 'Fireworks Whisper (Cloud)',
                           requires_api_key=True, api_key_env='STT_FIREWORKS_API_KEY')
+        # Sapphire Router — managed-mode cloud STT. sapphire.py branches on
+        # provider=='sapphire_router' but was never registered here, so flipping
+        # STT_PROVIDER to it silently landed on NullWhisperClient. H6 fix.
+        self.register_core('sapphire_router', SapphireRouterSTTProvider, 'Sapphire Router (Managed)',
+                          is_local=False)
         self.register_core('none', NullWhisperClient, 'None (disabled)', is_local=True)
 
     def get_all(self):

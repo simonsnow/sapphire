@@ -5,6 +5,7 @@ import os
 import re
 import sqlite3
 import threading
+from contextlib import contextmanager
 from datetime import datetime
 from typing import List, Dict, Optional, Any, Union
 from pathlib import Path
@@ -14,9 +15,10 @@ from core.event_bus import publish, Events
 
 logger = logging.getLogger(__name__)
 
-# System defaults for chat settings - hardcoded fallbacks
+# Static (non-scope) system defaults for chat settings.
+# Scope defaults are merged in dynamically by get_system_defaults() from SCOPE_REGISTRY.
 # Primary source is user/settings/chat_defaults.json or factory chat_defaults.json
-SYSTEM_DEFAULTS = {
+_STATIC_SYSTEM_DEFAULTS = {
     "prompt": "sapphire",
     "toolset": "all",
     "voice": "af_heart",
@@ -29,29 +31,45 @@ SYSTEM_DEFAULTS = {
     "custom_context": "",
     "llm_primary": "auto",      # "auto", "none", or provider key like "claude"
     "llm_model": "",            # Empty = use provider default, or specific model override
-    "story_engine_enabled": False,  # Story engine for games/simulations
-    "story_preset": None,           # Preset to load (e.g., "crystal_prophecy")
-    "story_vars_in_prompt": False,  # Include state variables in prompt (breaks caching)
-    "story_in_prompt": True,        # Include story segments in prompt (cache-friendly)
-    "memory_scope": "default",
-    "goal_scope": "default",
-    "knowledge_scope": "default",
-    "people_scope": "default",
-    "email_scope": "default",
-    "bitcoin_scope": "default",
-    "gcal_scope": "default",
-    "telegram_scope": "default",
-    "discord_scope": "default",
     "trim_color": "",
     "persona": None
 }
 
+
+def get_system_defaults() -> dict:
+    """Return the current system defaults dict, including dynamic scope defaults
+    from SCOPE_REGISTRY. This is the source of truth for chat setting defaults.
+
+    Function (not constant) because plugins can register new scopes at any time —
+    a snapshot at module-import would miss them. Safe to call repeatedly.
+    """
+    from core.chat.function_manager import scope_defaults_dict
+    defaults = dict(_STATIC_SYSTEM_DEFAULTS)
+    # Merge scope defaults; static keys win if there's a collision
+    for setting_key, default_val in scope_defaults_dict().items():
+        if setting_key not in defaults:
+            defaults[setting_key] = default_val
+    return defaults
+
+
+def __getattr__(name):
+    """Module-level backcompat shim for `from core.chat.history import SYSTEM_DEFAULTS`.
+
+    External read-only callers still work transparently — they get the current dict
+    (with dynamic scope keys). Internal callers in this module use get_system_defaults()
+    directly. Tests that PATCH `SYSTEM_DEFAULTS` must migrate to patching
+    `get_system_defaults` (returned by this shim is a fresh dict, not mutable state).
+    """
+    if name == 'SYSTEM_DEFAULTS':
+        return get_system_defaults()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 def get_user_defaults() -> Dict[str, Any]:
     """
     Get user's custom chat defaults, falling back to system defaults.
-    Priority: SYSTEM_DEFAULTS < chat_defaults.json < DEFAULT_PERSONA
+    Priority: get_system_defaults() < chat_defaults.json < DEFAULT_PERSONA
     """
-    merged = SYSTEM_DEFAULTS.copy()
+    merged = get_system_defaults()
 
     # User chat_defaults.json as base layer (if it exists)
     user_defaults_path = Path(__file__).parent.parent.parent / "user" / "settings" / "chat_defaults.json"
@@ -620,12 +638,19 @@ class ChatSessionManager:
         
         self.current_chat = ConversationHistory(max_history=max_history)
         self.active_chat_name = "default"
-        self.current_settings = SYSTEM_DEFAULTS.copy()
+        self.current_settings = get_system_defaults()
         
         # Track if we're in an active tool cycle (for Claude thinking_raw)
         self._in_tool_cycle = False
-        # Prevent chat switching during active streaming (would corrupt both chats)
-        self._is_streaming = False
+        # Prevent chat switching during active streaming (would corrupt both chats).
+        # 2026-04-22 — converted from single bool to counter. H4 made streaming
+        # state per-request (each /api/chat call gets its own StreamingChat) but
+        # this flag stayed a shared single-bool on session_manager — two
+        # concurrent streams on the same chat had the first finisher set
+        # False while the second was still running, defeating the append /
+        # delete / save guards. Counter represents how many streams are
+        # currently active; `_is_streaming` property reads > 0.
+        self._streaming_count = 0
         
         # Initialize database
         self._init_db()
@@ -647,13 +672,60 @@ class ChatSessionManager:
 
         logger.info(f"ChatSessionManager initialized with SQLite storage")
 
-    def _get_connection(self) -> sqlite3.Connection:
-        """Get a database connection with WAL mode."""
+    # ── Streaming state (counter-backed) ──
+    # Per-request StreamingChat instances each own their own cancel_flag,
+    # ephemeral, current_stream — but the `am I streaming?` guard used by
+    # append_messages_to_chat / delete_chat / save-ordering needs to know
+    # whether ANY stream is active. That's a counter, not a bool.
+    # Writers use begin_streaming() / end_streaming(). Readers use the
+    # `_is_streaming` property. 2026-04-22 H4 follow-up.
+
+    @property
+    def _is_streaming(self) -> bool:
+        """True if at least one stream is active."""
+        return getattr(self, '_streaming_count', 0) > 0
+
+    @_is_streaming.setter
+    def _is_streaming(self, val):
+        """Back-compat setter — tests and legacy code that flip this bool
+        directly still work. Real writers should use begin/end_streaming()
+        for atomic concurrency-safe counting."""
+        self._streaming_count = 1 if val else 0
+
+    def begin_streaming(self):
+        """Increment active-stream counter. Safe for concurrent streams."""
+        with self._lock:
+            self._streaming_count = getattr(self, '_streaming_count', 0) + 1
+
+    def end_streaming(self):
+        """Decrement active-stream counter (floored at 0). Safe for
+        concurrent streams. A double-decrement (bug elsewhere) is silent
+        — counter stays at 0."""
+        with self._lock:
+            cur = getattr(self, '_streaming_count', 0)
+            self._streaming_count = cur - 1 if cur > 0 else 0
+
+    @contextmanager
+    def _get_connection(self):
+        """Yield a database connection; close explicitly on exit.
+
+        sqlite3.Connection.__exit__ only commits/rolls back — it does NOT
+        close the conn. Prior code relied on GC to eventually close, which
+        under rapid use could accumulate handles whose finalizers block
+        interpreter shutdown on SQLite's WAL mutex (the root of months of
+        stuck-pytest-shell reports).
+
+        WAL + synchronous are set once in _init_db (persisted in db header).
+        busy_timeout IS honored during active transactions; sqlite3.connect's
+        timeout= kwarg is ignored once BEGIN fires (CPython #124510).
+        """
         conn = sqlite3.connect(str(self._db_path), timeout=30.0)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        conn.row_factory = sqlite3.Row
-        return conn
+        try:
+            conn.execute("PRAGMA busy_timeout=30000")
+            conn.row_factory = sqlite3.Row
+            yield conn
+        finally:
+            conn.close()
 
     def _init_db(self):
         """Initialize SQLite database with schema."""
@@ -668,41 +740,6 @@ class ChatSessionManager:
                     )
                 """)
                 
-                # State engine tables
-                conn.execute("""
-                    CREATE TABLE IF NOT EXISTS state_current (
-                        chat_name TEXT NOT NULL,
-                        key TEXT NOT NULL,
-                        value TEXT NOT NULL,
-                        value_type TEXT,
-                        label TEXT,
-                        constraints TEXT,
-                        updated_at TEXT NOT NULL,
-                        updated_by TEXT NOT NULL,
-                        turn_number INTEGER NOT NULL,
-                        PRIMARY KEY (chat_name, key)
-                    )
-                """)
-                
-                conn.execute("""
-                    CREATE TABLE IF NOT EXISTS state_log (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        chat_name TEXT NOT NULL,
-                        key TEXT NOT NULL,
-                        old_value TEXT,
-                        new_value TEXT NOT NULL,
-                        changed_by TEXT NOT NULL,
-                        turn_number INTEGER NOT NULL,
-                        timestamp TEXT NOT NULL,
-                        reason TEXT
-                    )
-                """)
-                
-                conn.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_state_log_chat_turn
-                    ON state_log(chat_name, turn_number)
-                """)
-
                 conn.execute("""
                     CREATE TABLE IF NOT EXISTS tool_images (
                         id TEXT PRIMARY KEY,
@@ -760,10 +797,10 @@ class ChatSessionManager:
                 # Handle both formats
                 if isinstance(data, dict) and "messages" in data:
                     messages = data["messages"]
-                    settings = data.get("settings", SYSTEM_DEFAULTS.copy())
+                    settings = data.get("settings", get_system_defaults())
                 elif isinstance(data, list):
                     messages = data
-                    settings = SYSTEM_DEFAULTS.copy()
+                    settings = get_system_defaults()
                 else:
                     logger.warning(f"Unknown JSON format in {json_path}, skipping")
                     continue
@@ -818,7 +855,7 @@ class ChatSessionManager:
                 else:
                     self.current_chat.messages = json.loads(raw_messages)
                 file_settings = json.loads(row["settings"])
-                self.current_settings = SYSTEM_DEFAULTS.copy()
+                self.current_settings = get_system_defaults()
                 self.current_settings.update(file_settings)
 
                 logger.info(f"Loaded chat '{chat_name}' with {len(self.current_chat.messages)} messages")
@@ -844,17 +881,27 @@ class ChatSessionManager:
         with self._lock:
             try:
                 with self._get_connection() as conn:
-                    conn.execute(
-                        """INSERT OR REPLACE INTO chats (name, settings, messages, updated_at)
-                           VALUES (?, ?, ?, ?)""",
+                    # UPDATE (not INSERT OR REPLACE) + rowcount check so a late
+                    # writer — agent completion, post_chat hook, etc. — can't
+                    # resurrect a chat that was just deleted. create_chat is
+                    # the sole path that creates rows.
+                    cur = conn.execute(
+                        """UPDATE chats SET settings = ?, messages = ?, updated_at = ?
+                           WHERE name = ?""",
                         (
-                            self.active_chat_name,
                             json.dumps(self.current_settings),
                             json.dumps(self.current_chat.messages),
-                            datetime.now().isoformat()
+                            datetime.now().isoformat(),
+                            self.active_chat_name,
                         )
                     )
                     conn.commit()
+                    if cur.rowcount == 0:
+                        logger.warning(
+                            f"Save to chat '{self.active_chat_name}' affected 0 rows — "
+                            f"chat was deleted. Dropping save to avoid resurrecting it."
+                        )
+                        return
                 logger.debug(f"Saved chat '{self.active_chat_name}' ({len(self.current_chat.messages)} messages)")
             except Exception as e:
                 logger.error(f"Failed to save chat '{self.active_chat_name}': {e}")
@@ -883,11 +930,10 @@ class ChatSessionManager:
                     
                     chats.append({
                         "name": row["name"],
-                        "display_name": settings.get("private_display_name") or settings.get("story_display_name") or row["name"].replace('_', ' ').title(),
+                        "display_name": settings.get("private_display_name") or row["name"].replace('_', ' ').title(),
                         "message_count": row["msg_count"] or 0,
                         "is_active": row["name"] == self.active_chat_name,
                         "modified": row["updated_at"],
-                        "story_chat": bool(settings.get("story_chat")),
                         "private_chat": bool(settings.get("private_chat")),
                         "settings": settings
                     })
@@ -961,11 +1007,6 @@ class ChatSessionManager:
                 
                 # Delete chat and any associated data
                 conn.execute("DELETE FROM chats WHERE name = ?", (chat_name,))
-                try:
-                    conn.execute("DELETE FROM state_current WHERE chat_name = ?", (chat_name,))
-                    conn.execute("DELETE FROM state_log WHERE chat_name = ?", (chat_name,))
-                except Exception:
-                    pass  # Tables may not exist if story engine never used
                 try:
                     conn.execute("DELETE FROM tool_images WHERE chat_name = ?", (chat_name,))
                 except Exception:
@@ -1139,6 +1180,32 @@ class ChatSessionManager:
     def get_turn_count(self) -> int:
         return self.current_chat.get_turn_count()
 
+    def read_chat_settings(self, chat_name: str) -> Optional[Dict[str, Any]]:
+        """Read a chat's settings from SQLite WITHOUT switching active chat.
+        Returns None if the chat doesn't exist. Applies system defaults
+        on top of the stored settings so callers get a complete view.
+
+        This replaces a legacy JSON-file path that no longer exists post
+        SQLite migration — the old route code was silently 404'ing every
+        non-active chat because the JSON file it expected was never
+        written. Silent-default class bug (2026-04-19)."""
+        self._ensure_db()
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.execute(
+                    "SELECT settings FROM chats WHERE name = ?", (chat_name,)
+                )
+                row = cursor.fetchone()
+                if not row:
+                    return None
+                stored = json.loads(row["settings"]) if row["settings"] else {}
+                merged = get_system_defaults()
+                merged.update(stored)
+                return merged
+        except Exception as e:
+            logger.error(f"Failed to read settings for chat '{chat_name}': {e}")
+            return None
+
     def read_chat_messages(self, chat_name: str, provider: str = None) -> List[Dict[str, Any]]:
         """Read messages from a named chat WITHOUT switching active chat."""
         self._ensure_db()
@@ -1160,8 +1227,45 @@ class ChatSessionManager:
             return []
 
     def append_to_chat(self, chat_name: str, user_content: str, assistant_content: str):
-        """Append a message pair to a named chat WITHOUT switching active chat."""
+        """Append a simple message pair to a named chat WITHOUT switching active chat."""
+        self.append_messages_to_chat(chat_name, [
+            {"role": "user", "content": user_content},
+            {"role": "assistant", "content": assistant_content},
+        ])
+
+    def append_messages_to_chat(self, chat_name: str, new_messages: list,
+                                 max_wait_if_streaming: float = 15.0):
+        """Append a list of messages to a named chat WITHOUT switching active chat.
+
+        Preserves the full conversation structure including tool_calls and tool
+        results. Each message gets a timestamp if it doesn't already have one.
+
+        If the target chat is the ACTIVE chat and a stream is in progress, wait
+        for the stream to finish before appending. Scout 2 finding (2026-04-19):
+        writing while the stream is mid-flight can interleave cron messages
+        between a tool_call and its tool_result (breaks LLM conversation
+        validity) OR result in a subsequent per-message save overwriting the
+        cron write with a stale in-memory snapshot. The `_is_streaming` guard
+        already protects `delete_chat` and `set_active_chat` — extending it
+        here closes the asymmetry.
+        """
+        import time as _time
         self._ensure_db()
+
+        # Defer if the target is the active chat and a stream is running.
+        # Poll rather than event-wait so this works whether the caller is in
+        # an async context or a worker thread.
+        if chat_name == self.active_chat_name and self._is_streaming:
+            deadline = _time.time() + max_wait_if_streaming
+            while self._is_streaming and _time.time() < deadline:
+                _time.sleep(0.2)
+            if self._is_streaming:
+                logger.warning(
+                    f"append_messages_to_chat('{chat_name}') waited "
+                    f"{max_wait_if_streaming:.0f}s for active stream to end — "
+                    f"proceeding anyway; ordering race possible"
+                )
+
         timestamp = datetime.now().isoformat()
         try:
             with self._lock, self._get_connection() as conn:
@@ -1173,48 +1277,35 @@ class ChatSessionManager:
                     logger.warning(f"Chat '{chat_name}' not found — skipping append (may have been deleted)")
                     return
                 messages = json.loads(row["messages"])
-                messages.append({"role": "user", "content": user_content, "timestamp": timestamp})
-                messages.append({"role": "assistant", "content": assistant_content, "timestamp": timestamp})
-                conn.execute(
+
+                for msg in new_messages:
+                    if 'timestamp' not in msg:
+                        msg['timestamp'] = timestamp
+                    messages.append(msg)
+
+                result = conn.execute(
                     """UPDATE chats SET messages = ?, updated_at = ? WHERE name = ?""",
                     (json.dumps(messages), timestamp, chat_name)
                 )
                 conn.commit()
-                logger.debug(f"Appended message pair to chat '{chat_name}'")
+                if result.rowcount == 0:
+                    logger.warning(f"Chat '{chat_name}' was deleted during append — messages lost")
+                logger.debug(f"Appended {len(new_messages)} messages to chat '{chat_name}'")
 
-                # If this is the active chat, append to in-memory list instead of
-                # replacing it — replacing would wipe any unsaved user/assistant messages
-                # from the streaming pipeline that are in the in-memory list but not yet in DB
+                # If this is the active chat, sync in-memory list
                 if chat_name == self.active_chat_name:
-                    self.current_chat.messages.append({"role": "user", "content": user_content, "timestamp": timestamp})
-                    self.current_chat.messages.append({"role": "assistant", "content": assistant_content, "timestamp": timestamp})
+                    for msg in new_messages:
+                        self.current_chat.messages.append(msg)
 
                 publish(Events.MESSAGE_ADDED, {"role": "pair", "chat_name": chat_name})
         except Exception as e:
             logger.error(f"Failed to append to chat '{chat_name}': {e}")
 
-    def _rollback_state_if_needed(self):
-        """Rollback story engine to current turn count if enabled."""
-        story_enabled = self.current_settings.get('story_engine_enabled', False)
-        if not story_enabled:
-            return
-
-        try:
-            from core.story_engine import StoryEngine
-            new_turn = self.get_turn_count()
-            engine = StoryEngine(self.active_chat_name, self._db_path)
-
-            if not engine.is_empty():
-                engine.rollback_to_turn(new_turn)
-                logger.info(f"[STORY] Rolled back state to turn {new_turn} after message removal")
-        except Exception as e:
-            logger.error(f"[STORY] Failed to rollback state: {e}")
-
     def remove_last_messages(self, count: int) -> bool:
         result = self.current_chat.remove_last_messages(count)
         if result:
             self._save_current_chat()
-            self._rollback_state_if_needed()
+            self._prune_orphaned_tool_images(self.active_chat_name)
             publish(Events.MESSAGE_REMOVED, {"count": count})
         return result
 
@@ -1222,7 +1313,7 @@ class ChatSessionManager:
         result = self.current_chat.remove_from_user_message(user_content)
         if result:
             self._save_current_chat()
-            self._rollback_state_if_needed()
+            self._prune_orphaned_tool_images(self.active_chat_name)
             publish(Events.MESSAGE_REMOVED, {"from": "user_message"})
         return result
 
@@ -1230,7 +1321,7 @@ class ChatSessionManager:
         result = self.current_chat.remove_from_assistant_timestamp(timestamp)
         if result:
             self._save_current_chat()
-            self._rollback_state_if_needed()
+            self._prune_orphaned_tool_images(self.active_chat_name)
             publish(Events.MESSAGE_REMOVED, {"from": "assistant_timestamp"})
         return result
 
@@ -1239,9 +1330,47 @@ class ChatSessionManager:
         result = self.current_chat.remove_tool_call(tool_call_id)
         if result:
             self._save_current_chat()
-            # Note: tool call removal doesn't change turn count, no state rollback needed
+            self._prune_orphaned_tool_images(self.active_chat_name)
             publish(Events.MESSAGE_REMOVED, {"tool_call_id": tool_call_id})
         return result
+
+    def _prune_orphaned_tool_images(self, chat_name: str) -> int:
+        """Delete tool_images rows for this chat whose IDs are no longer
+        referenced by any message content. Called after any message-removal
+        path. Without this, image blobs accumulate forever (Scout 1 finding
+        2026-04-19: DB bloat at 100KB–2MB per image × heavy-use chats).
+        Returns count of rows deleted.
+        """
+        import re
+        try:
+            with self._lock, self._get_connection() as conn:
+                row = conn.execute(
+                    "SELECT messages FROM chats WHERE name = ?", (chat_name,)
+                ).fetchone()
+                if not row:
+                    return 0
+                msgs_blob = row["messages"] or "[]"
+                # Extract all live IMG IDs from message content
+                live_ids = set(re.findall(r'<<IMG::tool:([^>]+)>>', msgs_blob))
+                # Find stored image IDs for this chat that aren't in live_ids
+                stored = conn.execute(
+                    "SELECT id FROM tool_images WHERE chat_name = ?", (chat_name,)
+                ).fetchall()
+                orphans = [r["id"] for r in stored if r["id"] not in live_ids]
+                if orphans:
+                    placeholders = ','.join('?' * len(orphans))
+                    conn.execute(
+                        f"DELETE FROM tool_images WHERE chat_name = ? AND id IN ({placeholders})",
+                        (chat_name, *orphans),
+                    )
+                    conn.commit()
+                    logger.debug(
+                        f"Pruned {len(orphans)} orphan tool_image(s) from chat '{chat_name}'"
+                    )
+                return len(orphans)
+        except Exception as e:
+            logger.warning(f"orphan tool_image prune failed for '{chat_name}': {e}")
+            return 0
 
     def clear(self):
         self.current_chat.clear()
@@ -1256,16 +1385,6 @@ class ChatSessionManager:
         except Exception:
             pass  # Table may not exist yet
 
-        # Always clear state for this chat (even if engine currently disabled)
-        try:
-            from core.story_engine import StoryEngine
-            engine = StoryEngine(self.active_chat_name, self._db_path)
-            if not engine.is_empty():
-                engine.clear_all()
-                logger.info(f"[STORY] Cleared state for chat '{self.active_chat_name}'")
-        except Exception as e:
-            logger.error(f"[STORY] Failed to clear state: {e}")
-        
         publish(Events.CHAT_CLEARED)
 
     def edit_message_by_content(self, role: str, original_content: str, new_content: str) -> bool:
@@ -1289,6 +1408,79 @@ class ChatSessionManager:
         except Exception as e:
             logger.error(f"Failed to update settings: {e}")
             return False
+
+    def reset_chat_scope_ref(self, setting_key: str, deleted_scope: str,
+                             reset_to: str = 'default') -> list:
+        """Sweep every chat's settings; any chat whose settings[setting_key] equals
+        `deleted_scope` has that key rewritten to `reset_to`.
+
+        Called when a scope is permanently deleted (memory/goal/knowledge/people)
+        so chats don't silently keep pointing at a dead scope name. Without this,
+        apply_scopes_from_settings on next activation sets the ContextVar to the
+        ghost string and the AI writes into a room nobody sees in the UI — the
+        same bug class as the mind.js hardcoded-scope one.
+
+        Returns list of chat names that were updated. Publishes
+        CHAT_SETTINGS_CHANGED per affected chat. If the ACTIVE chat was affected,
+        the caller is responsible for re-applying scopes (we avoid importing
+        api_fastapi here to keep the dep graph clean).
+        """
+        from datetime import datetime
+        affected = []
+        try:
+            with self._lock, self._get_connection() as conn:
+                cursor = conn.execute("SELECT name, settings FROM chats")
+                for row in cursor.fetchall():
+                    try:
+                        s = json.loads(row['settings'])
+                    except Exception:
+                        continue
+                    if s.get(setting_key) == deleted_scope:
+                        s[setting_key] = reset_to
+                        affected.append((row['name'], json.dumps(s)))
+                for chat_name, new_settings_json in affected:
+                    conn.execute(
+                        "UPDATE chats SET settings = ?, updated_at = ? WHERE name = ?",
+                        (new_settings_json, datetime.utcnow().isoformat() + 'Z', chat_name),
+                    )
+                conn.commit()
+        except Exception as e:
+            logger.error(f"reset_chat_scope_ref failed for {setting_key}:{deleted_scope}: {e}")
+            return [name for name, _ in affected]
+
+        affected_names = [name for name, _ in affected]
+        # If the active chat was touched, reload its in-memory settings AND
+        # re-apply to ContextVars. Without the re-apply, the ContextVar keeps
+        # the pre-sweep value (the now-deleted scope name), so the AI writes
+        # into a ghost scope even though the chat file is correct. Found this
+        # herring in my own fix — the in-memory current_settings dict and the
+        # ContextVar were a two-source-of-truth problem.
+        if self.active_chat_name in affected_names:
+            try:
+                self._load_chat(self.active_chat_name)
+                from core.chat.function_manager import apply_scopes_from_settings
+                # `fm` arg is legacy/unused (the function reads SCOPE_REGISTRY
+                # directly), so None is safe here
+                apply_scopes_from_settings(None, self.current_settings)
+            except Exception as e:
+                logger.warning(f"reload+apply after scope sweep failed: {e}")
+
+        for name in affected_names:
+            try:
+                publish(Events.CHAT_SETTINGS_CHANGED, {
+                    "chat": name,
+                    "origin": "scope_cleanup",
+                    "reason": f"{setting_key}:{deleted_scope}→{reset_to}",
+                })
+            except Exception:
+                pass
+
+        if affected_names:
+            logger.info(
+                f"Swept {setting_key}={deleted_scope!r} from {len(affected_names)} "
+                f"chat(s) → {reset_to!r}: {affected_names}"
+            )
+        return affected_names
 
     def __len__(self):
         return len(self.current_chat)

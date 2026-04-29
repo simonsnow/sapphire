@@ -5,6 +5,7 @@ import logging
 from pathlib import Path
 
 from fastapi import APIRouter, Request, Depends, HTTPException, UploadFile, File
+from fastapi.responses import JSONResponse
 
 import config
 from core.auth import require_login
@@ -40,6 +41,56 @@ async def test_embedding(request: Request, _=Depends(require_login)):
     return {"success": True, "provider": provider, "dimensions": dim, "ms": elapsed}
 
 
+@router.get("/api/embedding/integrity")
+async def embedding_integrity(request: Request, _=Depends(require_login)):
+    """Report how stored vectors are stamped vs the active provider.
+
+    Used by the Settings UI to warn before a provider swap: shows how many
+    memory/knowledge/people vectors would become invisible to vector search
+    if the user proceeded. Powers the 'Swap anyway?' confirmation dialog.
+
+    Runs in a worker thread — the report issues 6 `SELECT ... GROUP BY`
+    queries over BLOB-bearing tables with no index on (provider, dim). On
+    100k+ rows that's a multi-second synchronous scan, long enough to stall
+    the FastAPI event loop and queue every other HTTP request behind it.
+    Scout finding #14 — 2026-04-20.
+    """
+    import asyncio
+    from core.embeddings import integrity_report
+    return await asyncio.to_thread(integrity_report)
+
+
+@router.post("/api/embedding/reembed")
+async def embedding_reembed_start(request: Request, _=Depends(require_login)):
+    """Kick off a background re-embed of all stored vectors stamped with a
+    non-active provider (or legacy unstamped). Fires SSE `reembed_progress`
+    events throughout. Idempotent: refuses if already running."""
+    from core.embeddings.reembed import start_reembed
+    ok, msg = start_reembed()
+    if not ok:
+        raise HTTPException(status_code=409, detail=msg)
+    return {"status": "started", "message": msg}
+
+
+@router.get("/api/embedding/reembed/status")
+async def embedding_reembed_status(request: Request, _=Depends(require_login)):
+    """Current re-embed status snapshot. Useful for clients that missed the
+    SSE events or opened the page mid-run."""
+    from core.embeddings.reembed import get_status
+    return get_status()
+
+
+@router.post("/api/embedding/reembed/cancel")
+async def embedding_reembed_cancel(request: Request, _=Depends(require_login)):
+    """Request graceful cancellation of an in-progress re-embed. Worker
+    finishes current batch then exits (no half-stamped rows)."""
+    from core.embeddings.reembed import cancel_reembed
+    ok, msg = cancel_reembed()
+    if not ok:
+        raise HTTPException(status_code=409, detail=msg)
+    return {"status": "cancelling", "message": msg}
+
+
 # =============================================================================
 # MEMORY SCOPE ROUTES
 # =============================================================================
@@ -47,7 +98,7 @@ async def test_embedding(request: Request, _=Depends(require_login)):
 @router.get("/api/memory/scopes")
 async def get_memory_scopes(request: Request, _=Depends(require_login)):
     """Get list of memory scopes."""
-    from functions import memory
+    from plugins.memory.tools import memory_tools as memory
     scopes = memory.get_scopes()
     return {"scopes": scopes}
 
@@ -56,12 +107,14 @@ async def get_memory_scopes(request: Request, _=Depends(require_login)):
 async def create_memory_scope(request: Request, _=Depends(require_login)):
     """Create a new memory scope."""
     import re
-    from functions import memory
+    from plugins.memory.tools import memory_tools as memory
     data = await request.json()
     name = data.get('name', '').strip().lower()
     if not name or not re.match(r'^[a-z0-9_]{1,32}$', name):
         raise HTTPException(status_code=400, detail="Invalid scope name")
     if memory.create_scope(name):
+        from core.event_bus import publish, Events
+        publish(Events.SCOPE_CHANGED, {"kind": "memory", "action": "created", "name": name})
         return {"created": name}
     else:
         raise HTTPException(status_code=500, detail="Failed to create scope")
@@ -70,13 +123,15 @@ async def create_memory_scope(request: Request, _=Depends(require_login)):
 @router.delete("/api/memory/scopes/{scope_name}")
 async def delete_memory_scope(scope_name: str, request: Request, _=Depends(require_login)):
     """Delete a memory scope and ALL its memories. Requires confirmation token."""
-    from functions import memory
+    from plugins.memory.tools import memory_tools as memory
     data = await request.json()
     if data.get('confirm') != 'DELETE':
         raise HTTPException(status_code=400, detail="Confirmation required")
     result = memory.delete_scope(scope_name)
     if "error" in result:
         raise HTTPException(status_code=400, detail=result["error"])
+    from core.event_bus import publish, Events
+    publish(Events.SCOPE_CHANGED, {"kind": "memory", "action": "deleted", "name": scope_name})
     return result
 
 
@@ -87,7 +142,7 @@ async def delete_memory_scope(scope_name: str, request: Request, _=Depends(requi
 @router.get("/api/goals/scopes")
 async def get_goal_scopes(request: Request, _=Depends(require_login)):
     """Get list of goal scopes."""
-    from functions import goals
+    from plugins.memory.tools import goals_tools as goals
     scopes = goals.get_scopes()
     return {"scopes": scopes}
 
@@ -96,12 +151,14 @@ async def get_goal_scopes(request: Request, _=Depends(require_login)):
 async def create_goal_scope(request: Request, _=Depends(require_login)):
     """Create a new goal scope."""
     import re
-    from functions import goals
+    from plugins.memory.tools import goals_tools as goals
     data = await request.json()
     name = data.get('name', '').strip().lower()
     if not name or not re.match(r'^[a-z0-9_]{1,32}$', name):
         raise HTTPException(status_code=400, detail="Invalid scope name")
     if goals.create_scope(name):
+        from core.event_bus import publish, Events
+        publish(Events.SCOPE_CHANGED, {"kind": "goal", "action": "created", "name": name})
         return {"created": name}
     else:
         raise HTTPException(status_code=500, detail="Failed to create scope")
@@ -109,19 +166,21 @@ async def create_goal_scope(request: Request, _=Depends(require_login)):
 
 @router.delete("/api/goals/scopes/{scope_name}")
 async def remove_goal_scope(scope_name: str, request: Request, _=Depends(require_login)):
-    from functions import goals
+    from plugins.memory.tools import goals_tools as goals
     data = await request.json()
     if data.get('confirm') != 'DELETE':
         raise HTTPException(status_code=400, detail="Confirmation required")
     result = goals.delete_scope(scope_name)
     if "error" in result:
         raise HTTPException(status_code=400, detail=result["error"])
+    from core.event_bus import publish, Events
+    publish(Events.SCOPE_CHANGED, {"kind": "goal", "action": "deleted", "name": scope_name})
     return result
 
 
 @router.get("/api/goals")
 async def list_goals_api(request: Request, _=Depends(require_login)):
-    from functions import goals
+    from plugins.memory.tools import goals_tools as goals
     scope = request.query_params.get('scope', 'default')
     status = request.query_params.get('status', 'active')
     return {"goals": goals.get_goals_list(scope, status)}
@@ -129,7 +188,7 @@ async def list_goals_api(request: Request, _=Depends(require_login)):
 
 @router.get("/api/goals/{goal_id}")
 async def get_goal_api(goal_id: int, request: Request, _=Depends(require_login)):
-    from functions import goals
+    from plugins.memory.tools import goals_tools as goals
     detail = goals.get_goal_detail(goal_id)
     if not detail:
         raise HTTPException(status_code=404, detail="Goal not found")
@@ -138,7 +197,7 @@ async def get_goal_api(goal_id: int, request: Request, _=Depends(require_login))
 
 @router.post("/api/goals")
 async def create_goal_endpoint(request: Request, _=Depends(require_login)):
-    from functions import goals
+    from plugins.memory.tools import goals_tools as goals
     data = await request.json()
     try:
         goal_id = goals.create_goal_api(
@@ -156,7 +215,7 @@ async def create_goal_endpoint(request: Request, _=Depends(require_login)):
 
 @router.put("/api/goals/{goal_id}")
 async def update_goal_endpoint(goal_id: int, request: Request, _=Depends(require_login)):
-    from functions import goals
+    from plugins.memory.tools import goals_tools as goals
     data = await request.json()
     try:
         goals.update_goal_api(
@@ -175,7 +234,7 @@ async def update_goal_endpoint(goal_id: int, request: Request, _=Depends(require
 
 @router.post("/api/goals/{goal_id}/progress")
 async def add_goal_progress(goal_id: int, request: Request, _=Depends(require_login)):
-    from functions import goals
+    from plugins.memory.tools import goals_tools as goals
     data = await request.json()
     try:
         note_id = goals.add_progress_note(goal_id, data.get('note', ''))
@@ -186,9 +245,11 @@ async def add_goal_progress(goal_id: int, request: Request, _=Depends(require_lo
 
 @router.delete("/api/goals/{goal_id}")
 async def delete_goal_endpoint(goal_id: int, request: Request, _=Depends(require_login)):
-    from functions import goals
+    from plugins.memory.tools import goals_tools as goals
+    # force=true lets the UI confirm + override the permanent-goal guard
+    force = request.query_params.get('force', '').lower() in ('1', 'true', 'yes')
     try:
-        title = goals.delete_goal_api(goal_id)
+        title = goals.delete_goal_api(goal_id, force=force)
         return {"deleted": goal_id, "title": title}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -200,7 +261,7 @@ async def delete_goal_endpoint(goal_id: int, request: Request, _=Depends(require
 
 @router.get("/api/knowledge/scopes")
 async def get_knowledge_scopes(request: Request, _=Depends(require_login)):
-    from functions import knowledge
+    from plugins.memory.tools import knowledge_tools as knowledge
     scopes = knowledge.get_scopes()
     return {"scopes": scopes}
 
@@ -208,12 +269,14 @@ async def get_knowledge_scopes(request: Request, _=Depends(require_login)):
 @router.post("/api/knowledge/scopes")
 async def create_knowledge_scope(request: Request, _=Depends(require_login)):
     import re as _re
-    from functions import knowledge
+    from plugins.memory.tools import knowledge_tools as knowledge
     data = await request.json()
     name = data.get('name', '').strip().lower()
     if not name or not _re.match(r'^[a-z0-9_]{1,32}$', name):
         raise HTTPException(status_code=400, detail="Invalid scope name")
     if knowledge.create_scope(name):
+        from core.event_bus import publish, Events
+        publish(Events.SCOPE_CHANGED, {"kind": "knowledge", "action": "created", "name": name})
         return {"created": name}
     else:
         raise HTTPException(status_code=500, detail="Failed to create scope")
@@ -222,55 +285,61 @@ async def create_knowledge_scope(request: Request, _=Depends(require_login)):
 @router.delete("/api/knowledge/scopes/{scope_name}")
 async def delete_knowledge_scope(scope_name: str, request: Request, _=Depends(require_login)):
     """Delete a knowledge scope, ALL its tabs, and ALL entries. Requires confirmation token."""
-    from functions import knowledge
+    from plugins.memory.tools import knowledge_tools as knowledge
     data = await request.json()
     if data.get('confirm') != 'DELETE':
         raise HTTPException(status_code=400, detail="Confirmation required")
     result = knowledge.delete_scope(scope_name)
     if "error" in result:
         raise HTTPException(status_code=400, detail=result["error"])
+    from core.event_bus import publish, Events
+    publish(Events.SCOPE_CHANGED, {"kind": "knowledge", "action": "deleted", "name": scope_name})
     return result
 
 
 @router.get("/api/knowledge/people/scopes")
 async def list_people_scopes(request: Request, _=Depends(require_login)):
-    from functions import knowledge
+    from plugins.memory.tools import knowledge_tools as knowledge
     return {"scopes": knowledge.get_people_scopes()}
 
 
 @router.post("/api/knowledge/people/scopes")
 async def create_people_scope(request: Request, _=Depends(require_login)):
-    from functions import knowledge
+    from plugins.memory.tools import knowledge_tools as knowledge
     data = await request.json()
     name = data.get('name', '').strip().lower()
     if not name or len(name) > 32:
         raise HTTPException(status_code=400, detail="Invalid scope name")
     knowledge.create_people_scope(name)
+    from core.event_bus import publish, Events
+    publish(Events.SCOPE_CHANGED, {"kind": "people", "action": "created", "name": name})
     return {"created": name}
 
 
 @router.delete("/api/knowledge/people/scopes/{scope_name}")
 async def remove_people_scope(scope_name: str, request: Request, _=Depends(require_login)):
-    from functions import knowledge
+    from plugins.memory.tools import knowledge_tools as knowledge
     data = await request.json()
     if data.get('confirm') != 'DELETE':
         raise HTTPException(status_code=400, detail="Confirmation required")
     result = knowledge.delete_people_scope(scope_name)
     if "error" in result:
         raise HTTPException(status_code=400, detail=result["error"])
+    from core.event_bus import publish, Events
+    publish(Events.SCOPE_CHANGED, {"kind": "people", "action": "deleted", "name": scope_name})
     return result
 
 
 @router.get("/api/knowledge/people")
 async def list_people(request: Request, _=Depends(require_login)):
-    from functions import knowledge
+    from plugins.memory.tools import knowledge_tools as knowledge
     scope = request.query_params.get('scope', 'default')
     return {"people": knowledge.get_people(scope)}
 
 
 @router.post("/api/knowledge/people")
 async def save_person(request: Request, _=Depends(require_login)):
-    from functions import knowledge
+    from plugins.memory.tools import knowledge_tools as knowledge
     data = await request.json()
     name = data.get('name', '').strip()
     if not name:
@@ -292,7 +361,7 @@ async def save_person(request: Request, _=Depends(require_login)):
 
 @router.delete("/api/knowledge/people/{person_id}")
 async def remove_person(person_id: int, request: Request, _=Depends(require_login)):
-    from functions import knowledge
+    from plugins.memory.tools import knowledge_tools as knowledge
     if knowledge.delete_person(person_id):
         return {"deleted": person_id}
     raise HTTPException(status_code=404, detail="Person not found")
@@ -301,7 +370,7 @@ async def remove_person(person_id: int, request: Request, _=Depends(require_logi
 @router.post("/api/knowledge/people/import-vcf")
 async def import_vcf(request: Request, _=Depends(require_login)):
     """Import contacts from a VCF (vCard) file."""
-    from functions import knowledge
+    from plugins.memory.tools import knowledge_tools as knowledge
     import re
 
     form = await request.form()
@@ -406,7 +475,7 @@ async def import_vcf(request: Request, _=Depends(require_login)):
 
 @router.get("/api/knowledge/tabs")
 async def list_tabs(request: Request, _=Depends(require_login)):
-    from functions import knowledge
+    from plugins.memory.tools import knowledge_tools as knowledge
     scope = request.query_params.get('scope', 'default')
     tab_type = request.query_params.get('type')
     return {"tabs": knowledge.get_tabs(scope, tab_type)}
@@ -414,7 +483,7 @@ async def list_tabs(request: Request, _=Depends(require_login)):
 
 @router.get("/api/knowledge/tabs/{tab_id}")
 async def get_tab(tab_id: int, request: Request, _=Depends(require_login)):
-    from functions import knowledge
+    from plugins.memory.tools import knowledge_tools as knowledge
     scope = request.query_params.get('scope', 'default')
     entries = knowledge.get_tab_entries(tab_id, scope)
     return {"entries": entries}
@@ -422,7 +491,7 @@ async def get_tab(tab_id: int, request: Request, _=Depends(require_login)):
 
 @router.post("/api/knowledge/tabs")
 async def create_knowledge_tab(request: Request, _=Depends(require_login)):
-    from functions import knowledge
+    from plugins.memory.tools import knowledge_tools as knowledge
     data = await request.json()
     name = data.get('name', '').strip()
     scope = data.get('scope', 'default')
@@ -436,7 +505,7 @@ async def create_knowledge_tab(request: Request, _=Depends(require_login)):
 
 @router.put("/api/knowledge/tabs/{tab_id}")
 async def update_knowledge_tab(tab_id: int, request: Request, _=Depends(require_login)):
-    from functions import knowledge
+    from plugins.memory.tools import knowledge_tools as knowledge
     data = await request.json()
     if knowledge.update_tab(tab_id, data.get('name'), data.get('description')):
         return {"updated": tab_id}
@@ -445,7 +514,7 @@ async def update_knowledge_tab(tab_id: int, request: Request, _=Depends(require_
 
 @router.delete("/api/knowledge/tabs/{tab_id}")
 async def delete_knowledge_tab(tab_id: int, request: Request, _=Depends(require_login)):
-    from functions import knowledge
+    from plugins.memory.tools import knowledge_tools as knowledge
     if knowledge.delete_tab(tab_id):
         return {"deleted": tab_id}
     raise HTTPException(status_code=404, detail="Tab not found")
@@ -453,7 +522,7 @@ async def delete_knowledge_tab(tab_id: int, request: Request, _=Depends(require_
 
 @router.post("/api/knowledge/tabs/{tab_id}/entries")
 async def add_knowledge_entry(tab_id: int, request: Request, _=Depends(require_login)):
-    from functions import knowledge
+    from plugins.memory.tools import knowledge_tools as knowledge
     from datetime import datetime
     data = await request.json()
     content = data.get('content', '').strip()
@@ -475,7 +544,7 @@ async def add_knowledge_entry(tab_id: int, request: Request, _=Depends(require_l
 @router.post("/api/knowledge/tabs/{tab_id}/upload")
 async def upload_knowledge_file(tab_id: int, file: UploadFile = File(...), _=Depends(require_login)):
     """Upload a text file into a knowledge tab — chunks and embeds automatically."""
-    from functions import knowledge
+    from plugins.memory.tools import knowledge_tools as knowledge
 
     # Verify tab exists
     tab = knowledge.get_tabs_by_id(tab_id)
@@ -519,7 +588,7 @@ async def upload_knowledge_file(tab_id: int, file: UploadFile = File(...), _=Dep
 @router.delete("/api/knowledge/tabs/{tab_id}/file/{filename}")
 async def delete_knowledge_file(tab_id: int, filename: str, _=Depends(require_login)):
     """Delete all entries from a specific uploaded file."""
-    from functions import knowledge
+    from plugins.memory.tools import knowledge_tools as knowledge
     count = knowledge.delete_entries_by_filename(tab_id, filename)
     if count == 0:
         raise HTTPException(status_code=404, detail="No entries found for that file")
@@ -528,7 +597,7 @@ async def delete_knowledge_file(tab_id: int, filename: str, _=Depends(require_lo
 
 @router.put("/api/knowledge/entries/{entry_id}")
 async def update_knowledge_entry(entry_id: int, request: Request, _=Depends(require_login)):
-    from functions import knowledge
+    from plugins.memory.tools import knowledge_tools as knowledge
     data = await request.json()
     content = data.get('content', '').strip()
     if not content:
@@ -540,7 +609,7 @@ async def update_knowledge_entry(entry_id: int, request: Request, _=Depends(requ
 
 @router.delete("/api/knowledge/entries/{entry_id}")
 async def delete_knowledge_entry(entry_id: int, request: Request, _=Depends(require_login)):
-    from functions import knowledge
+    from plugins.memory.tools import knowledge_tools as knowledge
     if knowledge.delete_entry(entry_id):
         return {"deleted": entry_id}
     raise HTTPException(status_code=404, detail="Entry not found")
@@ -553,7 +622,7 @@ async def delete_knowledge_entry(entry_id: int, request: Request, _=Depends(requ
 @router.post("/api/chats/{chat_name}/documents")
 async def upload_chat_document(chat_name: str, file: UploadFile = File(...), _=Depends(require_login)):
     """Upload a document for per-chat RAG context."""
-    from functions import knowledge
+    from plugins.memory.tools import knowledge_tools as knowledge
 
     filename = file.filename or 'upload.txt'
     ext = filename.rsplit('.', 1)[-1].lower() if '.' in filename else ''
@@ -613,7 +682,7 @@ async def upload_chat_document(chat_name: str, file: UploadFile = File(...), _=D
 @router.get("/api/chats/{chat_name}/documents")
 async def list_chat_documents(chat_name: str, _=Depends(require_login)):
     """List uploaded documents for a chat."""
-    from functions import knowledge
+    from plugins.memory.tools import knowledge_tools as knowledge
     rag_scope = f"__rag__:{chat_name}"
     entries = knowledge.get_entries_by_scope(rag_scope)
     return {"documents": entries}
@@ -622,7 +691,7 @@ async def list_chat_documents(chat_name: str, _=Depends(require_login)):
 @router.delete("/api/chats/{chat_name}/documents/{filename:path}")
 async def delete_chat_document(chat_name: str, filename: str, _=Depends(require_login)):
     """Delete a specific document from a chat's RAG scope."""
-    from functions import knowledge
+    from plugins.memory.tools import knowledge_tools as knowledge
     rag_scope = f"__rag__:{chat_name}"
     count = knowledge.delete_entries_by_scope_and_filename(rag_scope, filename)
     if count == 0:
@@ -640,30 +709,41 @@ async def delete_chat_document(chat_name: str, filename: str, _=Depends(require_
 
 @router.get("/api/memory/list")
 async def list_memories(request: Request, _=Depends(require_login)):
-    """List memories grouped by label for the Mind view."""
-    from functions import memory
+    """List memories for the Mind view. Includes private_key plaintext —
+    the Mind view is the user's own UI surface, so showing the gating word
+    is the feature, not a leak. Tools/MCP have their own filtered paths."""
+    from plugins.memory.tools import memory_tools as memory
     scope = request.query_params.get('scope', 'default')
     with memory._get_connection() as conn:
         cursor = conn.cursor()
         scope_sql, scope_params = memory._scope_condition(scope)
         cursor.execute(
-            f'SELECT id, content, timestamp, label FROM memories WHERE {scope_sql} ORDER BY label, timestamp DESC',
+            f'SELECT id, content, timestamp, label, private_key FROM memories WHERE {scope_sql} ORDER BY label, timestamp DESC',
             scope_params
         )
         rows = cursor.fetchall()
     grouped = {}
-    for mid, content, ts, label in rows:
+    for mid, content, ts, label, private_key in rows:
         key = label or 'unlabeled'
         if key not in grouped:
             grouped[key] = []
-        grouped[key].append({"id": mid, "content": content, "timestamp": ts, "label": label})
-    return {"memories": grouped, "total": len(rows)}
+        grouped[key].append({
+            "id": mid, "content": content, "timestamp": ts,
+            "label": label, "private_key": private_key,
+        })
+    # no-store: Mind view re-fetches after MIND_CHANGED; browser disk/memory
+    # cache serving a stale body here would leave fresh saves (esp. private_key
+    # badges) invisible until F5. 2026-04-22.
+    return JSONResponse(
+        content={"memories": grouped, "total": len(rows)},
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @router.put("/api/memory/{memory_id}")
 async def update_memory(memory_id: int, request: Request, _=Depends(require_login)):
     """Update memory content and re-embed."""
-    from functions import memory
+    from plugins.memory.tools import memory_tools as memory
     data = await request.json()
     content = data.get('content', '').strip()
     scope = data.get('scope', 'default')
@@ -679,29 +759,58 @@ async def update_memory(memory_id: int, request: Request, _=Depends(require_logi
             raise HTTPException(status_code=404, detail="Memory not found")
 
         keywords = memory._extract_keywords(content)
-        label = data.get('label')
 
         embedding_blob = None
+        embedding_provider = None
+        embedding_dim = None
         embedder = memory._get_embedder()
         if embedder.available:
             embs = embedder.embed([content], prefix='search_document')
             if embs is not None:
-                embedding_blob = embs[0].tobytes()
+                from core.embeddings import stamp_embedding
+                embedding_blob, embedding_provider, embedding_dim = stamp_embedding(embs[0], embedder)
 
+        # Sparse update — only touch columns the caller explicitly provided.
+        # Bugs this closes (2026-04-21):
+        #   - `label = data.get('label')` used to pass None on UI edits (which
+        #     don't send label) and UPDATE would null-out the existing label.
+        #   - `timestamp = CURRENT_TIMESTAMP` used to fire unconditionally,
+        #     resetting the creation time on every spelling correction.
+        # Embedding still re-computes when the content changes — that's the
+        # whole point of editing, and a fresh embedding preserves semantic
+        # reachability. But embedding columns only overwrite when we
+        # successfully produced a fresh vector (transient remote-embedder
+        # failure must not strip a good vector off).
+        updates, params = ['content = ?', 'keywords = ?'], [content, keywords]
+        if 'label' in data:
+            updates.append('label = ?'); params.append(data.get('label'))
+        if embedding_blob is not None:
+            updates.extend(['embedding = ?', 'embedding_provider = ?', 'embedding_dim = ?'])
+            params.extend([embedding_blob, embedding_provider, embedding_dim])
+        params.extend([memory_id, scope])
         cursor.execute(
-            'UPDATE memories SET content = ?, keywords = ?, label = ?, embedding = ?, timestamp = CURRENT_TIMESTAMP WHERE id = ? AND scope = ?',
-            (content, keywords, label, embedding_blob, memory_id, scope)
+            f'UPDATE memories SET {", ".join(updates)} WHERE id = ? AND scope = ?',
+            params
         )
         conn.commit()
+    try:
+        from core.mind_events import publish_mind_changed
+        publish_mind_changed('memory', scope, 'update')
+    except Exception:
+        pass
     return {"updated": memory_id}
 
 
 @router.delete("/api/memory/{memory_id}")
 async def delete_memory_api(memory_id: int, request: Request, _=Depends(require_login)):
-    """Delete a memory by ID."""
-    from functions import memory
+    """Delete a memory by ID. Accepts ?private_key=... so the Mind UI can
+    delete private rows it can already see plaintext (the user is authenticated
+    and the gate is for AI tool calls, not their own UI). Without this, the
+    UI's delete button silently fails on private rows. 2026-04-21."""
+    from plugins.memory.tools import memory_tools as memory
     scope = request.query_params.get('scope', 'default')
-    result, success = memory._delete_memory(memory_id, scope)
+    private_key = request.query_params.get('private_key')
+    result, success = memory._delete_memory(memory_id, scope, private_key=private_key)
     if success:
         return {"deleted": memory_id}
     raise HTTPException(status_code=404, detail=result)
@@ -713,19 +822,31 @@ async def delete_memory_api(memory_id: int, request: Request, _=Depends(require_
 
 @router.get("/api/memory/export")
 async def export_memories(request: Request, _=Depends(require_login)):
-    """Export all memories in a scope as JSON (no vectors)."""
-    from functions import memory
+    """Export all memories in a scope as JSON (no vectors).
+
+    Includes private rows verbatim with their `private_key` plaintext.
+    Rationale (Krem, 2026-04-21): losing the irreplaceable intimate moments
+    is the most catastrophic thing in the app. Export means export. A
+    user-initiated export that silently drops content is the worse failure
+    mode than a user-initiated export that includes everything they own.
+    The Mind UI already shows private keys plaintext — no new exposure.
+    Import preserves the `private_key` on round-trip (see finding C3).
+    """
+    from plugins.memory.tools import memory_tools as memory
     scope = request.query_params.get('scope', 'default')
     with memory._get_connection() as conn:
         cursor = conn.cursor()
         scope_sql, scope_params = memory._scope_condition(scope)
         cursor.execute(
-            f'SELECT content, label, timestamp FROM memories WHERE {scope_sql} ORDER BY timestamp',
-            scope_params
+            f'SELECT content, label, timestamp, private_key FROM memories WHERE {scope_sql} ORDER BY timestamp',
+            scope_params,
         )
-        entries = [{"text": r[0], "label": r[1], "timestamp": r[2]} for r in cursor.fetchall()]
+        entries = [
+            {"text": r[0], "label": r[1], "timestamp": r[2], "private_key": r[3]}
+            for r in cursor.fetchall()
+        ]
     return {
-        "sapphire_export": True, "type": "memories", "version": 1,
+        "sapphire_export": True, "type": "memories", "version": 2,
         "scope": scope, "count": len(entries), "entries": entries,
     }
 
@@ -734,32 +855,58 @@ async def export_memories(request: Request, _=Depends(require_login)):
 async def find_duplicate_memories(request: Request, _=Depends(require_login)):
     """Find near-duplicate memories using vector similarity."""
     import numpy as np
-    from functions import memory
+    from plugins.memory.tools import memory_tools as memory
 
     scope = request.query_params.get('scope', 'default')
     default_thresh = getattr(config, 'MEMORY_DEDUP_THRESHOLD', 0.92)
     threshold = float(request.query_params.get('threshold', str(default_thresh)))
 
+    # Dedup is only meaningful within a single vector space. Pull only rows
+    # that share the currently-active provider's stamp — mixing spaces in
+    # np.stack blows up, and even same-dim across different models produces
+    # nonsense similarity scores that'd get surfaced as "duplicates".
+    embedder = memory._get_embedder()
+    active_provider = getattr(embedder, 'provider_id', None) if embedder else None
+
     with memory._get_connection() as conn:
         cursor = conn.cursor()
         scope_sql, scope_params = memory._scope_condition(scope)
+        # Exclude private rows from dedup. The response returns full content
+        # of both `keep` and `remove` rows in JSON — surfacing a private row
+        # next to its near-duplicate would leak plaintext. Dedup only across
+        # public rows. Witch-hunt 2026-04-21 finding C2.
         cursor.execute(
-            f'SELECT id, content, timestamp, label, embedding FROM memories WHERE {scope_sql} AND embedding IS NOT NULL ORDER BY timestamp',
-            scope_params
+            f'SELECT id, content, timestamp, label, embedding, embedding_dim FROM memories '
+            f'WHERE {scope_sql} AND embedding IS NOT NULL AND embedding_provider = ? '
+            f'AND private_key IS NULL '
+            f'ORDER BY timestamp',
+            scope_params + [active_provider]
         )
         rows = cursor.fetchall()
 
     if len(rows) < 2:
         return {"pairs": [], "count": 0}
 
-    # Load all embeddings into a matrix for fast comparison
+    # Load embeddings, filtering out any stray shape mismatches defensively.
     ids, contents, timestamps, labels, embeddings = [], [], [], [], []
-    for row_id, content, ts, lbl, emb_blob in rows:
+    expected_dim = rows[0][5]
+    for row_id, content, ts, lbl, emb_blob, stored_dim in rows:
+        if stored_dim != expected_dim:
+            continue
+        try:
+            vec = np.frombuffer(emb_blob, dtype=np.float32)
+            if vec.shape[0] != expected_dim:
+                continue
+        except Exception:
+            continue
         ids.append(row_id)
         contents.append(content)
         timestamps.append(ts)
         labels.append(lbl)
-        embeddings.append(np.frombuffer(emb_blob, dtype=np.float32))
+        embeddings.append(vec)
+
+    if len(embeddings) < 2:
+        return {"pairs": [], "count": 0}
 
     emb_matrix = np.stack(embeddings)  # (N, D)
 
@@ -791,7 +938,7 @@ async def find_duplicate_memories(request: Request, _=Depends(require_login)):
 async def import_memories(request: Request, _=Depends(require_login)):
     """Import memories from JSON export. Skips exact text duplicates."""
     import hashlib
-    from functions import memory
+    from plugins.memory.tools import memory_tools as memory
 
     data = await request.json()
     entries = data.get("entries", [])
@@ -817,7 +964,12 @@ async def import_memories(request: Request, _=Depends(require_login)):
             skipped += 1
             continue
         label = entry.get("label")
-        memory._save_memory(text, label=label, scope=scope)
+        # Preserve private_key on round-trip. Without this, an export that
+        # included private rows (via ?include_private=1) would re-import as
+        # public, permanently losing the gating word. Witch-hunt 2026-04-21
+        # finding C3.
+        private_key = entry.get("private_key")
+        memory._save_memory(text, label=label, scope=scope, private_key=private_key)
         existing_hashes.add(text_hash)
         imported += 1
 
@@ -831,7 +983,7 @@ async def import_memories(request: Request, _=Depends(require_login)):
 @router.get("/api/knowledge/people/export")
 async def export_people(request: Request, _=Depends(require_login)):
     """Export all people in a scope as JSON."""
-    from functions import knowledge
+    from plugins.memory.tools import knowledge_tools as knowledge
     scope = request.query_params.get('scope', 'default')
     people = knowledge.get_people(scope)
     # Strip internal IDs, keep portable fields
@@ -854,7 +1006,7 @@ async def export_people(request: Request, _=Depends(require_login)):
 @router.post("/api/knowledge/people/import")
 async def import_people_json(request: Request, _=Depends(require_login)):
     """Import people from JSON export. Skips duplicates by name+email."""
-    from functions import knowledge
+    from plugins.memory.tools import knowledge_tools as knowledge
 
     data = await request.json()
     entries = data.get("entries", [])
@@ -896,7 +1048,7 @@ async def import_people_json(request: Request, _=Depends(require_login)):
 @router.get("/api/knowledge/tabs/{tab_id}/export")
 async def export_knowledge_tab(tab_id: int, request: Request, _=Depends(require_login)):
     """Export a knowledge tab with all entries as JSON (no vectors)."""
-    from functions import knowledge
+    from plugins.memory.tools import knowledge_tools as knowledge
     scope = request.query_params.get('scope', 'default')
     tabs = knowledge.get_tabs(scope)
     tab = next((t for t in tabs if t["id"] == tab_id), None)
@@ -916,7 +1068,7 @@ async def export_knowledge_tab(tab_id: int, request: Request, _=Depends(require_
 @router.post("/api/knowledge/tabs/import")
 async def import_knowledge_tab(request: Request, _=Depends(require_login)):
     """Import a knowledge tab from JSON export. Creates tab, adds entries."""
-    from functions import knowledge
+    from plugins.memory.tools import knowledge_tools as knowledge
 
     data = await request.json()
     name = (data.get("name") or "").strip()
@@ -980,7 +1132,7 @@ async def find_duplicates(request: Request, _=Depends(require_login)):
     """
     import hashlib
     import numpy as np
-    from functions import knowledge
+    from plugins.memory.tools import knowledge_tools as knowledge
 
     scope = request.query_params.get("scope", "")
     threshold = float(request.query_params.get("threshold", "0.95"))
@@ -1108,7 +1260,7 @@ async def find_duplicates(request: Request, _=Depends(require_login)):
 @router.delete("/api/knowledge/dedup/resolve")
 async def resolve_duplicates(request: Request, _=Depends(require_login)):
     """Delete specific duplicate entries by ID list. Keeps the first, deletes the rest."""
-    from functions import knowledge
+    from plugins.memory.tools import knowledge_tools as knowledge
 
     data = await request.json()
     delete_ids = data.get("ids", [])

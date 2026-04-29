@@ -34,37 +34,49 @@ TOOLS = [
         "is_local": True,
         "function": {
             "name": "spawn_agent",
-            "description": "Launch a background agent. IMPORTANT: Always call agent_options() first to see available agent types — there may be specialized types like 'claude_code' for coding tasks. Do NOT default to 'llm' for coding — check what's available. The agent runs in isolation and reports back automatically when done.",
+            "description": "Launch a background agent. Types: llm | claude_code | claude_code_plugin. Call agent_options() first. Full usage + director rules: search_help_docs('agents').",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "mission": {
                         "type": "string",
-                        "description": "The task/question for the agent to complete. Be specific — this is the agent's only instruction."
+                        "description": "Task for the agent. What to do, not how."
                     },
                     "agent_type": {
                         "type": "string",
-                        "description": "Type of agent to spawn. MUST call agent_options() first to see available types. Use 'claude_code' for coding/building tasks, 'llm' for research/analysis. Defaults to 'llm'."
+                        "description": "llm | claude_code | claude_code_plugin. From agent_options()."
                     },
                     "model": {
                         "type": "string",
-                        "description": "Model override (e.g. 'claude-opus-4-6') — only for 'llm' type. Leave empty for auto/default."
+                        "description": "Model override (llm only, e.g. 'claude-opus-4-6')"
                     },
                     "toolset": {
                         "type": "string",
-                        "description": "Which toolset the agent can use (e.g. 'default', 'research') — only for 'llm' type."
+                        "description": "Toolset (llm only)"
                     },
                     "prompt": {
                         "type": "string",
-                        "description": "Which prompt/personality the agent uses — only for 'llm' type. Default: 'agent' (lean, no personality)."
+                        "description": "Persona (llm only). 'agent'=lean default, 'self'=inherit, or persona name."
                     },
                     "project_name": {
                         "type": "string",
-                        "description": "Project/workspace name — only for 'claude_code' type."
+                        "description": "Workspace name (claude_code only)"
+                    },
+                    "plugin_name": {
+                        "type": "string",
+                        "description": "Plugin dir name (claude_code_plugin only). Lands in user/plugins/{name}/"
+                    },
+                    "capabilities": {
+                        "type": "string",
+                        "description": "Comma-sep (claude_code_plugin only): tools, hooks, daemon, routes, settings, providers, schedule"
+                    },
+                    "context": {
+                        "type": "string",
+                        "description": "Extra requirements (claude_code_plugin only). APIs, constraints, formats."
                     },
                     "session_id": {
                         "type": "string",
-                        "description": "Resume a previous Claude Code session by ID — only for 'claude_code' type."
+                        "description": "Resume prior session (claude_code + claude_code_plugin)"
                     }
                 },
                 "required": ["mission"]
@@ -134,34 +146,105 @@ def _create_llm_worker():
         """Runs an isolated LLM + tool loop in a background thread."""
 
         def __init__(self, agent_id, name, mission, chat_name='', on_complete=None,
-                     model='', toolset='default', prompt='agent', **kwargs):
+                     model='', toolset='default', prompt='agent',
+                     _inherit_scopes=True, **kwargs):
             super().__init__(agent_id, name, mission, chat_name, on_complete)
             self._model = model
             self._toolset = toolset
             self._prompt = prompt
+            # When spawn_agent was called with prompt='self' (not an explicit
+            # persona name), this is False. `self` means "inherit identity
+            # (voice/prompt/toolset) but NOT data access (scopes)." The
+            # 'agent' persona's none-scope defaults apply via force-None
+            # closure in ExecutionContext. Direction A — H1 2026-04-22.
+            self._inherit_scopes = _inherit_scopes
 
         def run(self):
             from core.continuity.execution_context import ExecutionContext
             from core.api_fastapi import get_system
+            from core.personas import persona_manager
 
             provider_key, model_override = _resolve_model(self._model)
 
+            # Phase 2i: scope values come from the assigned persona instead of a
+            # hardcoded 9-scope dict. The built-in 'agent' persona (added to
+            # core/personas/personas.json) provides lean background-worker defaults
+            # that match prior behavior: memory/knowledge/people = 'default',
+            # goal/email/bitcoin/gcal/telegram/discord = 'none'.
+            # Zero-touch for new plugin scopes: they're added to the persona via
+            # the Persona editor and flow through automatically.
+            persona = persona_manager.get(self._prompt) or {}
+            persona_settings = persona.get('settings', {}) if isinstance(persona, dict) else {}
+
+            # Phase 5 defensive fallback (day-ruiner scout): `persona_manager._load()`
+            # early-returns when `user/personas/personas.json` exists, which means
+            # newly-added built-in personas (like 'agent' from Phase 2i) don't
+            # auto-seed on existing installs. If the 'agent' persona is missing,
+            # we synthesize the lean defaults inline so background workers get
+            # the intended safe posture regardless.
+            #
+            # 2026-04-19 scope tightening: every scope → 'none'. Agents are
+            # headless coders/workers; they shouldn't read from OR write to the
+            # user's personal memory/knowledge/people/goals. Old default of
+            # 'default' quietly let agent observations pollute Sapphire's shared
+            # memory. `'none'` → save_memory/search_memory return "disabled"
+            # explicitly, which is the right failure mode. Keep aligned with
+            # `core/personas/personas.json::agent.settings` so swapping persona
+            # source doesn't change behavior.
+            if not persona_settings and self._prompt == 'agent':
+                logger.info("[agents] 'agent' persona not seeded — using inline lean defaults")
+                persona_settings = {
+                    'prompt': 'agent',
+                    'toolset': 'default',
+                    'spice_enabled': False,
+                    'inject_datetime': True,
+                    'memory_scope': 'none',
+                    'goal_scope': 'none',
+                    'knowledge_scope': 'none',
+                    'people_scope': 'none',
+                    'email_scope': 'none',
+                    'bitcoin_scope': 'none',
+                    'gcal_scope': 'none',
+                    'telegram_scope': 'none',
+                    'discord_scope': 'none',
+                }
+
+            # Extract only the scope keys from persona settings (other fields like
+            # voice/spice don't apply to background agents — provider/model/toolset
+            # are handled explicitly below via worker args).
+            scope_settings = {k: v for k, v in persona_settings.items() if k.endswith('_scope')}
+
+            # H1 2026-04-22 (Direction A): if prompt='self' resolved to this
+            # persona, strip scope keys. 'self' means "same identity, no data
+            # access" — explicit persona names (prompt='sapphire' etc) keep
+            # full inherit. Root cause was: personas bundled identity +
+            # scope, and 'self' resolution silently brought the whole bundle.
+            if not self._inherit_scopes:
+                if scope_settings:
+                    logger.info(
+                        f"[agents] prompt='self' — dropping inherited scope "
+                        f"settings from '{self._prompt}' persona "
+                        f"({', '.join(scope_settings.keys())})"
+                    )
+                scope_settings = {}
+
+            # Phase 5 fix (chaos scout): resolve the actual prompt file name from
+            # the persona's nested `prompt` field. Persona names and prompt file
+            # names are two different namespaces — a persona 'quirk_bot' might use
+            # prompt file 'sapphire'. Without this resolution, ExecutionContext
+            # would try to load a prompt file by the persona name and fall back
+            # to "You are a helpful assistant" — silent voice loss.
+            prompt_file_name = persona_settings.get('prompt', self._prompt)
+
             task_settings = {
-                'prompt': self._prompt,
+                'prompt': prompt_file_name,
                 'toolset': self._toolset,
                 'provider': provider_key,
                 'model': model_override,
                 'max_tool_rounds': 10,
                 'max_parallel_tools': 3,
                 'inject_datetime': True,
-                'memory_scope': 'default',
-                'knowledge_scope': 'default',
-                'goal_scope': 'none',
-                'email_scope': 'none',
-                'bitcoin_scope': 'none',
-                'gcal_scope': 'none',
-                'telegram_scope': 'none',
-                'discord_scope': 'none',
+                **scope_settings,
             }
 
             system = get_system()
@@ -172,6 +255,11 @@ def _create_llm_worker():
             raw = ctx.run(self.mission)
             self.result = re.sub(r'<think>[\s\S]*?</think>\s*', '', raw).strip() if raw else ''
             self.tool_log = ctx.tool_log
+            # If the run degraded to a placeholder (tool loop exhausted, context
+            # overflow, empty LLM), the executor populates degraded_reason. Carry
+            # it as a warning so the agent pill renders amber instead of green.
+            # Scout #15 — 2026-04-20.
+            self.warning = getattr(ctx, 'degraded_reason', None)
 
     return LLMWorker
 
@@ -233,6 +321,17 @@ try:
     from core.agents import agent_manager as _mgr
     if _mgr is not None:
         _register_llm_type(_mgr)
+    else:
+        # Silent failure here was a scout finding. If boot order ever regresses
+        # and plugin scan runs before AgentManager is constructed, agents won't
+        # register and spawn_agent(type='llm') will return "Unknown agent type".
+        # Loud warning makes the regression visible.
+        logger.warning(
+            "[agents] agent_manager is None at plugin load — LLM agent type NOT "
+            "registered. Plugin loaded before AgentManager was constructed; "
+            "check boot order in sapphire.py (plugin_loader.scan should run "
+            "AFTER AgentManager() is created)."
+        )
 except Exception as e:
     logger.warning(f"Failed to register LLM agent type at load: {e}")
 
@@ -255,6 +354,53 @@ def _get_active_chat():
         return get_system().llm_chat.get_active_chat() or ''
     except Exception:
         return ''
+
+
+def _get_current_chat_persona(chat_name: str = None):
+    """Return the persona name the current execution is running under.
+
+    Used by spawn_agent to resolve the special `prompt='self'` keyword —
+    "spawn an agent that inherits the spawning context's current persona".
+
+    If `chat_name` is provided, look up the persona FOR THAT CHAT by name
+    instead of reading whichever chat is active at call time. Without this,
+    a concurrent tab switch or voice trigger between spawn entry and this
+    lookup flips the "active chat" underneath us — the agent inherits the
+    wrong chat's persona and scopes. Callers must snapshot the chat name
+    at spawn entry and pass it through. Scout day-ruiner #5.
+
+    **Priority order (Scout #7 — 2026-04-20):**
+      1. If we're inside an ExecutionContext run (agent task, heartbeat task,
+         daemon callback), use the RUNNING TASK's persona — not the user's
+         foreground chat. Otherwise an agent with scope='none' chain-spawning
+         `prompt='self'` would silently inherit the USER's default scopes.
+      2. Otherwise fall back to the active chat's persona (foreground case:
+         user hits "spawn agent" while chatting as sapphire → child inherits
+         sapphire).
+      3. None if neither resolves — caller uses 'agent' default.
+    """
+    try:
+        from core.continuity.execution_context import current_task_persona
+        task_persona = current_task_persona.get()
+        if task_persona:
+            return task_persona
+    except Exception:
+        pass
+    from core.api_fastapi import get_system
+    try:
+        sm = get_system().llm_chat.session_manager
+        # If caller snapshotted a specific chat at spawn entry, read THAT
+        # chat's settings directly — don't re-read the live active-chat
+        # pointer, which may have changed between spawn entry and this
+        # resolution. Scout day-ruiner #5.
+        if chat_name:
+            settings = sm.read_chat_settings(chat_name) or {}
+        else:
+            settings = sm.get_chat_settings()
+        persona = settings.get('persona')
+        return persona if persona else None
+    except Exception:
+        return None
 
 
 def _get_plugin_settings():
@@ -362,12 +508,19 @@ def _agent_options(manager, ps):
     for t in sorted(toolset_names):
         lines.append(f"  - {t}")
 
-    # Prompts
+    # Prompts / personas available for the spawn_agent `prompt` parameter.
+    # Special: 'self' means "inherit the spawning chat's current persona".
     from core import prompts
     prompt_list = prompts.list_prompts()
-    lines.append("\nAvailable Prompts:")
+    lines.append("\nAvailable Personas (for the `prompt` parameter):")
+    lines.append("  - agent  (default, lean background worker — no personality, minimal scopes)")
+    lines.append("  - self   (special: inherit the spawning chat's current persona)")
+    seen = {'agent'}
     for p in prompt_list:
         name = p if isinstance(p, str) else p.get('name', str(p))
+        if name in seen:
+            continue
+        seen.add(name)
         lines.append(f"  - {name}")
 
     return '\n'.join(lines)
@@ -375,6 +528,9 @@ def _agent_options(manager, ps):
 
 def _spawn_agent(manager, arguments, ps):
     mission = arguments.get('mission')
+    # For plugin builds, Sapphire often puts the instructions in context instead of mission
+    if not mission and arguments.get('agent_type') == 'claude_code_plugin':
+        mission = arguments.get('context', '') or arguments.get('plugin_name', '')
     if not mission:
         return "Mission is required.", False
 
@@ -387,7 +543,30 @@ def _spawn_agent(manager, arguments, ps):
     if agent_type == 'llm':
         model_arg = arguments.get('model', '')
         kwargs['toolset'] = arguments.get('toolset', ps.get('default_toolset', 'default'))
-        kwargs['prompt'] = arguments.get('prompt', 'sapphire')
+
+        # Phase 5: `prompt` resolution.
+        # Default is 'agent' (lean background-worker persona with minimal scopes,
+        # no personality layer) — matches the tool description contract.
+        # Special keyword 'self' means "inherit the spawning chat's current persona"
+        # so Sapphire can explicitly extend herself into an agent when she wants to.
+        # Fallback for 'self' when no active persona is set: 'agent'.
+        # Using `or 'agent'` (not `default=`) so empty-string and None both fall
+        # through to the lean default — an LLM explicitly passing `prompt=''`
+        # would otherwise bypass the 'self' check and end up with no persona.
+        requested_prompt = arguments.get('prompt') or 'agent'
+        resolved_from_self = False
+        if requested_prompt == 'self':
+            # Pass the chat_name we snapshotted at spawn entry (line ~502) so
+            # concurrent active-chat switches don't flip the persona underneath
+            # us between entry and this resolution. Scout day-ruiner #5.
+            inherited = _get_current_chat_persona(chat_name=chat_name)
+            requested_prompt = inherited or 'agent'
+            resolved_from_self = True
+            logger.info(f"[agents] spawn_agent: prompt='self' resolved to '{requested_prompt}'")
+        kwargs['prompt'] = requested_prompt
+        # H1 2026-04-22: 'self' = identity-only inherit. Explicit persona
+        # names (prompt='sapphire') keep full scope inherit.
+        kwargs['_inherit_scopes'] = not resolved_from_self
 
         # Resolve roster name to provider:model
         resolved_model = model_arg
@@ -405,6 +584,12 @@ def _spawn_agent(manager, arguments, ps):
         session_id = arguments.get('session_id', '')
         if session_id:
             kwargs['session_id'] = session_id
+
+    elif agent_type == 'claude_code_plugin':
+        for k in ('plugin_name', 'capabilities', 'context', 'session_id'):
+            v = arguments.get(k)
+            if v:
+                kwargs[k] = v
 
     result = manager.spawn(agent_type, mission, chat_name=chat_name, **kwargs)
     if 'error' in result:

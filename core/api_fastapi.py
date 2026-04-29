@@ -360,7 +360,7 @@ async def setup_submit(request: Request):
 
     if not password:
         return RedirectResponse(url="/setup?error=empty", status_code=302)
-    if len(password) < 6:
+    if len(password) < 10:
         return RedirectResponse(url="/setup?error=short", status_code=302)
     if password != confirm:
         return RedirectResponse(url="/setup?error=mismatch", status_code=302)
@@ -412,6 +412,11 @@ async def login_submit(request: Request):
         return RedirectResponse(url="/login?error=config", status_code=302)
 
     if verify_password(password, password_hash):
+        # Rotate session state before promoting to authenticated. Prevents
+        # session-fixation — a pre-login cookie an attacker could have planted
+        # (LAN XSS on another localhost app, stale iframe, etc) gets cleared
+        # before we stamp logged_in. 2026-04-22 M5 fix.
+        request.session.clear()
         request.session['logged_in'] = True
         request.session['username'] = getattr(config, 'AUTH_USERNAME', 'user')
         logger.info(f"Successful login from {client_ip}")
@@ -460,12 +465,59 @@ def _apply_chat_settings(system, settings: dict):
                     prompts.apply_scenario(prompt_name)
 
                 logger.info(f"Applied prompt: {prompt_name}")
+            else:
+                # Chat settings named a prompt that no longer exists (likely
+                # deleted after the chat was configured with it). Fall back to
+                # 'default' loudly AND rewrite the chat's settings so the
+                # next activation doesn't take the same wrong turn. Silent
+                # no-op here = chat sticks with whatever prompt the previous
+                # chat left loaded. H3 fix 2026-04-22.
+                logger.warning(
+                    f"Chat references unknown prompt '{prompt_name}' "
+                    f"— falling back to 'default' and rewriting chat settings."
+                )
+                default_data = prompts.get_prompt('default')
+                default_content = default_data.get('content', '') if isinstance(default_data, dict) else ''
+                if default_content:
+                    system.llm_chat.set_system_prompt(default_content)
+                    prompts.set_active_preset_name('default')
+                try:
+                    chat_name = system.llm_chat.session_manager.get_active_chat_name()
+                    if chat_name:
+                        system.llm_chat.session_manager.update_chat_settings(
+                            chat_name, {"prompt": "default"}
+                        )
+                except Exception as e:
+                    logger.debug(f"Could not rewrite chat.prompt after fallback: {e}")
+                try:
+                    from core.event_bus import publish, Events
+                    publish(Events.SETTINGS_CHANGED, {
+                        "key": "chat_prompt_fallback",
+                        "value": "default",
+                        "reason": f"missing:{prompt_name}",
+                    })
+                except Exception:
+                    pass
     except Exception as e:
         logger.error(f"Error applying prompt settings: {e}")
 
     try:
-        from core.chat.function_manager import apply_scopes_from_settings
+        # Reset before apply so scopes not present in this chat's settings fall
+        # back to defaults instead of inheriting the previous chat's values.
+        # Matches the pattern used in chat.py, chat_streaming.py, and
+        # continuity/execution_context.py.
+        from core.chat.function_manager import apply_scopes_from_settings, reset_scopes
+        reset_scopes()
         apply_scopes_from_settings(system.llm_chat.function_manager, settings)
+        # Align RAG scope with the active chat — chat.py/chat_streaming.py set this
+        # per-request, but routes that only activate a chat (no message sent) left
+        # scope_rag pointing at the previous chat's documents.
+        try:
+            chat_name = system.llm_chat.session_manager.get_active_chat_name()
+            if chat_name:
+                system.llm_chat.function_manager.set_rag_scope(f"__rag__:{chat_name}")
+        except Exception:
+            pass
     except Exception as e:
         logger.error(f"Error applying scope settings: {e}")
 
@@ -494,18 +546,48 @@ def _apply_chat_settings(system, settings: dict):
     except Exception as e:
         logger.error(f"Error applying toolset: {e}")
 
-    try:
-        system.llm_chat._update_story_engine()
 
-        if settings.get('story_engine_enabled') is not None:
-            toolset_info = system.llm_chat.function_manager.get_current_toolset_info()
-            publish(Events.TOOLSET_CHANGED, {
-                "name": toolset_info.get("name", "custom"),
-                "action": "story_engine_update",
-                "function_count": toolset_info.get("function_count", 0)
-            })
+def reapply_if_active(system, domain: str, name: str):
+    """Hot-reload a saveable thing into the active chat's runtime state.
+
+    When a user edits a toolset/prompt/persona that the active chat is
+    currently using, saving the file alone does not refresh the in-memory
+    runtime — function_manager._enabled_tools, current_system_prompt, etc.
+    stay stale until re-activation. This helper closes that gap.
+
+    No-op when the active chat doesn't reference `name`. Wrapped in a broad
+    try/except so a hot-reload failure never breaks the save response.
+
+    Remmi/Zeebs field report 2026-04-23: editing an active toolset to add a
+    newly-registered plugin tool looked like it worked (file saved) but the
+    tool call returned "not currently available" until re-Activate. This
+    makes the edit land on the first save, as users reasonably expect.
+    """
+    try:
+        chat_settings = system.llm_chat.session_manager.get_chat_settings() or {}
+        if chat_settings.get(domain) != name:
+            return
+        if domain == 'toolset':
+            system.llm_chat.function_manager.update_enabled_functions([name])
+            publish(Events.TOOLSET_CHANGED, {"name": name})
+        elif domain == 'prompt':
+            data = prompts.get_prompt(name)
+            content = data.get('content', '') if isinstance(data, dict) else ''
+            if content:
+                system.llm_chat.set_system_prompt(content)
+                publish(Events.PROMPT_CHANGED, {"name": name, "action": "reapplied"})
+        elif domain == 'persona':
+            # Persona is a bundle; rerun the full apply so prompt/toolset/
+            # voice/scopes all sync to the edited persona's settings.
+            from core.personas import persona_manager
+            persona = persona_manager.get(name)
+            if persona:
+                settings = persona.get("settings", {}).copy()
+                settings["persona"] = name
+                _apply_chat_settings(system, settings)
+        logger.info(f"Hot-reload: re-applied {domain} '{name}' to active chat")
     except Exception as e:
-        logger.error(f"Error applying story engine settings: {e}")
+        logger.warning(f"Hot-reload {domain}='{name}' failed: {e}")
 
 
 # =============================================================================
@@ -517,7 +599,6 @@ from core.routes.tts import router as tts_router
 from core.routes.settings import router as settings_router
 from core.routes.content import router as content_router
 from core.routes.knowledge import router as knowledge_router
-from core.routes.story_engine import router as story_engine_router
 from core.routes.system import router as system_router
 from core.routes.plugins import router as plugins_router
 from core.routes.media import router as media_router
@@ -529,7 +610,6 @@ app.include_router(tts_router)
 app.include_router(settings_router)
 app.include_router(content_router)
 app.include_router(knowledge_router)
-app.include_router(story_engine_router)
 app.include_router(system_router)
 app.include_router(plugins_router)
 app.include_router(media_router)

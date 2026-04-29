@@ -2,12 +2,33 @@
 # Pure REST via requests — no Google client libraries needed.
 
 import logging
+import threading
 import time
 from datetime import datetime, timedelta
 
 import requests
 
 logger = logging.getLogger(__name__)
+
+# Per-scope locks serialize the token refresh dance (check expiry → POST to
+# Google → save). Without this, two concurrent callers both see expired, both
+# POST, both write — last-writer-wins on disk and the other thread's access
+# token is the one Google rotated out of. Worse, if Google rotated the
+# refresh_token, the losing write clobbers the new one with the old. Gone.
+_refresh_locks_guard = threading.Lock()
+_refresh_locks: dict = {}
+
+
+def _lock_for(scope: str) -> threading.Lock:
+    """Get or create the per-scope refresh lock. The guard lock around the
+    dict itself is only held for the tiny get-or-create — the scope lock is
+    what actually serializes refreshes."""
+    with _refresh_locks_guard:
+        lock = _refresh_locks.get(scope)
+        if lock is None:
+            lock = threading.Lock()
+            _refresh_locks[scope] = lock
+        return lock
 
 ENABLED = True
 EMOJI = '\U0001f4c5'
@@ -24,7 +45,7 @@ TOOLS = [
         "network": True,
         "function": {
             "name": "calendar_today",
-            "description": "Get today's calendar events. Shows schedule with times and free hours. Use when asked about today's plans, meetings, or schedule.",
+            "description": "Today's calendar events with times and free hours.",
             "parameters": {
                 "type": "object",
                 "properties": {},
@@ -38,17 +59,17 @@ TOOLS = [
         "network": True,
         "function": {
             "name": "calendar_range",
-            "description": "Get calendar events for a date range. Use for checking upcoming days, this week, availability on specific dates.",
+            "description": "Calendar events for a date range (YYYY-MM-DD).",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "start_date": {
                         "type": "string",
-                        "description": "Start date (YYYY-MM-DD). Defaults to today."
+                        "description": "YYYY-MM-DD. Default: today."
                     },
                     "end_date": {
                         "type": "string",
-                        "description": "End date (YYYY-MM-DD). Defaults to 7 days from start."
+                        "description": "YYYY-MM-DD. Default: start + 7 days."
                     }
                 },
                 "required": []
@@ -61,7 +82,7 @@ TOOLS = [
         "network": True,
         "function": {
             "name": "calendar_add",
-            "description": "Add an event to the calendar. Use when asked to schedule, book, or add something to the calendar.",
+            "description": "Add a calendar event. Times are local (user's timezone) — do NOT add 'Z' or offsets.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -71,15 +92,15 @@ TOOLS = [
                     },
                     "start": {
                         "type": "string",
-                        "description": "Start datetime (YYYY-MM-DDTHH:MM) or date (YYYY-MM-DD) for all-day"
+                        "description": "Local time. YYYY-MM-DDTHH:MM for timed, YYYY-MM-DD for all-day."
                     },
                     "end": {
                         "type": "string",
-                        "description": "End datetime (YYYY-MM-DDTHH:MM) or date (YYYY-MM-DD). Defaults to 1 hour after start."
+                        "description": "Local time. Default: start + 1 hour."
                     },
                     "description": {
                         "type": "string",
-                        "description": "Optional event description or notes"
+                        "description": "Notes"
                     }
                 },
                 "required": ["title", "start"]
@@ -92,13 +113,13 @@ TOOLS = [
         "network": True,
         "function": {
             "name": "calendar_delete",
-            "description": "Delete a calendar event by its number. Get the number from calendar_today or calendar_range first.",
+            "description": "Delete a calendar event. Get event number from calendar_today / calendar_range first.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "event_id": {
                         "type": "string",
-                        "description": "The event number to delete (e.g. '1' or '#1' from calendar results)"
+                        "description": "Event number from calendar results (e.g. '1' or '#1')"
                     }
                 },
                 "required": ["event_id"]
@@ -115,8 +136,13 @@ def _get_gcal_scope():
     try:
         from core.chat.function_manager import scope_gcal
         return scope_gcal.get()
-    except Exception:
-        return 'default'
+    except Exception as e:
+        # Fail disabled, not defaulted. Same silent-default class we closed
+        # in memory/knowledge/goals on 2026-04-20. If ContextVar resolution
+        # fails, a task with gcal_scope='none' must not silently inherit
+        # another scope's refresh token.
+        logger.warning(f"Could not get gcal scope: {e}, returning None (disabled)")
+        return None
 
 
 def _get_gcal_creds():
@@ -128,8 +154,20 @@ def _get_gcal_creds():
     return credentials.get_gcal_account(scope), None
 
 
-def _get_access_token():
-    """Get a valid access token, refreshing if expired."""
+def _get_access_token(force_refresh: bool = False):
+    """Get a valid access token for the current gcal scope.
+
+    Returns (access_token, calendar_id, err). On error, token and
+    calendar_id are None and err has a user-facing message.
+
+    `force_refresh=True` bypasses the cache and hits Google unconditionally —
+    used by the 401-retry path in _api_call.
+
+    The refresh dance is serialized per-scope: a second concurrent caller
+    waits on the scope lock, then re-reads the cache and returns the freshly-
+    minted token instead of double-refreshing. This prevents the race where
+    both threads POST and one loses a potential refresh_token rotation.
+    """
     creds, err = _get_gcal_creds()
     if err:
         return None, None, err
@@ -145,77 +183,132 @@ def _get_access_token():
 
     calendar_id = creds.get('calendar_id', 'primary') or 'primary'
 
-    # Check if cached access token is still valid (with 60s buffer)
-    # We use credentials_manager's raw storage for the short-lived access_token cache
     from core.credentials_manager import credentials
     scope = _get_gcal_scope()
-    raw = credentials._credentials.get('gcal_accounts', {}).get(scope, {})
-    cached_token = raw.get('access_token', '')
-    expires_at = raw.get('expires_at', 0)
 
-    if cached_token and expires_at > time.time() + 60:
-        return cached_token, calendar_id, None
+    with _lock_for(scope):
+        # Re-check the cache AFTER taking the lock. If we were queued behind
+        # another refresh, that refresh just completed — use its fresh token.
+        snap = credentials.get_gcal_tokens_snapshot(scope)
+        cached_token = snap.get('access_token', '')
+        expires_at = snap.get('expires_at', 0)
+        if not force_refresh and cached_token and expires_at > time.time() + 60:
+            return cached_token, calendar_id, None
 
-    # Refresh the token
-    resp = requests.post(GOOGLE_TOKEN_URL, data={
-        'refresh_token': refresh_token,
-        'client_id': client_id,
-        'client_secret': client_secret,
-        'grant_type': 'refresh_token',
-    }, timeout=15)
+        # Actually hit Google. Catch network errors separately from HTTP
+        # errors so the user gets a useful message.
+        try:
+            resp = requests.post(GOOGLE_TOKEN_URL, data={
+                'refresh_token': refresh_token,
+                'client_id': client_id,
+                'client_secret': client_secret,
+                'grant_type': 'refresh_token',
+            }, timeout=15)
+        except requests.RequestException as e:
+            logger.warning(f"[GCAL] Network error during token refresh: {e}")
+            return None, None, ("Couldn't reach Google's token endpoint "
+                                f"({type(e).__name__}). Try again in a moment.")
 
-    if resp.status_code != 200:
-        logger.error(f"[GCAL] Token refresh failed: {resp.text}")
-        return None, None, "Token refresh failed. Try reconnecting in Settings > Google Calendar."
+        if resp.status_code == 200:
+            try:
+                tokens = resp.json()
+                access_token = tokens['access_token']
+            except (ValueError, KeyError) as e:
+                logger.error(f"[GCAL] Malformed token response: {e}; body: {resp.text[:200]}")
+                return None, None, f"Malformed token response from Google: {e}"
 
-    tokens = resp.json()
-    access_token = tokens['access_token']
-    new_expires = time.time() + tokens.get('expires_in', 3600)
+            new_expires = time.time() + tokens.get('expires_in', 3600)
+            # Rotation-aware save: Google MAY return a new refresh_token under
+            # certain conditions (security rotation, scope change). If we
+            # save the old one we'll fail with invalid_grant on next refresh.
+            # Scout finding 2026-04-19.
+            new_refresh = tokens.get('refresh_token', refresh_token)
+            if new_refresh != refresh_token:
+                logger.info(f"[GCAL] refresh_token rotated for scope '{scope}' — saving new one")
+            credentials.update_gcal_tokens(scope, new_refresh, access_token, new_expires)
+            return access_token, calendar_id, None
 
-    # Cache the short-lived token
-    credentials.update_gcal_tokens(scope, refresh_token, access_token, new_expires)
+        # Non-200: discriminate the cause so the message matches reality.
+        try:
+            err_body = resp.json()
+            err_code = err_body.get('error', '') or ''
+        except ValueError:
+            err_code = ''
+        logger.error(f"[GCAL] Token refresh HTTP {resp.status_code} error={err_code!r}: {resp.text[:200]}")
 
-    return access_token, calendar_id, None
-
-
-def _api_get(token, endpoint, params=None):
-    """Make an authenticated GET request to the Calendar API."""
-    resp = requests.get(
-        f"{CALENDAR_API}{endpoint}",
-        headers={'Authorization': f'Bearer {token}'},
-        params=params,
-        timeout=15
-    )
-    if resp.status_code == 401:
-        return None, "Authentication expired. Try reconnecting."
-    if resp.status_code != 200:
-        return None, f"API error {resp.status_code}: {resp.text[:200]}"
-    return resp.json(), None
-
-
-def _api_post(token, endpoint, data):
-    """Make an authenticated POST request to the Calendar API."""
-    resp = requests.post(
-        f"{CALENDAR_API}{endpoint}",
-        headers={'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'},
-        json=data,
-        timeout=15
-    )
-    if resp.status_code not in (200, 201):
-        return None, f"API error {resp.status_code}: {resp.text[:200]}"
-    return resp.json(), None
+        if err_code == 'invalid_grant':
+            return None, None, (
+                "Google rejected the refresh token (invalid_grant). "
+                "Disconnect and reconnect in Settings > Google Calendar."
+            )
+        if resp.status_code >= 500:
+            return None, None, (
+                f"Google token endpoint temporarily unavailable (HTTP {resp.status_code}). "
+                "Try again in a few minutes."
+            )
+        return None, None, (
+            f"Token refresh failed (HTTP {resp.status_code}"
+            + (f", error={err_code}" if err_code else "")
+            + "). If this keeps happening, try reconnecting in Settings."
+        )
 
 
-def _api_delete(token, endpoint):
-    """Make an authenticated DELETE request to the Calendar API."""
-    resp = requests.delete(
-        f"{CALENDAR_API}{endpoint}",
-        headers={'Authorization': f'Bearer {token}'},
-        timeout=15
-    )
-    if resp.status_code not in (200, 204):
-        return None, f"API error {resp.status_code}: {resp.text[:200]}"
-    return True, None
+def _api_call(method: str, endpoint_template: str, params=None, body=None):
+    """Authenticated GCal API call with one automatic 401 retry.
+
+    `endpoint_template` may contain `{calendar_id}` — substituted from the
+    caller's scope credentials. Returns (data, err). For 204 / no-content
+    responses, data is True on success.
+
+    On 401, forces a fresh refresh and retries once. Without this, a tiny
+    clock skew or cached Google 401 would surface to the user as "reconnect"
+    when a retry would've worked.
+    """
+    last_err = None
+    for attempt in range(2):
+        force = (attempt == 1)
+        token, calendar_id, err = _get_access_token(force_refresh=force)
+        if err:
+            return None, err
+        try:
+            url = f"{CALENDAR_API}{endpoint_template.format(calendar_id=calendar_id)}"
+        except KeyError as e:
+            return None, f"Endpoint template missing substitution: {e}"
+        headers = {'Authorization': f'Bearer {token}'}
+        if body is not None:
+            headers['Content-Type'] = 'application/json'
+        try:
+            resp = requests.request(method, url, headers=headers, params=params,
+                                    json=body, timeout=15)
+        except requests.RequestException as e:
+            return None, f"Network error ({type(e).__name__}): {e}"
+        if resp.status_code == 401 and attempt == 0:
+            logger.info(f"[GCAL] 401 on {method} {endpoint_template} — forcing refresh and retrying")
+            continue
+        if resp.status_code == 401:
+            return None, "Authentication expired after refresh. Reconnect in Settings > Google Calendar."
+        if resp.status_code in (200, 201):
+            try:
+                return resp.json(), None
+            except ValueError:
+                return True, None
+        if resp.status_code == 204:
+            return True, None
+        last_err = f"API error {resp.status_code}: {resp.text[:200]}"
+        return None, last_err
+    return None, last_err or "Unexpected auth failure."
+
+
+def _api_get(endpoint_template, params=None):
+    return _api_call('GET', endpoint_template, params=params)
+
+
+def _api_post(endpoint_template, data):
+    return _api_call('POST', endpoint_template, body=data)
+
+
+def _api_delete(endpoint_template):
+    return _api_call('DELETE', endpoint_template)
 
 
 # === Formatting ===
@@ -289,7 +382,11 @@ def _format_events(events, title_line, now=None):
 # === Tool execution ===
 
 def execute(function_name, arguments, config, plugin_settings=None):
-    token, calendar_id, err = _get_access_token()
+    # Preflight: surfaces connection / credential errors before any
+    # per-function work. Each _api_call re-acquires internally so rotation
+    # + 401-retry land in the right place — the token from this preflight
+    # is intentionally discarded.
+    _, _, err = _get_access_token()
     if err:
         return err, False
 
@@ -304,7 +401,7 @@ def execute(function_name, arguments, config, plugin_settings=None):
         today = now.replace(hour=0, minute=0, second=0, microsecond=0)
         tomorrow = today + timedelta(days=1)
 
-        data, err = _api_get(token, f'/calendars/{calendar_id}/events', {
+        data, err = _api_get('/calendars/{calendar_id}/events', {
             'timeMin': today.isoformat(),
             'timeMax': tomorrow.isoformat(),
             'timeZone': tz,
@@ -351,7 +448,7 @@ def execute(function_name, arguments, config, plugin_settings=None):
         # End should be end of day
         end = end.replace(hour=23, minute=59, second=59)
 
-        data, err = _api_get(token, f'/calendars/{calendar_id}/events', {
+        data, err = _api_get('/calendars/{calendar_id}/events', {
             'timeMin': start.isoformat(),
             'timeMax': end.isoformat(),
             'timeZone': tz,
@@ -453,7 +550,7 @@ def execute(function_name, arguments, config, plugin_settings=None):
                 end_dt = start_dt + timedelta(hours=1)
                 event['end'] = {'dateTime': end_dt.isoformat(), 'timeZone': tz}
 
-        data, err = _api_post(token, f'/calendars/{calendar_id}/events', event)
+        data, err = _api_post('/calendars/{calendar_id}/events', event)
         if err:
             return err, False
 
@@ -479,7 +576,7 @@ def execute(function_name, arguments, config, plugin_settings=None):
         # Resolve short ID (#1, #2) to real Google ID
         event_id = _id_map_var.get({}).get(event_id, event_id)
 
-        _, err = _api_delete(token, f'/calendars/{calendar_id}/events/{event_id}')
+        _, err = _api_delete('/calendars/{calendar_id}/events/' + event_id)
         if err:
             return err, False
 

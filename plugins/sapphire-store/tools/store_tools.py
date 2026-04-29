@@ -22,22 +22,22 @@ TOOLS = [
         "is_local": True,
         "function": {
             "name": "store_browse",
-            "description": "Browse and search the Sapphire plugin store. Returns a list of plugins, or full detail if an exact slug match is found. Use with no arguments to see what's available.",
+            "description": "Browse the Sapphire plugin store.\n  search='X' — query by name/keyword/slug (exact slug = full detail)\n  category='X' — filter\n  (none) — full list",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "search": {
                         "type": "string",
-                        "description": "Search query — plugin name, keyword, or exact slug"
+                        "description": "Name, keyword, or exact slug"
                     },
                     "category": {
                         "type": "string",
-                        "description": "Filter by category (e.g. automation, finance, tools, security, entertainment)"
+                        "description": "e.g. automation, finance, tools, security, entertainment"
                     },
                     "sort": {
                         "type": "string",
                         "enum": ["newest", "votes", "name", "updated"],
-                        "description": "Sort order. Default: newest"
+                        "description": "Default newest"
                     }
                 },
                 "required": []
@@ -263,7 +263,10 @@ def _install(slug, plugin_settings=None):
 
             if dest.exists():
                 try:
-                    existing = json.loads((dest / "plugin.json").read_text())
+                    # Explicit utf-8: plugin manifests carry emoji ("emoji": "💾"),
+                    # Windows default cp1252 raises UnicodeDecodeError here and
+                    # blocks the "already installed" branch. 2026-04-24.
+                    existing = json.loads((dest / "plugin.json").read_text(encoding='utf-8'))
                     old_v = existing.get("version", "?")
                 except Exception:
                     old_v = "?"

@@ -182,19 +182,21 @@ async def _connect_single(account_name: str, token: str = None):
         try:
             from core.plugin_loader import plugin_loader
             state = plugin_loader.get_plugin_state("discord")
-            accounts = state.get("accounts", {})
-            if account_name in accounts:
-                accounts[account_name]["bot_name"] = client.user.name
-                accounts[account_name]["bot_id"] = client.user.id
-                state.save("accounts", accounts)
+            def _patch(accts):
+                accts = dict(accts or {})
+                if account_name in accts:
+                    accts[account_name]["bot_name"] = client.user.name
+                    accts[account_name]["bot_id"] = client.user.id
+                return accts
+            state.update_with_lock("accounts", _patch, default={})
         except Exception:
             pass
 
     @client.event
     async def on_message(message):
         logger.debug(f"[DISCORD] on_message fired: author={message.author} bot={message.author.bot} content={message.content[:50] if message.content else '(empty)'}")
-        # Ignore own messages and other bots
-        if message.author == client.user or message.author.bot:
+        # Always ignore own messages (self-loop prevention)
+        if message.author == client.user:
             return
 
         # Check direct @user mention
@@ -205,12 +207,19 @@ async def _connect_single(account_name: str, token: str = None):
             if bot_member:
                 mentioned = any(role in bot_member.roles for role in message.role_mentions)
 
+        # Other bots: only respond if they explicitly @mention us (Round Table semantics)
+        # Prevents passive spam while allowing intentional bot-to-bot conversation
+        if message.author.bot and not mentioned:
+            return
+
         # Fetch recent history for context (last 10 messages before this one)
+        # Include author IDs so the LLM can mention participants via <@id> format
         recent_history = []
         try:
             async for msg in message.channel.history(limit=11, before=message):
                 who = msg.author.display_name or msg.author.name
-                recent_history.append(f"{who}: {msg.clean_content or '(no text)'}")
+                author_id = msg.author.id
+                recent_history.append(f"{who} [id:{author_id}]: {msg.clean_content or '(no text)'}")
             recent_history.reverse()  # oldest first
         except Exception:
             pass
@@ -387,9 +396,33 @@ def _reply_handler(task, event_data: dict, response_text: str):
         logger.warning("[DISCORD] Reply handler missing channel_id or account")
         return
 
-    # Cooldown check — skip if replied to this channel too recently
-    cooldown = task.get("trigger_config", {}).get("cooldown", 0)
-    if cooldown and channel_id:
+    # Auto-reply gate — the manifest exposes a toggle but pre-2026-04-22 the
+    # daemon ignored it and replied regardless. Default is False. A user
+    # setting up the daemon to LISTEN ONLY (forward messages to Sapphire but
+    # not post back) would find the bot spamming channels and getting its
+    # token banned by Discord's anti-spam heuristics. Day-ruiner H1.
+    trigger_config = task.get("trigger_config", {}) or {}
+    if not trigger_config.get("auto_reply"):
+        # INFO not DEBUG: when the bot "goes silent" this is the likely
+        # cause, and admins need to see it without flipping log levels.
+        # Task default is True as of 2026-04-24 — an OFF here is a deliberate
+        # user choice (listen-only mode) or a pre-flip legacy task.
+        logger.info(
+            f"[DISCORD] auto_reply OFF — skipping reply to "
+            f"#{event_data.get('channel_name', channel_id)} "
+            f"(task '{task.get('name', '?')}'). Enable in Schedule if unintended."
+        )
+        return
+
+    # Cooldown check — skip if replied to this channel too recently.
+    # Enforce a minimum floor even when the user sets 0: Discord's
+    # per-channel rate limit is 5 msgs/5 sec. Below 5s floor a busy channel
+    # guarantees API abuse flags → bot ban. User wanting "fast replies"
+    # still gets 5s granularity; anyone not wanting auto-reply should use
+    # the auto_reply toggle instead of cooldown=0. Day-ruiner H3.
+    MIN_COOLDOWN_SECONDS = 5
+    cooldown = max(trigger_config.get("cooldown", 0) or 0, MIN_COOLDOWN_SECONDS)
+    if channel_id:
         now = time.time()
         last = _last_reply_time.get(channel_id, 0)
         if now - last < cooldown:
@@ -402,6 +435,14 @@ def _reply_handler(task, event_data: dict, response_text: str):
     clean = re.sub(r'^[\s\S]*</(?:seed:think|seed:cot_budget_reflect|think)>', '', clean, flags=re.IGNORECASE)
     clean = clean.strip()
     if not clean:
+        # Silent-drop was causing "typing... then nothing" UX on reasoning
+        # models. Make it loud AND show what we're stripping — the raw repr
+        # tells us if the model emitted think tags, a tiny stub, or just
+        # whitespace. Truncated to 200 chars to keep logs readable.
+        logger.warning(
+            f"[DISCORD] Empty reply after think-tag strip — raw response was "
+            f"{len(response_text)} chars. Raw: {response_text[:200]!r}"
+        )
         return
 
     # Discord has a 2000 char limit
