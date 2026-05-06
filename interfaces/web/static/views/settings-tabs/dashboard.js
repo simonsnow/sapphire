@@ -279,10 +279,24 @@ function _setMood(el, mood) {
 function _wireEditableName(el) {
     const node = el.querySelector('#dash-hero-name');
     if (!node) return;
-    node.addEventListener('blur', e => {
+    node.addEventListener('blur', async e => {
         const v = (e.target.textContent || '').trim() || 'Sapphire';
-        e.target.textContent = v;
-        try { localStorage.setItem('sapphireDisplayName', v); } catch (e2) { /* ignore */ }
+        // Cap to reasonable length so a runaway paste can't deform the hero.
+        const trimmed = v.slice(0, 64);
+        e.target.textContent = trimmed;
+        // localStorage cache for instant render on next load.
+        try { localStorage.setItem('sapphireDisplayName', trimmed); } catch (e2) { /* ignore */ }
+        // Persist to backend setting so it lives with the install, not the
+        // browser. Falls back silently if the network call fails — the local
+        // cache still carries the change.
+        try {
+            const csrf = document.querySelector('meta[name="csrf-token"]')?.content || '';
+            await fetch('/api/settings/batch', {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrf },
+                body: JSON.stringify({ settings: { DASHBOARD_DISPLAY_NAME: trimmed }, persist: true }),
+            });
+        } catch { /* offline / network — local cache still has it */ }
     });
     node.addEventListener('keydown', e => {
         if (e.key === 'Enter') { e.preventDefault(); e.target.blur(); }
@@ -429,6 +443,7 @@ async function loadSystemInfo(el) {
     const diskEl = el.querySelector('#sys-disk');
     const memEl  = el.querySelector('#sys-mem');
     const uptimeEl = el.querySelector('#mnt-uptime');
+    const nameEl = el.querySelector('#dash-hero-name');
     try {
         const res = await fetch('/api/dashboard/system-info');
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -438,8 +453,17 @@ async function loadSystemInfo(el) {
         if (uptimeEl) uptimeEl.innerHTML = `uptime <strong>${_esc(d.uptime_str)}</strong>`;
         if (typeof d.backups_hour === 'number') {
             _backupsHour = d.backups_hour;
-            // Re-paint backups if it already loaded with the default hour.
             loadBackupStatus(el);
+        }
+        if (typeof d.disk_pct === 'number') {
+            _moodSignals.diskPct = d.disk_pct;
+            _refreshMood(el);
+        }
+        // Sync display name from backend if it differs from what's rendered
+        // (server-side setting wins; localStorage is a fast-path cache only).
+        if (d.display_name && nameEl && nameEl.textContent.trim() !== d.display_name) {
+            nameEl.textContent = d.display_name;
+            try { localStorage.setItem('sapphireDisplayName', d.display_name); } catch (e2) { /* ignore */ }
         }
     } catch (e) {
         if (diskEl) diskEl.innerHTML = '<span class="dim">disk: unavailable</span>';
@@ -448,23 +472,52 @@ async function loadSystemInfo(el) {
     }
 }
 
+// Component status cache — lets the mood derivation read the latest snapshot.
+let _componentStatus = { emb: 'idle', tts: 'idle', stt: 'idle', ww: 'idle' };
+
 async function loadComponentStatus(el) {
-    // V1 stub: query /api/status for tts/stt liveness, default emb/ww to 'ok'.
-    // A proper /api/dashboard/component-status endpoint will replace this.
     try {
-        const res = await fetch('/api/status');
-        if (!res.ok) throw new Error('status failed');
+        const res = await fetch('/api/dashboard/component-status');
+        if (!res.ok) throw new Error('component-status failed');
         const d = await res.json();
-        const tts = (d.tts_state || {}).speaking ? 'ok' : 'ok';   // alive-ish if status responds
-        const stt = (d.stt_state || {}).recording ? 'ok' : 'ok';
-        _setComponentDot(el, 'emb', 'ok');
-        _setComponentDot(el, 'tts', tts);
-        _setComponentDot(el, 'stt', stt);
-        _setComponentDot(el, 'ww',  'ok');
+        _componentStatus = {
+            emb: d.emb || 'idle',
+            tts: d.tts || 'idle',
+            stt: d.stt || 'idle',
+            ww:  d.ww  || 'idle',
+        };
+        Object.entries(_componentStatus).forEach(([k, v]) => _setComponentDot(el, k, v));
     } catch {
-        // If /api/status fails the whole thing is down — paint all warn.
+        // Endpoint failed — paint all warn so the user sees something's off.
         ['emb', 'tts', 'stt', 'ww'].forEach(k => _setComponentDot(el, k, 'warn'));
+        _componentStatus = { emb: 'warn', tts: 'warn', stt: 'warn', ww: 'warn' };
     }
+    _refreshMood(el);
+}
+
+// Derive an aggregate mood from component status + update availability +
+// disk usage. Called after each signal updates so the orb reflects the
+// freshest picture. Idle components are benign — they just mean the
+// subsystem is configured off, not broken.
+let _moodSignals = {
+    updateAvailable: false,
+    pluginUpdatesCount: 0,
+    diskPct: 0,
+};
+function _refreshMood(el) {
+    const statuses = Object.values(_componentStatus);
+    let mood = 'healthy';
+    if (statuses.includes('error')) {
+        mood = 'error';
+    } else if (
+        statuses.includes('warn') ||
+        _moodSignals.updateAvailable ||
+        _moodSignals.pluginUpdatesCount > 0 ||
+        _moodSignals.diskPct > 92
+    ) {
+        mood = 'warn';
+    }
+    _setMood(el, mood);
 }
 
 function _setComponentDot(el, key, status) {
@@ -504,10 +557,13 @@ async function checkForUpdate(el, retry = 0, force = false) {
             const ago = updateStatus.last_check ? _agoStr(updateStatus.last_check) : 'just now';
             statusEl.innerHTML = `<span class="dash-pill warn" data-attention="warn">v${_esc(updateStatus.latest)} available</span> <span class="dim">· running v${_esc(updateStatus.current)} · ${_esc(ago)}</span>`;
             window.dispatchEvent(new CustomEvent('update-available', { detail: updateStatus }));
+            _moodSignals.updateAvailable = true;
         } else {
             const ago = updateStatus.last_check ? _agoStr(updateStatus.last_check) : 'just now';
             statusEl.innerHTML = `<span class="dash-pill success">✓ current</span> <strong>v${_esc(updateStatus.current)}</strong> <span class="dim">· ${_esc(ago)}</span>`;
+            _moodSignals.updateAvailable = false;
         }
+        _refreshMood(el);
     } catch (e) {
         statusEl.innerHTML = '<span class="dim">could not check</span>';
     }
@@ -661,6 +717,8 @@ async function loadPluginSpotlight(el) {
             updPlugins.innerHTML = '<span class="dash-pill success">✓</span> plugins current';
         }
     }
+    _moodSignals.pluginUpdatesCount = updateCount;
+    _refreshMood(el);
 
     const list = card.querySelector('#dash-recommended-list');
     if (!list) return;

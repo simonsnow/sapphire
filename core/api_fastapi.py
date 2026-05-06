@@ -87,6 +87,19 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 if USER_PUBLIC_DIR.exists():
     app.mount("/user-assets", StaticFiles(directory=str(USER_PUBLIC_DIR)), name="user-assets")
 
+# Dashboard fonts — bootstrap on import (downloads from Google Fonts on first
+# boot if missing; honors DASHBOARD_FONTS_AUTOFETCH). Mounted regardless so
+# the dir exists before mount; missing files 404 cleanly and CSS falls back.
+USER_FONTS_DIR = PROJECT_ROOT / "user" / "fonts"
+try:
+    from core.font_bootstrap import ensure_dashboard_fonts
+    ensure_dashboard_fonts(PROJECT_ROOT / "user")
+except Exception as _font_e:  # never block boot on font fetch
+    import logging as _logging
+    _logging.getLogger(__name__).warning(f"font bootstrap failed: {_font_e}")
+USER_FONTS_DIR.mkdir(parents=True, exist_ok=True)
+app.mount("/user-fonts", StaticFiles(directory=str(USER_FONTS_DIR)), name="user-fonts")
+
 # Plugin web assets — serves from plugins/{name}/web/ and user/plugins/{name}/web/
 SYSTEM_PLUGINS_DIR = PROJECT_ROOT / "plugins"
 USER_PLUGINS_DIR_WEB = PROJECT_ROOT / "user" / "plugins"

@@ -766,6 +766,8 @@ async def dashboard_system_info(_=Depends(require_login)):
     except Exception:
         backups_hour = 3
 
+    display_name = (getattr(config, 'DASHBOARD_DISPLAY_NAME', '') or 'Sapphire').strip() or 'Sapphire'
+
     return {
         "mem_mb": mem_mb,
         "threads": proc.num_threads(),
@@ -776,4 +778,68 @@ async def dashboard_system_info(_=Depends(require_login)):
         "disk_free_gb": round(du.free / 1024 ** 3, 1) if du else None,
         "disk_pct": round(du.percent, 1) if du else None,
         "backups_hour": backups_hour,
+        "display_name": display_name,
+    }
+
+
+@router.get("/api/dashboard/component-status")
+async def dashboard_component_status(_=Depends(require_login)):
+    """Health pills for the dashboard hero — embeddings, TTS, STT, wakeword.
+    Each returns: 'ok' (configured & alive), 'idle' (configured off / Null
+    provider), 'warn' (configured but provider unhealthy), 'error' (system
+    expects it but it's missing). Frontend mood-derives off this set."""
+    system = get_system()
+
+    def _tts_status() -> str:
+        try:
+            tts = getattr(system, 'tts', None)
+            if tts is None:
+                return 'idle' if not getattr(config, 'TTS_ENABLED', False) else 'error'
+            provider_name = type(getattr(tts, '_provider', None)).__name__.lower()
+            if 'null' in provider_name:
+                return 'idle'
+            return 'ok'
+        except Exception:
+            return 'warn'
+
+    def _stt_status() -> str:
+        try:
+            if not getattr(config, 'STT_ENABLED', False):
+                return 'idle'
+            recorder = getattr(system, 'whisper_recorder', None)
+            if recorder is None:
+                return 'error'
+            if 'null' in type(recorder).__name__.lower():
+                return 'idle'
+            return 'ok'
+        except Exception:
+            return 'warn'
+
+    def _wakeword_status() -> str:
+        try:
+            if not getattr(config, 'WAKEWORD_ENABLED', False):
+                return 'idle'
+            detector = getattr(system, 'wake_detector', None)
+            if detector is None:
+                return 'error'
+            if 'null' in type(detector).__name__.lower():
+                return 'idle'
+            return 'ok'
+        except Exception:
+            return 'warn'
+
+    def _embedding_status() -> str:
+        try:
+            provider = (getattr(config, 'EMBEDDING_PROVIDER', '') or '').lower()
+            if not provider or provider == 'none':
+                return 'idle'
+            return 'ok'
+        except Exception:
+            return 'warn'
+
+    return {
+        'tts': _tts_status(),
+        'stt': _stt_status(),
+        'ww':  _wakeword_status(),
+        'emb': _embedding_status(),
     }

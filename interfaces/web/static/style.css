@@ -2687,6 +2687,23 @@ div.hb-response-summary {
 .danger-section:last-child { margin-bottom: 0; }
 
 /* =============================================================================
+   FONTS — Dancing Script fetched on first boot to user/fonts/, served at
+   /user-fonts/. See core/font_bootstrap.py. If fetching is disabled or
+   failed, the woff2 url 404s and the browser falls back to system
+   'cursive' — the dashboard still renders, just plainer.
+   Latin subset only; one variable woff2 covers weights 500-700.
+   Monospace UI text uses the system font stack (Menlo/Consolas/etc.) —
+   no custom mono download needed.
+============================================================================= */
+@font-face {
+    font-family: 'Dancing Script';
+    font-style: normal;
+    font-weight: 500 700;
+    font-display: swap;
+    src: url('/user-fonts/dancing-script.woff2') format('woff2');
+}
+
+/* =============================================================================
    DASHBOARD — new hero (Variant B, locked 2026-05-06)
    See tmp/dashboard-refactor-plan.md and tmp/dashboard-hero.html for design
    intent. Hero contains identity row (orb + Sapphire name + status) and
