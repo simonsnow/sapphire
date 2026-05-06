@@ -1,3 +1,6 @@
+# 2.6.3 - Settings Dashboard
+- Main settings info page redesign
+- Added recommended plugins
 # 2.6.2 - Plugin Store
 - Brought plugin store to the app
 - Featured plugins feature
