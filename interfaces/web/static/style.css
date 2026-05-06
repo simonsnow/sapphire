@@ -2689,14 +2689,26 @@ div.hb-response-summary {
 /* Dashboard grid */
 .dashboard-grid {
     display: grid;
-    grid-template-columns: repeat(3, 1fr);
+    grid-template-columns: repeat(4, 1fr);
+    grid-auto-flow: row dense;  /* backfill cells around tall/wide cards so no holes */
     gap: 16px;
-    max-width: 900px;
 }
-@media (max-width: 900px) { .dashboard-grid { grid-template-columns: repeat(2, 1fr); } }
-@media (max-width: 600px) { .dashboard-grid { grid-template-columns: 1fr; } }
+@media (max-width: 1200px) { .dashboard-grid { grid-template-columns: repeat(3, 1fr); } }
+@media (max-width: 900px)  { .dashboard-grid { grid-template-columns: repeat(2, 1fr); } }
+@media (max-width: 600px)  { .dashboard-grid { grid-template-columns: 1fr; } }
 .dash-card-2col { grid-column: span 2; }
 @media (max-width: 600px) { .dash-card-2col { grid-column: span 1; } }
+
+/* Tall card — pinned to the right column, spans multiple rows. Used by
+   Recommended Plugins so the community feed reads as a vertical column
+   alongside the small status cards. */
+.dash-card-tall {
+    grid-column: -2 / -1;  /* always rightmost column */
+    grid-row: span 2;
+}
+@media (max-width: 600px) {
+    .dash-card-tall { grid-row: auto; grid-column: span 1; }
+}
 .dash-card {
     padding: 16px;
     border: 1px solid var(--border);
@@ -2739,6 +2751,89 @@ div.hb-response-summary {
     align-items: center;
     justify-content: space-between;
     margin-bottom: 10px;
+}
+
+/* Recommended Plugins (community shoutouts) — vertical feed */
+.dash-recommended-list {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+.dash-rec-tile {
+    background: var(--bg-tertiary, #2c2c2c);
+    border: 1px solid var(--border, #333);
+    border-radius: 8px;
+    padding: 10px 12px;
+    cursor: pointer;
+    text-align: left;
+    transition: border-color 0.15s, transform 0.15s;
+    color: var(--text);
+    font-family: inherit;
+}
+.dash-rec-tile:hover {
+    border-color: var(--trim-border, #4a9eff);
+    transform: translateY(-1px);
+}
+.dash-rec-name {
+    font-size: var(--font-sm);
+    font-weight: 600;
+    color: var(--text-bright, var(--text));
+    margin-bottom: 2px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+}
+.dash-rec-author {
+    font-size: var(--font-xs);
+    color: var(--text-muted);
+    margin-bottom: 4px;
+}
+.dash-rec-author a {
+    color: var(--text-secondary, var(--text-muted));
+    text-decoration: none;
+}
+.dash-rec-author a:hover {
+    color: var(--trim, #4a9eff);
+    text-decoration: underline;
+}
+.dash-rec-desc {
+    font-size: var(--font-xs);
+    color: var(--text-muted);
+    line-height: 1.35;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+}
+.dash-rec-installed {
+    font-size: 10px;
+    background: var(--bg-secondary);
+    color: var(--text-muted);
+    padding: 0 6px;
+    border-radius: 8px;
+    font-weight: normal;
+}
+.dash-rec-update {
+    font-size: 10px;
+    background: rgba(243, 156, 18, 0.18);
+    color: #f39c12;
+    padding: 0 6px;
+    border-radius: 8px;
+    font-weight: 600;
+}
+.dash-rec-see-all {
+    display: block;
+    margin-top: 12px;
+    padding-top: 10px;
+    border-top: 1px solid var(--border);
+    font-size: var(--font-sm);
+    color: var(--text-muted);
+    text-decoration: none;
+    text-align: center;
+}
+.dash-rec-see-all:hover {
+    color: var(--trim, #4a9eff);
 }
 .dash-card-header h4 {
     margin: 0;

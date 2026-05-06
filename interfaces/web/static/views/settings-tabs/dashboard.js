@@ -1,7 +1,16 @@
 // settings-tabs/dashboard.js - Dashboard with system controls, update checker, and token metrics
 import * as ui from '../../ui.js';
+import { listStorePlugins } from '../../shared/store-api.js';
 
 let updateStatus = null;
+
+// Stronger escape for community-authored content (plugin names, authors, URLs).
+// The pre-existing _esc below only handles <> — not enough for href attributes.
+function _safeEsc(s) {
+    return String(s ?? '')
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
 
 export default {
     id: 'dashboard',
@@ -43,6 +52,16 @@ export default {
                     <p class="text-muted" style="font-size:var(--font-sm);margin:0 0 8px">Guides and troubleshooting</p>
                     <button class="btn-primary btn-sm" id="dash-help">Open Help</button>
                 </div>
+                <div class="dash-card dash-card-tall" id="dash-recommended-card" style="display:none">
+                    <div class="dash-card-header" style="flex-direction:column;align-items:flex-start;gap:2px">
+                        <h4>\u{1F6CD}\u{FE0F} Recommended</h4>
+                        <span class="text-muted" style="font-size:var(--font-xs)">community shoutouts</span>
+                    </div>
+                    <div class="dash-recommended-list" id="dash-recommended-list">
+                        <span class="text-muted" style="font-size:var(--font-sm)">Loading...</span>
+                    </div>
+                    <a href="#store" id="dash-rec-see-all" class="dash-rec-see-all">See all in Store →</a>
+                </div>
                 <div class="dash-card">
                     <h4>Maintenance</h4>
                     <div class="dash-controls" style="flex-direction:column;gap:6px">
@@ -77,6 +96,17 @@ export default {
         // Help button
         el.querySelector('#dash-help')?.addEventListener('click', () => {
             import('../../core/router.js').then(r => r.switchView('help'));
+        });
+
+        // Recommended Plugins (community shoutouts)
+        loadRecommendedPlugins(el);
+        el.querySelector('#dash-recommended-card')?.addEventListener('click', e => {
+            const tile = e.target.closest('.dash-rec-tile');
+            if (tile) {
+                window.location.hash = `#store/plugins/${encodeURIComponent(tile.dataset.slug)}`;
+                return;
+            }
+            // "See all" link is a real anchor — let the browser handle it.
         });
 
         // Quick stats
@@ -305,6 +335,48 @@ function pollForRestart() {
         if (attempts < maxAttempts) setTimeout(poll, 1000);
     };
     poll();
+}
+
+
+// =============================================================================
+// RECOMMENDED PLUGINS — community shoutouts from sapphireblue.dev
+// =============================================================================
+
+async function loadRecommendedPlugins(el) {
+    const card = el.querySelector('#dash-recommended-card');
+    if (!card) return;
+    let data;
+    try {
+        data = await listStorePlugins({ featured: true, perPage: 5 });
+    } catch (e) {
+        // Quiet failure — store is optional infrastructure, don't clutter the dashboard.
+        card.style.display = 'none';
+        return;
+    }
+    const items = (data && data.items) || [];
+    if (!items.length || data.unreachable) {
+        card.style.display = 'none';
+        return;
+    }
+    const list = card.querySelector('#dash-recommended-list');
+    if (!list) return;
+    list.innerHTML = items.map(item => {
+        const author = item.author_url
+            ? `<a href="${_safeEsc(item.author_url)}" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation()">${_safeEsc(item.author || 'Unknown')}</a>`
+            : _safeEsc(item.author || 'Unknown');
+        const installed = item.installed_state === 'current'
+            ? '<span class="dash-rec-installed">installed</span>'
+            : item.installed_state === 'update_available'
+                ? '<span class="dash-rec-update">update available</span>'
+                : '';
+        return `
+            <button class="dash-rec-tile" data-slug="${_safeEsc(item.slug)}" title="Open ${_safeEsc(item.name)} in the Store">
+                <div class="dash-rec-name">${_safeEsc(item.name)} ${installed}</div>
+                <div class="dash-rec-author">by ${author}</div>
+                <div class="dash-rec-desc">${_safeEsc(item.description || '')}</div>
+            </button>`;
+    }).join('');
+    card.style.display = '';
 }
 
 

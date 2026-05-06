@@ -20,10 +20,11 @@ import pluginsTab from './settings-tabs/plugins.js';
 import backupTab from './settings-tabs/backup.js';
 import systemTab from './settings-tabs/system.js';
 import helpTab from './settings-tabs/help-tab.js';
+import storeTab from './settings-tabs/store-tab.js';
 
 import { getRegisteredTabs } from '../shared/plugin-registry.js';
 
-const STATIC_TABS = [dashboardTab, appearanceTab, audioTab, ttsTab, sttTab, embeddingTab, llmTab, toolsTab, networkTab, wakewordTab, pluginsTab, backupTab, systemTab, helpTab];
+const STATIC_TABS = [dashboardTab, appearanceTab, audioTab, ttsTab, sttTab, embeddingTab, llmTab, toolsTab, networkTab, wakewordTab, pluginsTab, storeTab, backupTab, systemTab, helpTab];
 
 let container = null;
 let activeTab = 'dashboard';
