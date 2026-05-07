@@ -807,6 +807,11 @@ async function mountPanels(el) {
             continue;
         }
 
+        // Per-panel cleanup list. Widgets can call ctx.api.registerCleanup(fn)
+        // BEFORE scheduling work — that way cleanup runs even if render()
+        // throws after starting timers/listeners. Also captures the
+        // `cleanup` returned at the end of a successful render. 2026-05-07.
+        const cleanups = [];
         const ctx = {
             plugin: panel.plugin,
             widget_id: panel.widget_id,
@@ -814,12 +819,18 @@ async function mountPanels(el) {
             size: panel.size,
             settings: panel.settings || {},
             pluginWebPath: panel.plugin === 'core' ? '/core-widgets/' : `/plugin-web/${panel.plugin}/`,
-            api,
+            api: {
+                ...api,
+                registerCleanup: (fn) => {
+                    if (typeof fn === 'function') cleanups.push(fn);
+                },
+            },
         };
 
         try {
             const module = await import(`${panel.render_url}?v=${encodeURIComponent(v)}`);
             const result = await module.render(bodyEl, ctx);
+            if (typeof result?.cleanup === 'function') cleanups.push(result.cleanup);
             titleEl.textContent = result?.title || panel.name || panel.widget_id;
 
             const allActions = [...(result?.actions || [])];
@@ -847,9 +858,22 @@ async function mountPanels(el) {
                 menu.appendChild(btn);
             });
 
-            _panelRegistry.push({ instance_id: panel.instance_id, cleanup: result?.cleanup });
+            _panelRegistry.push({
+                instance_id: panel.instance_id,
+                cleanup: () => {
+                    for (const fn of cleanups) {
+                        try { fn(); } catch (err) { console.warn('panel cleanup', panel.instance_id, err); }
+                    }
+                },
+            });
         } catch (e) {
             console.warn(`[panel ${panel.plugin}.${panel.widget_id}] render failed`, e);
+            // Even though render threw, run any cleanups it managed to
+            // register before the throw. Otherwise leaked intervals /
+            // listeners accumulate across remount cycles.
+            for (const fn of cleanups) {
+                try { fn(); } catch {}
+            }
             titleEl.textContent = panel.name || panel.widget_id;
             bodyEl.innerHTML = `<div class="dash-action-panel-info-line"><span class="dim">render failed: ${_esc(e?.message || String(e))}</span></div>`;
         }

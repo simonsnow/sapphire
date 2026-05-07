@@ -193,6 +193,7 @@ You own its content. Don't touch its parent — that's the host's chrome.
 | `api.pollForRestart()` | Watches `/api/health` and reloads when Sapphire is back. Use after restart-triggering actions. |
 | `api.navigateSettingsTab(name)` | Programmatically switch Settings tabs (e.g. `'backup'`). |
 | `api.openWidgetSettings(instance_id)` | Open the auto-rendered settings modal for a widget. Useful if you want a custom action like `✏ Edit` that opens settings. |
+| `api.registerCleanup(fn)` | Register a cleanup function up-front, before scheduling work. Safer than only relying on the returned `cleanup` — if your render throws *after* starting an interval but *before* returning, the registered cleanup still runs and the timer doesn't leak. Recommended for any render that schedules side effects before its first `await`. |
 
 ### What you must return
 
@@ -354,6 +355,28 @@ return { title, actions };  // no cleanup
 const tick = setInterval(refresh, 1000);
 return { title, actions, cleanup: () => clearInterval(tick) };
 ```
+
+### Risky pattern: scheduling before an `await` that might throw
+
+If your render starts a timer/listener BEFORE an `await` that fails,
+the returned cleanup never reaches the host — your timer leaks.
+Use `ctx.api.registerCleanup` to bind the cleanup up-front:
+
+```js
+// SAFER — cleanup is bound BEFORE the risky await, so it still runs if fetch throws.
+export async function render(container, ctx) {
+    const tick = setInterval(refresh, 1000);
+    ctx.api.registerCleanup(() => clearInterval(tick));
+
+    const data = await ctx.api.fetch('/api/something-that-might-404');  // could throw
+    if (!data.ok) throw new Error('boom');
+    // ...
+    return { title: '...', actions: [...] };  // cleanup already registered
+}
+```
+
+You can use both patterns together — anything you `registerCleanup` AND
+anything you return as `cleanup` will all run on unmount.
 
 ### Used inline `onclick="..."` → may break with strict CSP
 
