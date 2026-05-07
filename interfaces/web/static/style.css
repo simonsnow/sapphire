@@ -4156,15 +4156,30 @@ a.gallery-caption:hover {
     border: none;
     color: var(--text-muted);
     cursor: pointer;
-    padding: 2px 6px;
+    padding: 2px 4px;
     border-radius: var(--radius-sm);
-    font-size: var(--font-xs);
-    transition: all var(--transition-normal);
+    line-height: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    transition: color var(--transition-normal), background var(--transition-normal);
+}
+
+.code-block-header .code-copy svg {
+    display: block;
 }
 
 .code-block-header .code-copy:hover {
     background: var(--bg-hover);
     color: var(--text-bright);
+}
+
+.code-block-header .code-copy.copied {
+    color: var(--success, #22c55e);
+}
+
+.code-block-header .code-copy.failed {
+    color: var(--error, #ef4444);
 }
 
 /* Streaming code block indicator */

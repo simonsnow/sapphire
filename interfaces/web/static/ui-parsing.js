@@ -141,36 +141,40 @@ const extractCodeBlocks = (text) => {
     return { processed, codeBlocks };
 };
 
-// Create a code block element with optional header and copy button
+const COPY_ICON_SVG = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>';
+const CHECK_ICON_SVG = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="20 6 9 17 4 12"></polyline></svg>';
+
+// Create a code block element with header (language label + copy icon)
 export const createCodeBlock = (language, code) => {
     const wrapper = document.createElement('pre');
-    
-    // Add header with language and copy button
-    if (language && language !== 'plaintext') {
-        const header = document.createElement('div');
-        header.className = 'code-block-header';
-        header.innerHTML = `
-            <span class="code-lang">${escapeHtml(language)}</span>
-            <button class="code-copy" title="Copy code">Copy</button>
-        `;
-        wrapper.appendChild(header);
-        
-        // Copy button handler
-        const copyBtn = header.querySelector('.code-copy');
-        copyBtn.addEventListener('click', async () => {
-            try {
-                await navigator.clipboard.writeText(code);
-                copyBtn.textContent = 'Copied!';
-                setTimeout(() => copyBtn.textContent = 'Copy', 2000);
-            } catch (e) {
-                copyBtn.textContent = 'Failed';
-                setTimeout(() => copyBtn.textContent = 'Copy', 2000);
-            }
-        });
-    }
-    
+
+    const header = document.createElement('div');
+    header.className = 'code-block-header';
+    const langText = (language && language !== 'plaintext') ? language : '';
+    header.innerHTML = `
+        <span class="code-lang">${escapeHtml(langText)}</span>
+        <button class="code-copy" title="Copy code" aria-label="Copy code">${COPY_ICON_SVG}</button>
+    `;
+    wrapper.appendChild(header);
+
+    const copyBtn = header.querySelector('.code-copy');
+    copyBtn.addEventListener('click', async () => {
+        try {
+            await navigator.clipboard.writeText(code);
+            copyBtn.innerHTML = CHECK_ICON_SVG;
+            copyBtn.classList.add('copied');
+            setTimeout(() => {
+                copyBtn.innerHTML = COPY_ICON_SVG;
+                copyBtn.classList.remove('copied');
+            }, 2000);
+        } catch (e) {
+            copyBtn.classList.add('failed');
+            setTimeout(() => copyBtn.classList.remove('failed'), 2000);
+        }
+    });
+
     const codeEl = document.createElement('code');
-    codeEl.className = `language-${language}`;
+    codeEl.className = `language-${language || 'plaintext'}`;
     codeEl.textContent = code;
     wrapper.appendChild(codeEl);
     

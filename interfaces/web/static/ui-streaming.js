@@ -138,23 +138,30 @@ export const startStreaming = (container, messageElement, scrollCallback) => {
 // Check if streaming is ready
 export const isStreamReady = () => streamMsg !== null;
 
+const COPY_ICON_SVG = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>';
+const CHECK_ICON_SVG = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="20 6 9 17 4 12"></polyline></svg>';
+
+const escapeHtml = (text) => {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+};
+
 // Create streaming code block preview (unhighlighted)
 const createCodePreview = (lang) => {
     const pre = createElem('pre');
     pre.className = 'streaming-code';
-    
-    // Add header if language specified
-    if (lang && lang !== 'plaintext') {
-        const header = document.createElement('div');
-        header.className = 'code-block-header';
-        header.innerHTML = `<span class="code-lang">${lang}</span><span class="code-status">...</span>`;
-        pre.appendChild(header);
-    }
-    
+
+    const header = document.createElement('div');
+    header.className = 'code-block-header';
+    const langText = (lang && lang !== 'plaintext') ? lang : '';
+    header.innerHTML = `<span class="code-lang">${escapeHtml(langText)}</span><span class="code-status">...</span>`;
+    pre.appendChild(header);
+
     const code = createElem('code');
     code.className = `language-${lang || 'plaintext'}`;
     pre.appendChild(code);
-    
+
     return { pre, code };
 };
 
@@ -185,15 +192,20 @@ const finalizeCodeBlock = () => {
             const copyBtn = document.createElement('button');
             copyBtn.className = 'code-copy';
             copyBtn.title = 'Copy code';
-            copyBtn.textContent = 'Copy';
+            copyBtn.setAttribute('aria-label', 'Copy code');
+            copyBtn.innerHTML = COPY_ICON_SVG;
             copyBtn.addEventListener('click', async () => {
                 try {
                     await navigator.clipboard.writeText(codeText);
-                    copyBtn.textContent = 'Copied!';
-                    setTimeout(() => copyBtn.textContent = 'Copy', 2000);
+                    copyBtn.innerHTML = CHECK_ICON_SVG;
+                    copyBtn.classList.add('copied');
+                    setTimeout(() => {
+                        copyBtn.innerHTML = COPY_ICON_SVG;
+                        copyBtn.classList.remove('copied');
+                    }, 2000);
                 } catch (e) {
-                    copyBtn.textContent = 'Failed';
-                    setTimeout(() => copyBtn.textContent = 'Copy', 2000);
+                    copyBtn.classList.add('failed');
+                    setTimeout(() => copyBtn.classList.remove('failed'), 2000);
                 }
             });
             status.replaceWith(copyBtn);
