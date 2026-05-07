@@ -10,6 +10,7 @@ Validation: each saved panel must reference a registered widget; entries
 referencing missing plugins are kept (so users see "(unavailable)" rather
 than silent removal — Stage 3 surfaces the placeholder UI).
 """
+import asyncio
 import json
 import logging
 import re
@@ -20,6 +21,11 @@ from fastapi import APIRouter, Request, Depends, HTTPException
 
 from core.auth import require_login
 from core.dashboard_widgets import list_widgets, get_widget
+
+# Serialize PUTs to dashboard.json — without this, two near-simultaneous
+# saves (drag + delete in flight, multi-tab edits) can interleave at the
+# file level and last-writer-wins. Race scout finding 2026-05-07.
+_DASHBOARD_LOCK = asyncio.Lock()
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -187,7 +193,11 @@ async def put_dashboard_widgets(request: Request, _=Depends(require_login)):
             "settings": p.get("settings") or {},
         })
 
-    _save({"version": 1, "panels": cleaned})
+    # Lock around the actual write so concurrent PUTs serialize. Validation
+    # above is already done by this point (intentionally outside the lock —
+    # cheap and parallelizable) so contention only covers the file write.
+    async with _DASHBOARD_LOCK:
+        _save({"version": 1, "panels": cleaned})
     return {"status": "ok", "count": len(cleaned)}
 
 

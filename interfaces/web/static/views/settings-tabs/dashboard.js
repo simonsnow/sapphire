@@ -133,7 +133,10 @@ export default {
         });
 
         // ── Spotlight tile click → store deep-link (lower content row) ──
+        // Don't intercept if the user clicked an actual link (e.g. author URL)
+        // inside the tile — let the browser navigate to that link instead.
         el.querySelector('#dash-spotlight-card')?.addEventListener('click', e => {
+            if (e.target.closest('a')) return;
             const tile = e.target.closest('.dash-rec-tile');
             if (tile) {
                 window.location.hash = `#store/plugins/${encodeURIComponent(tile.dataset.slug)}`;
@@ -618,6 +621,10 @@ async function openWidgetSettings(el, instance_id) {
     const fieldNodes = {};
 
     for (const field of schema) {
+        // Per-field try/catch so a single malformed schema entry doesn't
+        // tank the whole modal. Plugin authors WILL ship bad schemas;
+        // we render what we can and skip the broken entries.
+        try {
         const wrap = document.createElement('label');
         wrap.style.cssText = 'display:flex;flex-direction:column;gap:4px;margin-bottom:14px';
         const label = document.createElement('span');
@@ -690,7 +697,19 @@ async function openWidgetSettings(el, instance_id) {
         }
 
         body.appendChild(wrap);
+        // Skip fields with no key — they'd write to fieldNodes[undefined]
+        // and clobber each other on save. Logged so plugin authors notice.
+        if (!field.key) {
+            console.warn('[widget settings] field has no `key`, skipping:', field);
+            continue;
+        }
+        if (fieldNodes[field.key]) {
+            console.warn(`[widget settings] duplicate field key '${field.key}', last wins`);
+        }
         fieldNodes[field.key] = { input, type: field.type };
+        } catch (e) {
+            console.warn('[widget settings] field render failed, skipping:', field, e);
+        }
     }
 
     backdrop.querySelector('[data-act="save"]').addEventListener('click', async () => {
@@ -1176,7 +1195,7 @@ async function loadPluginSpotlight(el) {
     if (!list) return;
     list.innerHTML = items.map(item => {
         const author = (item.author_url && isSafeHref(item.author_url))
-            ? `<a href="${_esc(item.author_url)}" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation()">${_esc(item.author || 'Unknown')}</a>`
+            ? `<a href="${_esc(item.author_url)}" target="_blank" rel="noopener noreferrer">${_esc(item.author || 'Unknown')}</a>`
             : _esc(item.author || 'Unknown');
         const installed = item.installed_state === 'current'
             ? '<span class="dash-rec-installed">installed</span>'

@@ -262,6 +262,30 @@ async def security_headers(request: Request, call_next):
     response.headers['X-Frame-Options'] = 'DENY'
     response.headers['X-XSS-Protection'] = '1; mode=block'
 
+    # Permissive CSP — defense in depth around the community-content surfaces.
+    # 'unsafe-inline' on script-src and style-src is required because Sapphire's
+    # templates use inline <script> and inline style="" attributes throughout
+    # (see login.html, setup.html, index.html). Even with that allowance, the
+    # CSP still blocks the high-impact attacks:
+    #   - connect-src 'self' prevents any XSS from exfiltrating session cookie
+    #     via fetch/XHR to an attacker domain
+    #   - frame-ancestors 'none' blocks clickjacking
+    #   - default-src 'self' blocks surprise external resource loads
+    # Img-src includes data: (avatar fallbacks, modal icons) and https: for
+    # community-supplied screenshot URLs. Tightening to strict CSP requires
+    # cleaning up the inline handlers across the codebase first — out of scope.
+    response.headers['Content-Security-Policy'] = (
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline'; "
+        "style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data: https:; "
+        "font-src 'self' data:; "
+        "connect-src 'self'; "
+        "frame-ancestors 'none'; "
+        "base-uri 'self'; "
+        "form-action 'self'"
+    )
+
     # Static assets: cached 1hr, busted by ?v=BOOT_VERSION (changes every restart)
     # Import map in index.html ensures ALL JS modules get versioned URLs
     if request.url.path.startswith('/static/'):
