@@ -15,6 +15,41 @@ logger = logging.getLogger(__name__)
 
 IS_WINDOWS = sys.platform == 'win32'
 
+
+def _fsync_file(f):
+    """Force file contents to disk before close.
+
+    Without this, our 'atomic write' (tmp + rename) is only atomic against
+    process crashes — not power loss. A power flicker between the rename
+    and the pagecache flush leaves the target file as zero bytes, wiping
+    settings/credentials silently. Day-ruiner scout 2026-05-07.
+    """
+    try:
+        f.flush()
+        os.fsync(f.fileno())
+    except OSError as e:
+        logger.warning(f"fsync failed (write may not survive power loss): {e}")
+
+
+def _fsync_dir(path):
+    """Force a directory entry to disk so a rename inside it is durable.
+
+    Without this, the temp+rename can be reordered after power loss — the
+    rename hits the journal but the directory's updated entry is still in
+    pagecache. Result: file disappears or reverts.
+    """
+    try:
+        dir_fd = os.open(str(path), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        # Windows + some network filesystems don't support directory fsync;
+        # the file-level fsync above is the larger safety net anyway.
+        pass
+
+
 class SettingsManager:
     """Manages application settings with hot-reload and persistence."""
     
@@ -182,7 +217,9 @@ class SettingsManager:
             tmp_path = user_path.with_suffix('.json.tmp')
             with open(tmp_path, 'w', encoding='utf-8') as f:
                 json.dump(nested, f, indent=2)
+                _fsync_file(f)
             tmp_path.replace(user_path)
+            _fsync_dir(user_path.parent)
             # Update mtime immediately — no gap for file watcher
             self._last_mtime = user_path.stat().st_mtime
             logger.info(f"[SETTINGS] Migration persisted to disk")
@@ -423,11 +460,13 @@ class SettingsManager:
                             section[ck] = ''
             
             user_path.parent.mkdir(exist_ok=True)
-            # Atomic write: tmp file + rename to prevent corruption on crash
+            # Atomic write: tmp + fsync + rename + dir fsync to survive power loss
             tmp_path = user_path.with_suffix('.json.tmp')
             with open(tmp_path, 'w', encoding='utf-8') as f:
                 json.dump(nested, f, indent=2)
+                _fsync_file(f)
             tmp_path.replace(user_path)
+            _fsync_dir(user_path.parent)
             # Update mtime IMMEDIATELY after rename — no gap for the file watcher
             # to see a new mtime before _last_mtime is updated (fixes spurious reloads)
             self._last_mtime = user_path.stat().st_mtime
@@ -510,7 +549,9 @@ class SettingsManager:
                 tmp_path = user_path.with_suffix('.json.tmp')
                 with open(tmp_path, 'w', encoding='utf-8') as f:
                     json.dump({"_comment": "Your custom settings - edit freely or use web UI"}, f, indent=2)
+                    _fsync_file(f)
                 tmp_path.replace(user_path)
+                _fsync_dir(user_path.parent)
                 self._last_mtime = user_path.stat().st_mtime
                 logger.info("Settings reset to defaults")
                 return True
@@ -785,7 +826,9 @@ class SettingsManager:
                 tmp_path = user_path.with_suffix('.json.tmp')
                 with open(tmp_path, 'w', encoding='utf-8') as f:
                     json.dump(nested, f, indent=2)
+                    _fsync_file(f)
                 tmp_path.replace(user_path)
+                _fsync_dir(user_path.parent)
                 self._last_mtime = user_path.stat().st_mtime
                 logger.debug(f"Removed '{key}' from settings file")
         except Exception as e:

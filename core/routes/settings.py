@@ -479,7 +479,17 @@ async def update_setting(key: str, request: Request, _=Depends(require_login)):
         return {"status": "success", "key": key, "value": value, "tier": settings.validate_tier(key), "persisted": False}
     persist = data.get('persist', True)
     tier = settings.validate_tier(key)
-    settings.set(key, value, persist=persist)
+    # Provider-switch keys: defer persist until after switch verifies. Pre-fix,
+    # persist happened FIRST then switch ran — if switch raised (bad API key,
+    # provider plugin missing), settings.json had the new value, runtime had
+    # the new value, but the live singleton stayed on the old provider. Next
+    # restart booted with the wrong provider silently. Voice mode hammers
+    # this endpoint per provider/voice swap so the failure rate compounds.
+    # Mirrors the batch endpoint's deferred-persist pattern (race #4 fix).
+    # Day-ruiner scout 2026-05-07 #3.
+    _PROVIDER_SWITCH_KEYS = {'STT_PROVIDER', 'TTS_PROVIDER', 'EMBEDDING_PROVIDER'}
+    is_provider_switch = key in _PROVIDER_SWITCH_KEYS
+    settings.set(key, value, persist=(persist and not is_provider_switch))
     if key in {'SOCKS_ENABLED', 'SOCKS_HOST', 'SOCKS_PORT', 'SOCKS_TIMEOUT'}:
         clear_session_cache()
     if key == 'WAKE_WORD_ENABLED':
@@ -488,11 +498,15 @@ async def update_setting(key: str, request: Request, _=Depends(require_login)):
     # Provider switches: fire-and-forget when ?async=true (setup wizard uses this)
     run_async = request.query_params.get('async') == 'true'
 
+    # Tracks switch outcome so we know whether to persist + rollback
+    switch_ok = {'value': True}  # default True; set False on switch failure
+
     async def _do_stt_switch(val):
         try:
             await asyncio.to_thread(get_system().switch_stt_provider, val)
         except Exception as e:
             logger.error(f"Background STT switch failed: {e}")
+            switch_ok['value'] = False
 
     async def _do_tts_switch(val):
         try:
@@ -505,9 +519,25 @@ async def update_setting(key: str, request: Request, _=Depends(require_login)):
                 logger.warning(f"Failed to re-apply chat settings after TTS switch: {e}")
         except Exception as e:
             logger.error(f"Background TTS switch failed: {e}")
+            switch_ok['value'] = False
+
+    async def _do_embedding_switch(val):
+        try:
+            from core.embeddings import switch_embedding_provider
+            await asyncio.to_thread(switch_embedding_provider, val)
+        except Exception as e:
+            logger.error(f"Background embedding switch failed: {e}")
+            switch_ok['value'] = False
 
     if key == 'STT_PROVIDER':
         if run_async:
+            # async path: persist optimistically since we can't await the result.
+            # Worse than sync but matches prior behavior and is opt-in via ?async=true.
+            if persist:
+                with settings._lock:
+                    settings._user[key] = value
+                    settings._runtime.pop(key, None)
+                    settings.save()
             asyncio.create_task(_do_stt_switch(value))
         else:
             await _do_stt_switch(value)
@@ -515,9 +545,24 @@ async def update_setting(key: str, request: Request, _=Depends(require_login)):
         await asyncio.to_thread(get_system().toggle_stt, value)
     if key == 'TTS_PROVIDER':
         if run_async:
+            if persist:
+                with settings._lock:
+                    settings._user[key] = value
+                    settings._runtime.pop(key, None)
+                    settings.save()
             asyncio.create_task(_do_tts_switch(value))
         else:
             await _do_tts_switch(value)
+    if key == 'EMBEDDING_PROVIDER':
+        if run_async:
+            if persist:
+                with settings._lock:
+                    settings._user[key] = value
+                    settings._runtime.pop(key, None)
+                    settings.save()
+            asyncio.create_task(_do_embedding_switch(value))
+        else:
+            await _do_embedding_switch(value)
     if key == 'TTS_ENABLED':
         await asyncio.to_thread(get_system().toggle_tts, value)
         if value:
@@ -527,8 +572,27 @@ async def update_setting(key: str, request: Request, _=Depends(require_login)):
                 _apply_chat_settings(system, chat_settings)
             except Exception as e:
                 logger.warning(f"Failed to re-apply chat settings after TTS toggle: {e}")
+    # Provider keys: persist now (on success) or rollback runtime (on failure).
+    # Async paths persisted optimistically above and skip this block.
+    persisted = persist
+    if is_provider_switch and persist and not run_async:
+        if switch_ok['value']:
+            with settings._lock:
+                settings._user[key] = value
+                settings._runtime.pop(key, None)
+                settings.save()
+        else:
+            # Switch failed — drop the runtime override so the runtime layer
+            # stays aligned with the still-old persisted value.
+            try:
+                with settings._lock:
+                    settings._runtime.pop(key, None)
+            except Exception:
+                pass
+            persisted = False
+            raise HTTPException(status_code=500, detail=f"Provider switch failed for {key} — value not persisted")
     publish(Events.SETTINGS_CHANGED, {"key": key, "value": value, "tier": tier})
-    return {"status": "success", "key": key, "value": value, "tier": tier, "persisted": persist}
+    return {"status": "success", "key": key, "value": value, "tier": tier, "persisted": persisted}
 
 
 @router.delete("/api/settings/{key}")

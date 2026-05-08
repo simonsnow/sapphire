@@ -87,25 +87,31 @@ def test_append_does_not_wait_when_stream_on_different_chat(session_manager_tmp)
     assert elapsed < 0.3, f"should not have blocked, waited {elapsed}"
 
 
-def test_append_proceeds_after_max_wait_with_warning(session_manager_tmp, caplog):
-    """[PROACTIVE] If stream doesn't end within max_wait_if_streaming, proceed
-    anyway and log a warning. Indefinite block would be worse than a race."""
+def test_append_skips_after_max_wait(session_manager_tmp, caplog):
+    """[REGRESSION_GUARD] If stream doesn't end within max_wait_if_streaming,
+    the write is SKIPPED — corruption is worse than a lost heartbeat append.
+    Pre-2026-05-07 the path fell through and wrote anyway, interleaving cron
+    messages between in-flight tool_call/tool_result pairs. Race scout #1
+    fix: skip + return False + log error. Voice mode amplifies the timeout
+    rate so this matters going forward."""
     sm = session_manager_tmp
     sm._is_streaming = True  # never clears
 
     started_at = time.time()
-    with caplog.at_level("WARNING"):
-        sm.append_messages_to_chat(
+    with caplog.at_level("ERROR"):
+        result = sm.append_messages_to_chat(
             'trinity',
-            [{'role': 'user', 'content': 'forced through'}],
+            [{'role': 'user', 'content': 'should not land'}],
             max_wait_if_streaming=0.6,
         )
     elapsed = time.time() - started_at
     sm._is_streaming = False
 
     assert 0.5 < elapsed < 2.0, f"expected ~0.6s wait, got {elapsed}"
-    assert any('proceeding anyway' in r.message for r in caplog.records), \
-        "expected a warning log about forced proceed"
+    assert result is False, "append should return False to signal skipped write"
+    assert any('SKIPPED' in r.message or 'gave up' in r.message
+               for r in caplog.records), \
+        "expected an error log about skipped write"
 
 
 def test_append_no_wait_when_nothing_streaming(session_manager_tmp):
@@ -124,7 +130,7 @@ def test_append_no_wait_when_nothing_streaming(session_manager_tmp):
 def test_whisper_hallucination_filter_catches_common_phrases():
     """[REGRESSION_GUARD] Whisper hallucinates canned phrases on silence —
     filter must block them before they become phantom LLM queries. Scout 4."""
-    from core.wakeword.wake_detector import _is_whisper_hallucination
+    from core.stt.hallucination import is_whisper_hallucination as _is_whisper_hallucination
     for phrase in [
         'thank you',
         'Thank you.',
@@ -145,7 +151,7 @@ def test_whisper_hallucination_filter_catches_common_phrases():
 
 def test_whisper_filter_passes_real_phrases():
     """Inverse — real user speech must NOT be filtered out."""
-    from core.wakeword.wake_detector import _is_whisper_hallucination
+    from core.stt.hallucination import is_whisper_hallucination as _is_whisper_hallucination
     for phrase in [
         "what time is it",
         "remind me about the grocery list",
@@ -158,7 +164,7 @@ def test_whisper_filter_passes_real_phrases():
 
 
 def test_whisper_filter_case_and_punctuation_insensitive():
-    from core.wakeword.wake_detector import _is_whisper_hallucination
+    from core.stt.hallucination import is_whisper_hallucination as _is_whisper_hallucination
     assert _is_whisper_hallucination("THANK YOU")
     assert _is_whisper_hallucination("thank you.")
     assert _is_whisper_hallucination("thank you!")

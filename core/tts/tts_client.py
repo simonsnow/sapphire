@@ -367,6 +367,20 @@ class TTSClient:
             return gen is not None and gen != self._generation
 
         try:
+            # Mark busy BEFORE fetch so wait() blocks across the whole
+            # generate-and-play span. Pre-fix, _is_playing only became True
+            # after fetch returned non-None — if fetch failed (Kokoro down,
+            # 5xx, etc), _is_playing stayed False and any concurrent wait()
+            # returned instantly. Wakeword's finally then re-opened the
+            # InputStream while OutputStream might still be tearing down →
+            # PortAudio device contention → 10 strikes → wakeword silently
+            # dies. Chaos scout 2026-05-07 #2. The finally below clears
+            # _is_playing on every exit path, including early-return.
+            with self.lock:
+                if self.should_stop.is_set() or _stale():
+                    return
+                self._is_playing = True
+
             audio_data, samplerate = self._fetch_audio(text)
             if _stale():
                 logger.debug(f"[TTS] Stale generation {gen} (current {self._generation}), discarding")
@@ -378,10 +392,11 @@ class TTSClient:
                     logger.debug(f"[TTS] Fetch stopped={self.should_stop.is_set()}")
                 return
 
+            # _is_playing was already set True before fetch. TTS_PLAYING fires
+            # here so the UI signals real playback start, not the fetch span.
             with self.lock:
                 if self.should_stop.is_set() or _stale():
                     return
-                self._is_playing = True
                 publish(Events.TTS_PLAYING)
 
             # Convert stereo to mono if needed

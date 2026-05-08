@@ -88,8 +88,12 @@ class FasterWhisperProvider(BaseSTTProvider):
         except Exception as e:
             raise RuntimeError(f"Failed to initialize STT model: {e}")
 
-    def transcribe_file(self, audio_path: str) -> Optional[str]:
-        """Transcribe an audio file. Thread-safe."""
+    def _transcribe_impl(self, audio_path: str) -> Optional[str]:
+        """Transcribe an audio file. Thread-safe.
+
+        Hallucination filter is applied by `BaseSTTProvider.transcribe_file`
+        — return raw text here.
+        """
         temp_path = None
 
         with self._lock:

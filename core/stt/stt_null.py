@@ -13,7 +13,7 @@ class NullWhisperClient(BaseSTTProvider):
     def __init__(self):
         logger.info("STT disabled - using NullWhisperClient")
 
-    def transcribe_file(self, audio_file: str) -> Optional[str]:
+    def _transcribe_impl(self, audio_file: str) -> Optional[str]:
         return ""
 
     def is_available(self) -> bool:

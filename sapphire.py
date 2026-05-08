@@ -156,6 +156,21 @@ class VoiceChatSystem:
         # the plugin loader registered.
         self._cleanup_orphaned_rag()
 
+        # Wire reload callbacks for provider keys so live singletons swap
+        # when settings change. Without this, plugin_loader.unload_plugin
+        # sets TTS_PROVIDER='none' on disk but the live TTSClient keeps
+        # the disabled plugin's provider — user sees "voice was working,
+        # I disabled an unrelated plugin, now silent" with no log line.
+        # subsystem-integrity scout 2026-05-07 #1.
+        try:
+            from core.settings_manager import settings as _settings
+            _settings.register_reload_callback('TTS_PROVIDER', self.switch_tts_provider)
+            _settings.register_reload_callback('STT_PROVIDER', self.switch_stt_provider)
+            _settings.register_reload_callback('EMBEDDING_PROVIDER', self.switch_embedding_provider)
+            logger.info("Provider reload callbacks registered (TTS/STT/EMBEDDING)")
+        except Exception as _e:
+            logger.warning(f"Failed to register provider reload callbacks: {_e}")
+
         logger.info(f"System init took: {(time.time() - start_time)*1000:.1f}ms")
 
     @property

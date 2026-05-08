@@ -671,6 +671,15 @@ class ChatSessionManager:
         # delete / save guards. Counter represents how many streams are
         # currently active; `_is_streaming` property reads > 0.
         self._streaming_count = 0
+        # Event signals "no streams currently active." append_messages_to_chat
+        # waits on this instead of polling _streaming_count every 200ms — so
+        # heartbeat appends fire as soon as the stream ends, not up to 200ms
+        # later. Initially set (no streams). Cleared on first begin, set when
+        # the last end_streaming brings the counter back to 0. Race scout
+        # 2026-05-07 #1 — replaces the 15s poll-and-fall-through path that
+        # corrupted history mid-tool-call under voice cadence.
+        self._no_streams_event = threading.Event()
+        self._no_streams_event.set()
         
         # Initialize database
         self._init_db()
@@ -709,21 +718,50 @@ class ChatSessionManager:
     def _is_streaming(self, val):
         """Back-compat setter — tests and legacy code that flip this bool
         directly still work. Real writers should use begin/end_streaming()
-        for atomic concurrency-safe counting."""
+        for atomic concurrency-safe counting.
+
+        Keeps the no-streams event consistent with the legacy bool path so
+        tests that toggle this directly don't leave waiters stuck.
+        """
         self._streaming_count = 1 if val else 0
+        evt = getattr(self, '_no_streams_event', None)
+        if evt is not None:
+            if val:
+                evt.clear()
+            else:
+                evt.set()
 
     def begin_streaming(self):
-        """Increment active-stream counter. Safe for concurrent streams."""
+        """Increment active-stream counter. Safe for concurrent streams.
+
+        Clears the no-streams event on the 0→1 transition so any append
+        waiters block until end_streaming brings the counter back to 0.
+        """
         with self._lock:
-            self._streaming_count = getattr(self, '_streaming_count', 0) + 1
+            prev = getattr(self, '_streaming_count', 0)
+            self._streaming_count = prev + 1
+            if prev == 0:
+                # Lazy-init guard for the legacy bool setter path that
+                # bypasses __init__ in some test fixtures.
+                evt = getattr(self, '_no_streams_event', None)
+                if evt is not None:
+                    evt.clear()
 
     def end_streaming(self):
         """Decrement active-stream counter (floored at 0). Safe for
         concurrent streams. A double-decrement (bug elsewhere) is silent
-        — counter stays at 0."""
+        — counter stays at 0.
+
+        Sets the no-streams event when the counter reaches 0 so any
+        append waiters can proceed immediately.
+        """
         with self._lock:
             cur = getattr(self, '_streaming_count', 0)
             self._streaming_count = cur - 1 if cur > 0 else 0
+            if self._streaming_count == 0:
+                evt = getattr(self, '_no_streams_event', None)
+                if evt is not None:
+                    evt.set()
 
     @contextmanager
     def _get_connection(self):
@@ -742,6 +780,9 @@ class ChatSessionManager:
         conn = sqlite3.connect(str(self._db_path), timeout=30.0)
         try:
             conn.execute("PRAGMA busy_timeout=30000")
+            # synchronous is a per-connection PRAGMA — must set at every open.
+            # journal_mode=WAL is persistent in the db header; no need to re-set.
+            conn.execute("PRAGMA synchronous=NORMAL")
             conn.row_factory = sqlite3.Row
             yield conn
         finally:
@@ -751,6 +792,20 @@ class ChatSessionManager:
         """Initialize SQLite database with schema."""
         try:
             with self._get_connection() as conn:
+                # WAL + synchronous=NORMAL: massively reduces write-lock
+                # contention vs the default rollback journal, lets readers
+                # proceed while a writer holds the WAL. journal_mode=WAL
+                # persists in the db header — set once. synchronous=NORMAL
+                # is per-connection but cheap and we set it at every
+                # connection open via PRAGMA below. auto_vacuum=INCREMENTAL
+                # lets the file shrink after deletes (ours: chat purge,
+                # tool_image prune) without the full-VACUUM pause. All
+                # three are no-ops on subsequent inits. Longevity scout
+                # 2026-05-07 — backup.py wal_checkpoint was a silent no-op
+                # before this lands.
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA synchronous=NORMAL")
+                conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
                 conn.execute("""
                     CREATE TABLE IF NOT EXISTS chats (
                         name TEXT PRIMARY KEY,
@@ -759,7 +814,7 @@ class ChatSessionManager:
                         updated_at TEXT NOT NULL
                     )
                 """)
-                
+
                 conn.execute("""
                     CREATE TABLE IF NOT EXISTS tool_images (
                         id TEXT PRIMARY KEY,
@@ -1253,7 +1308,7 @@ class ChatSessionManager:
         ])
 
     def append_messages_to_chat(self, chat_name: str, new_messages: list,
-                                 max_wait_if_streaming: float = 15.0):
+                                 max_wait_if_streaming: float = 60.0) -> bool:
         """Append a list of messages to a named chat WITHOUT switching active chat.
 
         Preserves the full conversation structure including tool_calls and tool
@@ -1267,23 +1322,44 @@ class ChatSessionManager:
         cron write with a stale in-memory snapshot. The `_is_streaming` guard
         already protects `delete_chat` and `set_active_chat` — extending it
         here closes the asymmetry.
+
+        Returns True if the messages were written, False if the wait timed out
+        and the write was skipped to avoid corruption. Pre-2026-05-07 the wait
+        used 200ms polling and fell through after 15s, writing anyway and
+        risking interleaved tool_call/tool_result corruption — voice mode's
+        short turn cadence made that path the common case. Now an Event
+        signals stream end immediately, the wait window extended to 60s,
+        and the write is SKIPPED on timeout (data loss > corruption).
         """
-        import time as _time
         self._ensure_db()
 
         # Defer if the target is the active chat and a stream is running.
-        # Poll rather than event-wait so this works whether the caller is in
-        # an async context or a worker thread.
+        # Event-based wait — fires as soon as the last stream ends, no poll.
         if chat_name == self.active_chat_name and self._is_streaming:
-            deadline = _time.time() + max_wait_if_streaming
-            while self._is_streaming and _time.time() < deadline:
-                _time.sleep(0.2)
-            if self._is_streaming:
-                logger.warning(
-                    f"append_messages_to_chat('{chat_name}') waited "
-                    f"{max_wait_if_streaming:.0f}s for active stream to end — "
-                    f"proceeding anyway; ordering race possible"
+            evt = getattr(self, '_no_streams_event', None)
+            if evt is not None:
+                got = evt.wait(timeout=max_wait_if_streaming)
+            else:
+                # Legacy fallback for fixtures that bypass __init__.
+                import time as _time
+                deadline = _time.time() + max_wait_if_streaming
+                while self._is_streaming and _time.time() < deadline:
+                    _time.sleep(0.2)
+                got = not self._is_streaming
+            if not got or self._is_streaming:
+                # Write SKIPPED. Better to drop a heartbeat append than to
+                # write through and corrupt the chat's tool_call/tool_result
+                # invariants. Caller (heartbeat / cron / agent completion)
+                # should treat False as "your write didn't happen" — current
+                # callers ignore the return, which means the heartbeat output
+                # is lost in this rare case. Acceptable trade vs corruption.
+                logger.error(
+                    f"append_messages_to_chat('{chat_name}') gave up after "
+                    f"{max_wait_if_streaming:.0f}s waiting for active stream "
+                    f"to end — write SKIPPED to avoid history corruption. "
+                    f"{len(new_messages)} message(s) dropped."
                 )
+                return False
 
         timestamp = datetime.now().isoformat()
         try:
@@ -1294,7 +1370,7 @@ class ChatSessionManager:
                 row = cursor.fetchone()
                 if not row:
                     logger.warning(f"Chat '{chat_name}' not found — skipping append (may have been deleted)")
-                    return
+                    return False
                 messages = json.loads(row["messages"])
 
                 for msg in new_messages:
@@ -1317,8 +1393,10 @@ class ChatSessionManager:
                         self.current_chat.messages.append(msg)
 
                 publish(Events.MESSAGE_ADDED, {"role": "pair", "chat_name": chat_name})
+                return True
         except Exception as e:
             logger.error(f"Failed to append to chat '{chat_name}': {e}")
+            return False
 
     def remove_last_messages(self, count: int) -> bool:
         result = self.current_chat.remove_last_messages(count)

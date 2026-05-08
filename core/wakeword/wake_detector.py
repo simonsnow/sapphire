@@ -11,47 +11,11 @@ from core.event_bus import publish, Events
 logger = logging.getLogger(__name__)
 
 
-# Whisper frequently hallucinates these canned phrases on silence/noise/
-# off-language input (trained heavily on YouTube captions). Filtering them
-# prevents phantom LLM calls after wakeword false-positives. Case-
-# insensitive exact-match after strip + punctuation normalization.
-_WHISPER_HALLUCINATIONS = {
-    'thank you',
-    'thanks for watching',
-    'thanks for watching!',
-    'thanks for watching.',
-    'you',
-    '.',
-    'bye',
-    'bye.',
-    'bye!',
-    'goodbye',
-    'goodbye.',
-    "i'm sorry",
-    "i'm sorry.",
-    'subtitles by',
-    '[music]',
-    '[laughter]',
-    '[applause]',
-    'thanks.',
-    'thank you.',
-    'okay.',
-    'ok.',
-}
-
-
-def _is_whisper_hallucination(text: str) -> bool:
-    """Return True if `text` matches a known Whisper hallucination phrase
-    (or is empty/whitespace — same downstream treatment)."""
-    if not text:
-        return True
-    normalized = text.strip().lower()
-    if not normalized:
-        return True
-    if normalized in _WHISPER_HALLUCINATIONS:
-        return True
-    stripped = normalized.rstrip('.!?').strip()
-    return stripped in _WHISPER_HALLUCINATIONS
+# Hallucination filter moved to core.stt.hallucination and applied at the
+# STT provider boundary (BaseSTTProvider.transcribe_file). Wake detector
+# now sees None for hallucinated transcripts — same downstream treatment
+# as empty speech. Browser STT and future continuous-listen consumers
+# inherit the filter for free. Chaos scout 2026-05-07 #1.
 
 
 class WakeWordDetector:
@@ -322,18 +286,11 @@ class WakeWordDetector:
                     pass
             logger.info(f"Processing took: {(time.time() - process_time)*1000:.1f}ms")
 
+            # `transcribe_file` now applies the hallucination filter at the
+            # provider boundary — None means "no usable speech" (silence,
+            # noise, OR a known canned phrase). Single check covers both.
             if not text or not text.strip():
-                logger.warning("No speech detected")
-                self.system.speak_error('speech')
-                return
-
-            # Whisper hallucination filter. On silence or noise after a
-            # wakeword false-positive, Whisper famously produces canned
-            # phrases (trained on YouTube captions). Without this filter,
-            # the user wakes to Sapphire replying to phantom input at 3am.
-            # Scout 4 finding (2026-04-19).
-            if _is_whisper_hallucination(text):
-                logger.warning(f"Whisper hallucination filtered: {text!r}")
+                logger.warning("No speech detected (empty or hallucination)")
                 self.system.speak_error('speech')
                 return
 

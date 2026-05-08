@@ -22,6 +22,7 @@ import threading
 from pathlib import Path
 from typing import Optional
 from core.setup import CONFIG_DIR, SOCKS_CONFIG_FILE, CLAUDE_API_KEY_FILE
+from core.settings_manager import _fsync_file, _fsync_dir
 
 try:
     from cryptography.fernet import Fernet, InvalidToken
@@ -254,7 +255,9 @@ class CredentialsManager:
                 tmp = settings_file.with_suffix('.json.tmp')
                 with open(tmp, 'w', encoding='utf-8') as f:
                     json.dump(user_settings, f, indent=2)
+                    _fsync_file(f)
                 tmp.replace(settings_file)
+                _fsync_dir(settings_file.parent)
                 logger.info("Cleared stale API keys from settings.json")
 
                 # Also strip from settings_manager's in-memory config so they
@@ -318,7 +321,9 @@ class CredentialsManager:
                 tmp = settings_file.with_suffix('.json.tmp')
                 with open(tmp, 'w', encoding='utf-8') as f:
                     json.dump(user_settings, f, indent=2)
+                    _fsync_file(f)
                 tmp.replace(settings_file)
+                _fsync_dir(settings_file.parent)
                 logger.info("Cleared service API keys from settings.json")
 
                 # Also strip from in-memory config
@@ -399,12 +404,14 @@ class CredentialsManager:
                 tmp_path = CREDENTIALS_FILE.with_suffix('.tmp')
                 with open(tmp_path, 'w', encoding='utf-8') as f:
                     json.dump(self._credentials, f, indent=2)
+                    _fsync_file(f)
 
                 # Set restrictive permissions on Unix (before rename so file is protected)
                 if sys.platform != 'win32':
                     os.chmod(tmp_path, 0o600)
 
                 tmp_path.replace(CREDENTIALS_FILE)
+                _fsync_dir(CREDENTIALS_FILE.parent)
 
                 logger.info(f"Saved credentials to {CREDENTIALS_FILE}")
                 return True

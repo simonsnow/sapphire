@@ -23,7 +23,7 @@ class SapphireRouterSTTProvider(BaseSTTProvider):
         import config
         return os.environ.get('SAPPHIRE_TENANT_ID') or getattr(config, 'SAPPHIRE_ROUTER_TENANT_ID', '')
 
-    def transcribe_file(self, audio_path: str) -> Optional[str]:
+    def _transcribe_impl(self, audio_path: str) -> Optional[str]:
         url = self._get_url()
         if not url:
             return None

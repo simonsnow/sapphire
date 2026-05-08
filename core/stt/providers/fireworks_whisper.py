@@ -41,8 +41,11 @@ class FireworksWhisperProvider(BaseSTTProvider):
     def _get_model() -> str:
         return getattr(config, 'STT_FIREWORKS_MODEL', 'whisper-v3-turbo')
 
-    def transcribe_file(self, audio_path: str) -> Optional[str]:
-        """Transcribe via Fireworks API (multipart POST)."""
+    def _transcribe_impl(self, audio_path: str) -> Optional[str]:
+        """Transcribe via Fireworks API (multipart POST).
+
+        Hallucination filter is applied by `BaseSTTProvider.transcribe_file`.
+        """
         api_key = self._resolve_api_key()
         if not api_key:
             logger.error("Fireworks Whisper: no API key configured")
