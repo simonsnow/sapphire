@@ -9,7 +9,7 @@ This documentation has been reorganized. See the **[Plugin Author Guide](plugin-
 |-------|--------------|
 | [Overview & Quick Start](plugin-author/README.md) | What plugins are, tools vs plugins, quick start, complete example |
 | [Manifest](plugin-author/manifest.md) | `plugin.json` reference — fields, priority bands, directory structure |
-| [Hooks](plugin-author/hooks.md) | All 10 hook points, HookEvent fields, system access, examples |
+| [Hooks](plugin-author/hooks.md) | All 11 hook points (incl. `ghost_inject`), HookEvent fields, system access, examples |
 | [Voice Commands](plugin-author/voice-commands.md) | Keyword triggers that bypass the LLM — match modes, handlers, macros |
 | [Tools](plugin-author/tools.md) | Tool file format, schema flags, scopes, reading settings, privacy patterns |
 | [Routes](plugin-author/routes.md) | Custom HTTP endpoints — path params, auth enforcement, handler signature |

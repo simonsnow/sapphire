@@ -1,14 +1,16 @@
 # Spice
 
-Spice prevents stories from going stale and helps avoid loops or repetitive formatting. Spices are random prompt snippets injected into the system prompt, changing each round (or however often you set). This keeps conversations fresh and unpredictable.
+Spice prevents stories from going stale and helps avoid loops or repetitive formatting. Spices are random prompt snippets delivered to the AI as a per-turn operator-metadata note, changing each round (or however often you set). This keeps conversations fresh and unpredictable.
 
 ## How It Works
 
 1. Create spices in categories via the Spice Manager
 2. Enable/disable categories with checkboxes (applies globally)
 3. Enable spice for a chat in Chat Settings
-4. Each message, one random snippet injects into the prompt
+4. Each message, one random snippet rides on the **ghost-message rail** — a labeled note inserted just before your input, visible to the AI but not to you
 5. Rotates every X messages based on your settings
+
+**Why the ghost rail?** Pre-2.6.4 spice was injected into the system prompt every turn. That broke prompt caching on Claude (any system-prompt change invalidates the cache). Now spice lives outside the cached prefix — it's free on the cache budget, and it lands closer to the moment of generation, so models actually weight it more (recency effect). Stronger spice compliance, no caching cost.
 
 <img width="50%" alt="sapphire-spices" src="https://github.com/user-attachments/assets/f5563bed-7c5d-490a-9d18-c7f87339d9ef" />
 
@@ -69,9 +71,10 @@ QUICK ACCESS:
 - Click: toggle spice for this chat
 
 HOW IT WORKS:
-- One random snippet injects per interval
+- One random snippet rides on the ghost-message rail per interval (since 2.6.4)
 - Only enabled categories contribute to pool
 - Stored in user/prompts/prompt_spices.json
+- Cache-friendly — spice does NOT invalidate Claude prompt caching (lives outside the cached prefix)
 
 GOOD SPICES:
 - "Something unexpected happens" (vague, fits any scene)

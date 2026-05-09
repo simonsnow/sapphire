@@ -41,13 +41,14 @@ The `capabilities` object declares what the plugin provides:
     "daemon": { ... },
     "app": { ... },
     "themes": [ ... ],
+    "widgets": [ ... ],
     "sidebar_accordion": { ... }
   }
 }
 ```
 
 Each capability is documented in its own guide:
-- [Hooks & Voice Commands](hooks.md)
+- [Hooks & Voice Commands](hooks.md) — including the `ghost_inject` hook for cache-friendly per-turn context (since 2.6.4)
 - [Tools](tools.md)
 - Scopes — see below
 - [Routes](routes.md)
@@ -56,6 +57,7 @@ Each capability is documented in its own guide:
 - [Providers (TTS, STT, Embedding, LLM)](providers.md)
 - [Apps](APPS.md)
 - [Themes](THEMES.md)
+- [Widgets](widgets.md) — dashboard action-panel cards (rendered in Settings → Dashboard)
 - [Daemons](daemons.md) — long-running background threads with event sources (e.g. Telegram, Discord listeners)
 - Sidebar Accordion — inject custom HTML panels into the chat sidebar
 

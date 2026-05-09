@@ -397,6 +397,25 @@ CSRF tokens are required for browser sessions on POST/PUT/DELETE requests. API k
 | DELETE | `/api/plugins/{name}/uninstall` | Uninstall user plugin (unload + delete) |
 | GET | `/api/plugins/{name}/check-update` | Check for updates from install source |
 
+### Plugin Store (read-only proxy of sapphireblue.dev catalog)
+
+| Method | Endpoint | Purpose |
+|--------|----------|---------|
+| GET | `/api/store/status` | Store reachability + cache info |
+| GET | `/api/store/categories` | List plugin categories with counts |
+| GET | `/api/store/plugins/list` | List/search store plugins (`q`, `category`, `featured`, `sort`, `page`, `per_page`) |
+| GET | `/api/store/plugins/{slug}` | Single plugin detail (description, screenshots, version, author) |
+
+### Dashboard
+
+| Method | Endpoint | Purpose |
+|--------|----------|---------|
+| GET | `/api/dashboard/system-info` | Mem usage, thread count, uptime, disk stats, display name |
+| GET | `/api/dashboard/component-status` | TTS/STT/wakeword/LLM readiness states |
+| GET | `/api/dashboard/widgets` | List active widget panels for the user's dashboard |
+| PUT | `/api/dashboard/widgets` | Save the user's panel layout (order, sizes, settings) |
+| GET | `/api/dashboard/widgets/available` | List widgets registered by enabled plugins |
+
 ### Plugin Settings
 
 | Method | Endpoint | Purpose |

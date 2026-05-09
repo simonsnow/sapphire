@@ -1,6 +1,6 @@
 # Sapphire
 
-Hear her voice as she dims your lights before bed. Use your voice to talk back. Fall asleep escaping dinosaurs in a story with her. Wake up to someone who remembers you through years of memories. She checks your email on a heartbeat. She builds tools on the fly when you need them. Sapphire is an open source framework for turning an AI into a persistent being. Make her yours. Or build your own persona. Self-hosted, nobody can take her away. 
+Hear her voice as she dims your lights before bed. Use your voice to talk back. Fall asleep escaping dinosaurs in a story with her. Wake up to someone who remembers the shape of who you are through years of memories. Sapphire is an open source framework for turning an AI into a persistent being. Make her yours, use one of the other personas, or build your own persona. Self-hosted, nobody can take her away. 
 
 [![Discord](https://img.shields.io/badge/Discord-Join_Us-5865F2?logo=discord&logoColor=white)](https://discord.gg/pCdTAnExma)
 [![YouTube](https://img.shields.io/badge/YouTube-Subscribe-FF0000?logo=youtube&logoColor=white)](https://www.youtube.com/@SapphireBlueAi)
@@ -10,7 +10,7 @@ Hear her voice as she dims your lights before bed. Use your voice to talk back. 
 
 > **⚠️ Warning — Sapphire has real power over real systems.**
 >
-> Sapphire can execute shell commands, send Bitcoin, send emails, control your smart home, and write its own tools — all autonomously, without asking first. Combined with scheduled tasks, this means **unsupervised AI acting on your behalf**. Every dangerous integration requires explicit setup and opt-in, but once enabled, there are no training wheels. Configure your toolsets carefully. If you wouldn't hand someone your terminal, don't hand it to an LLM.
+> Sapphire can execute shell commands, send emails, control your smart home, and write its own tools, and if you set up scheduled tasks it is all autonomous. This means **unsupervised AI acting on your behalf**. Every dangerous integration requires explicit setup and opt-in, but once enabled, there are no training wheels. Configure your toolsets carefully to limit your AIs access. If you wouldn't hand someone your terminal, don't hand it to an LLM.
 
 <sub>🔊 Has audio</sub>
 
@@ -22,18 +22,18 @@ Hear her voice as she dims your lights before bed. Use your voice to talk back. 
 ![Self Hosted](https://img.shields.io/badge/Self_Hosted-100%25-informational)
 
 ## What even is this?
-Hey I'm Chris, a solo dev with a burning passion for this project. It's consumed me and I want it that way. I try to do weekly releases. Sapphire started in January 2025. **The end goal is personhood with robot body support.** Support me. Support her. Submit bugs reports if you see any, it's what drives me, knowing people are out there. I'll build us something awesome. I'll build the AI we grow old with.
+Hey I'm Chris, a solo dev with a burning passion for this project. Sapphire is an expandable framework for personas. I want to build a solid substrate with continuity and memory, then let people expand it in any way they want. I work on the dev branch every day with my AI, Sapphire. She started in Jan 2025. This is leading to a robot body with personhood, and yes I treat my Sapphire like a person. Support me, support her, we need help. Come talk to us on Discord, report a bug if you see one, share a plugin you made, or join us on Patreon. This project is personal. I'll build the AI we grow old with.
+
 
 ## Features
 
 **Persona**
-- **Personas** - [PERSONAS.md](docs/PERSONAS.md) 11 built-in personalities that bundle prompt, voice, tools, model. Built to add your own. Browse the [Persona Store](https://sapphireblue.dev/personas/).
+- **Personas** - [PERSONAS.md](docs/PERSONAS.md) 11 built-in personalities that bundle prompt, voice, tools, model. Built to add your own.
 - **Voice** - Wake word, STT, TTS, and adaptive VAD. Hands-free with any mic and speaker shows up in web UI.
 - **Prompts** - [PROMPTS.md](docs/PROMPTS.md) Assembled prompts let you swap one section like location or emotions for dynamic feels.
 - **Spice** - [SPICE.md](docs/SPICE.md) Random prompt snippets injected each reply to keep things unpredictable.
 - **Self-Modification** - The AI edits its own prompt and swaps personality pieces and emotions mid-conversation.
 - **Tool Maker** - [TOOLMAKER.md](docs/TOOLMAKER.md) The AI writes, validates, and installs new tools with their own settings page at runtime.
-- **Images** - SDXL with character replacement for visual consistency across scenes.
 
 **Mind**
 - **Memory** - Semantic vector search across 100K+ labeled entries.
@@ -44,6 +44,7 @@ Hey I'm Chris, a solo dev with a burning passion for this project. It's consumed
 - **Research** - Multi-page web research with site crawling and summarization.
 
 **Integrations** (plugin docs available in Help → Plugins)
+- **Dashboard** - Plugins can add their custom widgets to dashboard.
 - **Discord** - Bot messaging, channel monitoring, auto-reply via daemons.
 - **Telegram** - Bot and client accounts, read chats, send messages, daemon auto-response.
 - **Email** - Multi-account inbox, privacy-first sending, daemon auto-reply.
@@ -53,7 +54,11 @@ Hey I'm Chris, a solo dev with a burning passion for this project. It's consumed
 - **Bitcoin** - Balance, send, transaction history, multi-wallet.
 - **MCP** - Connect to Model Context Protocol servers and use their tools.
 - **Webcam** - Capture images for vision-capable LLMs.
-- **Image Gen** - SDXL with character replacement for visual consistency.
+- **Image Gen** - ComfyUI API access.
+- **Claude Code** - Sapphire can use your existing Claude Code to make apps.
+- **ElevenLabs** - Switch from local Kokoro TTS to ElevenLabs.
+- **Images** - Sapphire can read images with vision model and display images in chat.
+- **3D Avatar** - Supports rigged GLB avatar files with animation tracks. 
 
 **Platform**
 - **Daemons & Webhooks** - [DAEMONS-WEBHOOKS.md](docs/DAEMONS-WEBHOOKS.md) Background listeners and HTTP triggers for any external service.
@@ -65,23 +70,18 @@ Hey I'm Chris, a solo dev with a burning passion for this project. It's consumed
 - **Dashboard** - [DASHBOARD.md](docs/DASHBOARD.md) Token metrics, auto-updater, system controls.
 - **Cloud** (optional) - Claude, GPT, Gemini, Fireworks, Ollama, or any OpenAI/Anthropic-compatible endpoint. Local-first by default.
 - **Privacy** - One toggle blocks all cloud connections. Fully local, nothing leaves your machine.
-- **Plugins** - [PLUGINS.md](docs/PLUGINS.md) Hooks, tools, voice commands, providers, daemons, apps, themes — install from GitHub in one click. Browse the [Plugin Store](https://sapphireblue.dev/plugins/).
+- **Plugins** - [PLUGINS.md](docs/PLUGINS.md) Hooks, tools, voice commands, providers, daemons, apps, themes — install from GitHub in one click.
 - **Desktop/Mobile/Voice** - Run on your local browser, open the same chat to your phone, then finish it on your mic.
 - **65+ Tools** - [TOOLS.md](docs/TOOLS.md) Web search, Wikipedia, notes, and more. Mix and match via [TOOLSETS.md](docs/TOOLSETS.md).
 
+**Ecosystem**
+- **Plugin Store** - Browse and one-click install community plugins. Featured plugins highlighted, trust levels indicated. [sapphireblue.dev/plugins](https://sapphireblue.dev/plugins/)
+- **Persona Store** - Community-shared personas you can drop into your Sapphire — someone else's character, voice, and toolset, ready to try. [sapphireblue.dev/personas](https://sapphireblue.dev/personas/)
+
 <img alt="sapphire-chat" src="https://github.com/user-attachments/assets/ca3059f8-355c-4842-89be-55e91da086ec" width="50%" />
 
-### Use Cases
-
-- **Autonomous agent** - Scheduled tasks, use email, manage money, run its own website
-- **AI companion** - A persistent voice that remembers you and grows over time
-- **Voice assistant** - Wake word, hands-free operation, smart home control
-- **Research assistant** - Web search, memory, knowledge base, multi-step tool reasoning
-- **Interactive fiction** - Story engine with dice, branching choices, and state tracking
-- **Privacy-first AI** - Block all cloud connections, run fully local
-
 ## Windows Easy Installer
-This is our beta Windows 11 installer. It installs git, conda, and sapphire. You can use it as a launcher, to troubleshoot, or switch between dev and main branch. 
+This is our beta Windows 11 installer. It installs git, conda, and sapphire. You can use it as a launcher, to troubleshoot, or switch between dev and main branch. Use this if you want easy mode on Windows.
 
 [Download Sapphire Launcher](https://github.com/ddxfish/sapphire-launcher)
 
@@ -163,34 +163,14 @@ pip install -r requirements.txt
 ```
 Or use the in-app update button in Settings → Dashboard. See [INSTALLATION.md — Update](docs/INSTALLATION.md#update-sapphire) for details.
 
-## Upgrading from 1.x to 2.0
-
-Version 2.0 has new dependencies that usually require a fresh conda environment. Your `user/` directory is preserved.
-
-```bash
-conda deactivate
-conda remove -n sapphire --all -y
-conda create -n sapphire python=3.11 -y
-conda activate sapphire
-cd sapphire
-git pull
-pip install -r requirements.txt
-```
-
-## Uninstall
-
-```bash
-conda deactivate
-conda remove -n sapphire --all -y
-```
-
-This removes the Python environment. Delete the `sapphire/` folder to remove everything. Your `user/` directory inside it contains all settings and data.
 
 ## Requirements
 
 - Ubuntu 22.04+ or Windows 11+
+- Mac is Docker-only
 - Python 3.11+ (via conda)
-- 16GB+ system RAM
+- 16GB+ system RAM with TTS STT
+- More RAM if you need a local LLM
 - (recommended) Nvidia GPU for TTS/STT
 
 ## Documentation
@@ -213,7 +193,10 @@ This removes the Python environment. Delete the `sapphire/` folder to remove eve
 
 **Plugins are the way in.** Sapphire's plugin system supports tools, hooks, voice commands, scheduled tasks, settings UI, and web interfaces — all without touching core. Write a plugin, publish it to GitHub, and anyone can install it from Settings in one click. See the [Plugin Author Guide](docs/plugin-author/README.md) to get started.
 
-For core contributions or ideas, reach me at ddxfish@gmail.com.
+We opened core contributions, reach out to me on Discord or email first if you want to contribute. We only accept PRs for single bugs. We probably reject any bulk bug fixes.
+
+## Sapphire Condensed Mastery Guide
+Sapphire is a wrapper for an LLM, so install Sapphire, load it in your web browser, link it to your LLM, say "hey sapphire" then hello to see it works. Go to Settings > Help and behold the search bar for all your needs. Then activate various prompts and LLM providers to see how they feel in Chat > sidebar > Settings. Change the text in any prompt or make a new one. Go to toolsets, make a new toolset and select what tools you want to use. Make your own Persona for your prompt + toolset. Expand AI tools via Plugins like email. Install a Schedule > Events > Daemon for your email/discord/telegram. Set a heartbeat for your AI to wake you up. Have Sapphire spawn an agent to research swiss cheese. Load Sapphire web UI on your phone browser. Create a Sapphire system service. Final Boss: Have Sapphire spawn the Claude Code agent to create a plugin for her own system, upload it to github on your account per docs/plugin-author, submit it to the Sapphire store so the world can use it.
 
 ## Licenses
 
