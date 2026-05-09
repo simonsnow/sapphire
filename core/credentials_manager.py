@@ -68,6 +68,7 @@ DEFAULT_CREDENTIALS = {
     "email_accounts": {},
     "bitcoin_wallets": {},
     "gcal_accounts": {},
+    "github_accounts": {},
     "ssh": {
         "servers": []
     },
@@ -1062,6 +1063,77 @@ class CredentialsManager:
         """Check if gcal account exists and has a refresh token."""
         acct = self.get_gcal_account(scope)
         return bool(acct['client_id'] and acct['refresh_token'])
+
+    # =========================================================================
+    # GitHub
+    # =========================================================================
+
+    def get_github_account(self, scope: str = 'default') -> dict:
+        """Get GitHub account for a scope. PAT is unscrambled on read."""
+        accounts = self._credentials.get('github_accounts', {})
+        acct = accounts.get(scope, {})
+        return {
+            'username': acct.get('username', ''),
+            'pat': self._unscramble(acct.get('pat', '')),
+            'label': acct.get('label', scope),
+        }
+
+    def set_github_account(self, scope: str, username: str, pat: str, label: str = '') -> bool:
+        """Set GitHub account for a scope. PAT is scrambled before save.
+        If pat is empty string, the existing stored PAT is preserved."""
+        with self._lock:
+            try:
+                if 'github_accounts' not in self._credentials:
+                    self._credentials['github_accounts'] = {}
+
+                existing = self._credentials['github_accounts'].get(scope, {})
+                stored_pat = existing.get('pat', '') if not pat else self._scramble(pat)
+
+                self._credentials['github_accounts'][scope] = {
+                    'username': username,
+                    'pat': stored_pat,
+                    'label': label or scope,
+                }
+
+                if not self._save():
+                    logger.error(f"Failed to persist github account '{scope}' to disk")
+                    return False
+
+                logger.info(f"Set github account for scope '{scope}'")
+                return True
+            except Exception as e:
+                logger.error(f"Failed to set github account '{scope}': {e}")
+                return False
+
+    def delete_github_account(self, scope: str) -> bool:
+        """Remove a GitHub account by scope."""
+        with self._lock:
+            accounts = self._credentials.get('github_accounts', {})
+            if scope not in accounts:
+                return False
+            del accounts[scope]
+            if not self._save():
+                return False
+            logger.info(f"Deleted github account '{scope}'")
+            return True
+
+    def list_github_accounts(self) -> list:
+        """List all github accounts (no PATs)."""
+        accounts = self._credentials.get('github_accounts', {})
+        result = []
+        for scope, acct in accounts.items():
+            result.append({
+                'scope': scope,
+                'label': acct.get('label', scope),
+                'username': acct.get('username', ''),
+                'has_token': bool(acct.get('pat', '')),
+            })
+        return result
+
+    def has_github_account(self, scope: str = 'default') -> bool:
+        """Check if github account exists and has a PAT."""
+        acct = self.get_github_account(scope)
+        return bool(acct['pat'])
 
     # =========================================================================
     # SSH

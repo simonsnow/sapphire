@@ -1887,6 +1887,50 @@ async def delete_gcal_account(scope: str, request: Request, _=Depends(require_lo
 
 
 # =============================================================================
+# GITHUB ACCOUNT ROUTES
+# =============================================================================
+
+@router.get("/api/github/accounts")
+async def list_github_accounts(request: Request, _=Depends(require_login)):
+    """List all GitHub accounts (no PATs)."""
+    from core.credentials_manager import credentials
+    return {"accounts": credentials.list_github_accounts()}
+
+
+@router.put("/api/github/accounts/{scope}")
+async def set_github_account(scope: str, request: Request, _=Depends(require_login)):
+    """Create or update a GitHub account for a scope.
+    If pat is empty in the payload, the existing stored PAT is preserved
+    (so editing the label doesn't require re-pasting the token)."""
+    from core.credentials_manager import credentials
+    data = await request.json() or {}
+    username = data.get('username', '').strip()
+    pat = data.get('pat', '').strip()
+    label = data.get('label', '').strip()
+
+    if not username:
+        raise HTTPException(status_code=400, detail="Username is required")
+
+    # On first creation, a PAT is required. On edit, blank means "keep existing."
+    existing = credentials.get_github_account(scope)
+    if not pat and not existing.get('pat'):
+        raise HTTPException(status_code=400, detail="Personal access token is required")
+
+    if credentials.set_github_account(scope, username, pat, label):
+        return {"success": True}
+    raise HTTPException(status_code=500, detail="Failed to save github account")
+
+
+@router.delete("/api/github/accounts/{scope}")
+async def delete_github_account(scope: str, request: Request, _=Depends(require_login)):
+    """Delete a GitHub account."""
+    from core.credentials_manager import credentials
+    if credentials.delete_github_account(scope):
+        return {"success": True}
+    raise HTTPException(status_code=404, detail=f"GitHub account '{scope}' not found")
+
+
+# =============================================================================
 # SSH PLUGIN ROUTES
 # =============================================================================
 
