@@ -138,8 +138,41 @@ function renderSidebar() {
 }
 
 
-function renderCard(item) {
-    const featured = item.featured ? '<span class="store-featured-tag">★ Featured</span>' : '';
+function _githubUsernameFromUrl(url) {
+    // Extract `<user>` from `https://github.com/<user>` (strict — bare profile
+    // URL only, not repo paths). Returns null on non-match. Avoids constructing
+    // avatar URLs from arbitrary author_url values that didn't match GitHub.
+    if (!url || typeof url !== 'string') return null;
+    const m = url.match(/^https:\/\/github\.com\/([A-Za-z0-9][A-Za-z0-9-]{0,38})\/?$/);
+    return m ? m[1] : null;
+}
+
+function _renderAuthorAvatar(item) {
+    // Author avatar for featured cards. GitHub profile URL → real avatar via
+    // github.com/<user>.png redirector. Otherwise fall back to a gradient
+    // circle with the author's first letter — keeps the layout consistent
+    // even for community authors who set a non-GitHub author_url (or none).
+    // On GitHub-load failure: img removes itself rather than trying to
+    // synthesize a fallback inline (cleaner than embedding JS in onerror).
+    const username = _githubUsernameFromUrl(item.author_url);
+    if (username) {
+        return `<img class="store-card-avatar" loading="lazy"
+            src="https://github.com/${_esc(username)}.png?size=64"
+            alt="${_esc(item.author || username)}"
+            onerror="this.remove()">`;
+    }
+    const letter = (item.author || '?').charAt(0).toUpperCase();
+    return `<div class="store-card-avatar store-card-avatar-fallback">${_esc(letter)}</div>`;
+}
+
+function renderCard(item, showcase = false) {
+    // `showcase=true` is passed only by the top featured strip — that strip
+    // gets the premium tile treatment (gradient bg, trim border, glow).
+    // The same item appearing in the bottom "All Plugins" grid keeps its
+    // small ★ Featured tag but drops the showcase styling, so the bottom
+    // grid stays calm and the top strip retains visual hierarchy. 2026-05-08.
+    const isFeatured = !!item.featured;
+    const featured = isFeatured ? '<span class="store-featured-tag">★ Featured</span>' : '';
     const author = (item.author_url && isSafeHref(item.author_url))
         ? `<a href="${_esc(item.author_url)}" target="_blank" rel="noopener noreferrer">${_esc(item.author)}</a>`
         : _esc(item.author || 'Unknown');
@@ -147,14 +180,30 @@ function renderCard(item) {
     const localVer = item.installed_state === 'update_available' && item.local_version
         ? `<span class="store-card-localver" title="You have v${_esc(item.local_version)}">→ v${_esc(item.version)}</span>`
         : '';
+    // Avatar policy:
+    //   - Showcase strip: always show (humanizes featured plugins)
+    //   - Bottom grid: only for verified/official trust (skip community)
+    //     — visual hierarchy says higher trust = more presence on the page.
+    // 2026-05-08.
+    const showAvatar = showcase || item.trust_level === 'verified' || item.trust_level === 'official';
+    const avatar = showAvatar ? _renderAuthorAvatar(item) : '';
+    // Three-tier card treatment:
+    //   - showcase + featured  → `store-card-featured` (full premium: bg+border+glow+scaled tag)
+    //   - bottom + featured    → `store-card-tagged`   (just a subtle trim border)
+    //   - everything else      → `store-card`          (default)
+    // 2026-05-08.
+    let cardClass = 'store-card';
+    if (showcase && isFeatured) cardClass += ' store-card-featured';
+    else if (isFeatured) cardClass += ' store-card-tagged';
     return `
-    <article class="store-card" data-slug="${_esc(item.slug)}">
+    <article class="${cardClass}" data-slug="${_esc(item.slug)}">
         <header class="store-card-header">
             <span class="store-card-icon" title="${_esc(item.category)}">${_esc(_categoryIcon(item.category) || '🧩')}</span>
             <h3 class="store-card-name">${_esc(item.name)}</h3>
             ${featured}
         </header>
         <div class="store-card-meta">
+            ${avatar}
             <span class="store-card-author">by ${author}</span>
             ${version}
             ${localVer}
@@ -233,7 +282,7 @@ async function renderList() {
         ];
         if (showFeaturedStrip) {
             tasks.push(
-                listStorePlugins({ featured: true, perPage: 5 })
+                listStorePlugins({ featured: true, perPage: 6 })
                     .then(r => { featuredItems = r?.items || []; })
                     .catch(() => { featuredItems = []; })
             );
@@ -260,8 +309,9 @@ async function renderList() {
         html += `
         <section class="store-featured">
             <h2 class="store-section-title">★ Featured</h2>
+            <p class="store-featured-blurb">Community plugins backed by the Sapphire team — these authors have earned a spot.</p>
             <div class="store-grid store-grid-featured">
-                ${featuredItems.map(renderCard).join('')}
+                ${featuredItems.map(it => renderCard(it, true)).join('')}
             </div>
         </section>`;
     }

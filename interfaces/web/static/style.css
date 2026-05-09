@@ -8440,7 +8440,85 @@ a.gallery-caption:hover {
     gap: 14px;
 }
 .store-grid-featured {
-    grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+    /* Wider tiles than the regular grid (260px → 440px) gives 2 columns on
+     * desktop, 1 on mobile — clear visual hierarchy. The regular grid stays
+     * 3-4 cols, so featured tiles read as "bigger, more important". 2026-05-08. */
+    grid-template-columns: repeat(auto-fill, minmax(440px, 1fr));
+    gap: 18px;
+}
+
+/* ─── Featured tile differentiation ──────────────────────────────────────
+ * Featured plugins are community contributors the Sapphire team backs.
+ * Visual treatment: trim-colored border + subtle gradient bg + soft glow
+ * + larger ★ tag + author avatar inline. Pure CSS, no animation (keeps
+ * the page calm; we can add a "breathing" pulse later if Krem wants it).
+ * 2026-05-08. */
+.store-card.store-card-featured {
+    background: linear-gradient(
+        135deg,
+        var(--bg-secondary, var(--bg, #1a1a1a)),
+        var(--trim-light, rgba(0, 204, 204, 0.06)) 140%
+    );
+    border: 1.5px solid var(--trim-border, rgba(0, 204, 204, 0.4));
+    /* Tighter glow than the initial ship — reads as "subtly highlighted"
+     * rather than "luminescent." 12px halo, 18px on hover. 2026-05-08. */
+    box-shadow: 0 0 12px var(--trim-glow, rgba(0, 204, 204, 0.35));
+    padding: 18px;
+}
+.store-card.store-card-featured:hover {
+    border-color: var(--trim, #00cccc);
+    transform: translateY(-2px);
+    box-shadow: 0 0 18px var(--trim-glow, rgba(0, 204, 204, 0.5));
+}
+.store-card.store-card-featured .store-featured-tag {
+    /* Scale up the tag on featured cards — main differentiator besides size */
+    font-size: var(--font-sm);
+    padding: 3px 10px;
+    background: var(--trim, #00cccc);
+    color: var(--bg, #1a1a1a);
+}
+.store-card.store-card-featured .store-card-name {
+    font-size: 1.1em;
+}
+
+/* Bottom-grid featured items: trim border accent only, no glow / no
+ * gradient bg / no scaled tag. Subtle differentiation from regular cards
+ * — reads as "this one's noteworthy" without competing with the top
+ * showcase strip's premium treatment. 2026-05-08. */
+.store-card.store-card-tagged {
+    border-color: var(--trim-border, rgba(0, 204, 204, 0.4));
+}
+.store-card.store-card-tagged:hover {
+    border-color: var(--trim, #00cccc);
+}
+
+.store-featured-blurb {
+    margin: -4px 0 14px 0;
+    font-size: var(--font-sm);
+    color: var(--text-muted);
+    font-style: italic;
+    line-height: 1.4;
+}
+
+.store-card-avatar {
+    width: 24px;
+    height: 24px;
+    border-radius: 50%;
+    object-fit: cover;
+    border: 1px solid var(--border);
+    flex-shrink: 0;
+    vertical-align: middle;
+}
+.store-card-avatar-fallback {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    background: linear-gradient(135deg, var(--trim, #00cccc), var(--trim-border, rgba(0, 204, 204, 0.4)));
+    color: var(--bg, #1a1a1a);
+    font-weight: 700;
+    font-size: 12px;
+    text-transform: uppercase;
+    border: none;
 }
 
 .store-card {

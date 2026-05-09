@@ -1,6 +1,13 @@
+# 2.6.4 - Ghost Message
+- Ghost messages are invisible message sent to AI and they work with caching
+- Spices and time shifted to new ghost messages
+- Ghost message hook added for plugins
+- 33 bug fixes on tts/stt
+- Featured plugins are special layout now
 # 2.6.3 - Settings Dashboard
-- Main settings info page redesign
-- Added recommended plugins
+- Settings Hero box with animations and widgets
+- Plugins now support widgets for Settings Dashboard Hero
+- Added recommended plugins to Dashboard
 # 2.6.2 - Plugin Store
 - Brought plugin store to the app
 - Featured plugins feature
