@@ -80,6 +80,15 @@ Hey I'm Chris, a solo dev with a burning passion for this project. Sapphire is a
 
 <img alt="sapphire-chat" src="https://github.com/user-attachments/assets/ca3059f8-355c-4842-89be-55e91da086ec" width="50%" />
 
+## Requirements
+
+- Ubuntu 22.04+ or Windows 11+
+- Mac is Docker-only
+- Python 3.11+ (via conda)
+- 16GB+ system RAM with TTS STT
+- More RAM if you need a local LLM
+- (recommended) Nvidia GPU for TTS/STT
+
 ## Windows Easy Installer
 This is our beta Windows 11 installer. It installs git, conda, and sapphire. You can use it as a launcher, to troubleshoot, or switch between dev and main branch. Use this if you want easy mode on Windows.
 
@@ -164,15 +173,6 @@ pip install -r requirements.txt
 Or use the in-app update button in Settings → Dashboard. See [INSTALLATION.md — Update](docs/INSTALLATION.md#update-sapphire) for details.
 
 
-## Requirements
-
-- Ubuntu 22.04+ or Windows 11+
-- Mac is Docker-only
-- Python 3.11+ (via conda)
-- 16GB+ system RAM with TTS STT
-- More RAM if you need a local LLM
-- (recommended) Nvidia GPU for TTS/STT
-
 ## Documentation
 
 | Guide | Description |
@@ -181,7 +181,6 @@ Or use the in-app update button in Settings → Dashboard. See [INSTALLATION.md 
 | [Quick Start](docs/QUICK-START.md) | First persona, LLM setup, integrations |
 | [Plugin Author Guide](docs/plugin-author/README.md) | Build plugins with hooks, tools, providers, apps, themes |
 | [API](docs/API.md) | All ~280 REST endpoints |
-| [Agents](docs/AGENTS.md) | Background AI workers |
 | [Backups](docs/BACKUPS.md) | Automatic and manual backup system |
 | [Docker](docs/DOCKER.md) | Container deployment with GPU support |
 | [Technical](docs/TECHNICAL.md) | Architecture and internals |
@@ -189,7 +188,7 @@ Or use the in-app update button in Settings → Dashboard. See [INSTALLATION.md 
 
 ## Contributions
 
-**Help me test** if you can. If you see bugs, post them in Issues. It feels good to know people are using this. It genuinely helps, so please post if you see bugs.
+**Help me test** the dev branch if you can. If you see bugs, post them in Issues. It feels good to know people are using this. It genuinely helps, so please post if you see bugs.
 
 **Plugins are the way in.** Sapphire's plugin system supports tools, hooks, voice commands, scheduled tasks, settings UI, and web interfaces — all without touching core. Write a plugin, publish it to GitHub, and anyone can install it from Settings in one click. See the [Plugin Author Guide](docs/plugin-author/README.md) to get started.
 
