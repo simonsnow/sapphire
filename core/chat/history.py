@@ -405,10 +405,16 @@ class ConversationHistory:
                         llm_msg["thinking_raw"] = msg["thinking_raw"]
                 
             elif role == "tool":
+                # Tolerate tool messages missing `name` — historically
+                # placeholder writes from execution_context._patch_dangling_tool_calls
+                # (and any future hand-edited / partial history) lacked the
+                # field. A bare msg["name"] KeyError used to swallow into the
+                # outer except and return [] — silently empty history poisoned
+                # every subsequent heartbeat read of that chat. 2026-05-10.
                 llm_msg = {
                     "role": "tool",
                     "tool_call_id": msg["tool_call_id"],
-                    "name": msg["name"],
+                    "name": msg.get("name", "tool"),
                     "content": msg.get("content", "")
                 }
                 

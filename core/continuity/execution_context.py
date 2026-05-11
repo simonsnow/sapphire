@@ -260,18 +260,23 @@ class ExecutionContext:
             msg_start_idx = len(messages)
             messages.append({"role": "user", "content": user_input})
 
-        # `or config.X` coerces falsy values to the default — but an explicit
-        # 0 is a valid-looking-but-actually-lethal value here: max_parallel=0
-        # slices tool_calls to empty, assistant keeps re-requesting the same
-        # tools, infinite loop to iterations cap. Use None-check so explicit
-        # 0 is either honored (for context_limit: 0 meaning "unlimited") or
-        # coerced to 1 (for tool rounds/parallel which can't be 0).
-        # Chaos scout #5/#10 — 2026-04-20.
-        _rounds = self.task_settings.get("max_tool_rounds")
-        max_iterations = max(1, _rounds if _rounds is not None else config.MAX_TOOL_ITERATIONS)
-        _parallel = self.task_settings.get("max_parallel_tools")
-        max_parallel = max(1, _parallel if _parallel is not None else config.MAX_PARALLEL_TOOLS)
-        # context_limit: 0 IS a legitimate "no limit" signal; only None falls through.
+        # The scheduler stores 0 as the "unset / use default" sentinel for
+        # max_tool_rounds and max_parallel_tools (scheduler.py:320-321,
+        # frontend never exposes these by default). Treat 0 as "fall through
+        # to config default" — `or` does this naturally for both None and 0.
+        # Then max(1, ...) defends against negative or otherwise-falsy
+        # surprises. Without this, a heartbeat task created without explicit
+        # rounds was capped to 1 iteration: LLM uses it on a tool call, never
+        # gets to respond, loop exhausts silently. 2026-05-10 bug.
+        # Chaos scout #5/#10 (2026-04-20) protected against literal-0 cap-out
+        # but mistook the scheduler's 0-default as a real value — preserved
+        # the safety here by falling through to config defaults instead.
+        # context_limit IS different: 0 there legitimately means "unlimited"
+        # and the downstream `if context_limit > 0` check expects that.
+        _rounds = self.task_settings.get("max_tool_rounds") or config.MAX_TOOL_ITERATIONS
+        max_iterations = max(1, _rounds)
+        _parallel = self.task_settings.get("max_parallel_tools") or config.MAX_PARALLEL_TOOLS
+        max_parallel = max(1, _parallel)
         _ctx = self.task_settings.get("context_limit")
         context_limit = _ctx if _ctx is not None else getattr(config, 'CONTEXT_LIMIT', 0)
 
@@ -475,10 +480,24 @@ class ExecutionContext:
                     # Insert placeholders right after the last real tool response
                     # (or right after the asst if there are none), preserving order.
                     pos = insert_after + 1
+                    # Map tool_call_id -> function name from the asst(tc) so the
+                    # placeholder carries `name`. history.get_messages_for_llm
+                    # used to do msg["name"] (KeyError → swallowed → empty
+                    # history return). Reader is fixed too, but writing the
+                    # field is the right thing — keeps persisted history
+                    # well-formed for any other consumer. 2026-05-10.
+                    name_by_id = {}
+                    for tc in tcs:
+                        if isinstance(tc, dict):
+                            tc_id = tc.get("id")
+                            fn_name = (tc.get("function") or {}).get("name", "tool")
+                            if tc_id:
+                                name_by_id[tc_id] = fn_name
                     for tc_id in missing:
                         messages.insert(pos, {
                             "role": "tool",
                             "tool_call_id": tc_id,
+                            "name": name_by_id.get(tc_id, "tool"),
                             "content": "(Tool did not execute — loop exhausted before resolution.)",
                         })
                         pos += 1
