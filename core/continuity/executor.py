@@ -475,8 +475,16 @@ class ContinuityExecutor:
                 # to the target chat. ctx.new_messages has everything generated
                 # during this run: user msg, assistant+tool_calls, tool results,
                 # and the final assistant response — not just the bookends.
+                # Convert wire-format tool results to canonical persistence
+                # shape first — Claude / Anthropic-compat providers emit tool
+                # results as `role=user` with list-content `tool_result` blocks
+                # which the frontend renderer can't display. Without this
+                # conversion every Claude-backed scheduled task corrupts its
+                # named chat with empty user bubbles. 2026-05-11.
                 if hasattr(ctx, 'new_messages') and ctx.new_messages:
-                    session_manager.append_messages_to_chat(target_chat, ctx.new_messages)
+                    from core.chat.chat_tool_calling import wire_to_canonical
+                    canonical_messages = wire_to_canonical(ctx.new_messages)
+                    session_manager.append_messages_to_chat(target_chat, canonical_messages)
                 else:
                     # Fallback to simple pair if new_messages not available
                     session_manager.append_to_chat(target_chat, msg, response or "")

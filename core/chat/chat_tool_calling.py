@@ -86,6 +86,97 @@ def wrap_tool_result(tool_call_id: str, function_name: str, result: str) -> Dict
     }
 
 
+def wire_to_canonical(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Convert a wire-format message list to canonical persistence shape.
+
+    Some providers (Claude, Anthropic-compat) emit tool results as
+    `{role:"user", content:[{type:"tool_result", tool_use_id, content}]}`
+    so the next API call carries them in the shape the model expects. The
+    canonical persistence form, used by `format_messages_for_display` and
+    every OpenAI-style reader, is `{role:"tool", tool_call_id, name, content}`.
+
+    The foreground chat path avoids this mismatch by writing canonical
+    directly through `history.add_tool_result()` during execution. The
+    heartbeat / ExecutionContext path doesn't have a history object, so its
+    `messages` slice arrives at persistence time still in wire form. Without
+    converting, every Claude-backed scheduled task ends up with
+    invisible-bubble corruption in its named chat.
+
+    This walks the input and:
+      - Splits any `role=user` list-content `tool_result` blocks into
+        separate canonical `role=tool` messages (one per block) via the
+        existing `wrap_tool_result` shape, looking up `name` from the most
+        recent preceding assistant `tool_calls` within the slice.
+      - Preserves any non-`tool_result` blocks (text/image/file) on a
+        stripped user message at the original position. In practice
+        `format_tool_result` only emits a single `tool_result` block per
+        message — the mixed branch is defensive.
+      - Passes everything else through unchanged. Image-injection user
+        messages from `_inject_tool_images` (text + image blocks) are
+        already a shape the display formatter handles, so they pass.
+
+    Pure function — does not mutate the input list.
+    """
+    result: List[Dict[str, Any]] = []
+    name_by_tool_use_id: Dict[str, str] = {}
+
+    for msg in messages:
+        role = msg.get("role")
+
+        # Build the rolling name lookup from assistant tool_calls so we can
+        # populate canonical `name` on the converted tool messages below.
+        if role == "assistant":
+            tcs = msg.get("tool_calls")
+            if isinstance(tcs, list):
+                for tc in tcs:
+                    if not isinstance(tc, dict):
+                        continue
+                    tc_id = tc.get("id")
+                    fn_name = (tc.get("function") or {}).get("name", "tool")
+                    if tc_id:
+                        name_by_tool_use_id[tc_id] = fn_name
+            result.append(msg)
+            continue
+
+        if role == "user" and isinstance(msg.get("content"), list):
+            content = msg["content"]
+            tool_result_blocks = [
+                b for b in content
+                if isinstance(b, dict) and b.get("type") == "tool_result"
+            ]
+            if tool_result_blocks:
+                for block in tool_result_blocks:
+                    tc_id = block.get("tool_use_id") or block.get("tool_call_id", "")
+                    name = name_by_tool_use_id.get(tc_id, "tool")
+                    block_content = block.get("content", "")
+                    # tool_result content can itself be a list of typed blocks
+                    # (Claude allows nested text/image inside a tool_result);
+                    # flatten the text parts to a single string for canonical
+                    # storage. Image blocks inside tool results aren't a path
+                    # we exercise today — fall through to str() if needed.
+                    if isinstance(block_content, list):
+                        text_parts = [
+                            b.get("text", "") for b in block_content
+                            if isinstance(b, dict) and b.get("type") == "text"
+                        ]
+                        block_content = "\n".join(t for t in text_parts if t)
+                    result.append(wrap_tool_result(tc_id, name, str(block_content)))
+
+                # Preserve any non-tool_result blocks at the original position
+                # so a defensive mixed message doesn't lose its text/image data.
+                non_tool_blocks = [
+                    b for b in content
+                    if not (isinstance(b, dict) and b.get("type") == "tool_result")
+                ]
+                if non_tool_blocks:
+                    result.append({**msg, "content": non_tool_blocks})
+                continue
+
+        result.append(msg)
+
+    return result
+
+
 def _extract_tool_images(result, history=None):
     """Extract images from a tool result if it returned structured data.
 
