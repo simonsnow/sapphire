@@ -658,10 +658,15 @@ class ClaudeProvider(BaseProvider):
 
         # Detect the ghost envelope at second-to-last position
         second_to_last = claude_messages[-2]
+        # Sentinel detection — match either the legacy "[Operator metadata"
+        # prefix or the compact "[Sapphire turn-context" prefix. 2026-05-14.
+        _content = second_to_last.get("content") if isinstance(second_to_last.get("content"), str) else ""
         is_ghost = (
             second_to_last.get("role") == "user"
-            and isinstance(second_to_last.get("content"), str)
-            and second_to_last["content"].startswith("[Operator metadata for assistant")
+            and (
+                _content.startswith("[Sapphire turn-context")
+                or _content.startswith("[Operator metadata for assistant")
+            )
         )
         cache_idx = -3 if is_ghost else -2
         if abs(cache_idx) > len(claude_messages):

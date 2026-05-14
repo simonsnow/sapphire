@@ -68,12 +68,13 @@ from core.hooks import hook_runner, HookEvent
 logger = logging.getLogger(__name__)
 
 
-# Envelope opener — gives the assistant unambiguous framing that this is
-# operator metadata, not the user. Each contribution is per-line attributed.
-_ENVELOPE_HEADER = (
-    "[Operator metadata for assistant — these are turn-only notes, not the "
-    "user's voice. Acknowledge or weave only if natural.]"
-)
+# Envelope sentinel — used by the Claude provider to detect ghost messages
+# for prompt-cache boundary placement. Stays first-line so detection works,
+# but is now a compact marker rather than a wordy framing. Each plugin
+# emits its own "System Note:" or context line inside its contribution so
+# the AI gets actionable per-plugin guidance instead of generic boilerplate.
+# 2026-05-14.
+_ENVELOPE_HEADER = "[Sapphire turn-context — operator-injected, not user voice]"
 
 
 def _datetime_contribution() -> Optional[str]:
