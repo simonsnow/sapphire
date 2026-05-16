@@ -220,7 +220,7 @@ export default {
                     </div>
                     <div class="setting-input">
                         <input type="number" id="setting-MEMORY_DEDUP_THRESHOLD" data-key="MEMORY_DEDUP_THRESHOLD"
-                            value="${ctx.settings.MEMORY_DEDUP_THRESHOLD ?? 0.92}" step="0.01" min="0.70" max="0.99">
+                            value="${ctx.getValue('MEMORY_DEDUP_THRESHOLD') ?? 0.92}" step="0.01" min="0.70" max="0.99">
                     </div>
                 </div>
             </div>`;

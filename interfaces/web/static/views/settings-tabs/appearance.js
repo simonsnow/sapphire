@@ -13,7 +13,7 @@ export default {
         const currentTheme = localStorage.getItem('sapphire-theme') || 'dark';
         const density = localStorage.getItem('sapphire-density') || 'default';
         const font = localStorage.getItem('sapphire-font') || 'system';
-        const avatars = ctx.settings.AVATARS_IN_CHAT ?? true;
+        const avatars = ctx.getValue('AVATARS_IN_CHAT') ?? true;
 
         return `
         <div class="appearance-page">
