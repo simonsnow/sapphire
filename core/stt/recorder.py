@@ -118,19 +118,26 @@ class AudioRecorder:
         Silero (default): ML model trained to distinguish speech from
         non-speech sounds — robust to coughs, fan noise, music, AC.
         Amplitude (legacy): adaptive level threshold — sensitive to any
-        loud non-speech sound. Kept as fallback when silero unavailable.
+        loud non-speech sound. Always-available fallback.
+
+        Intent (STT_VAD_BACKEND) is the user's preference. Capability
+        (silero_vad.is_available()) is the system check — set by the boot
+        warmup. Effective backend = min(intent, capability).
         """
         if self._vad_backend == 'silero':
-            try:
-                return self._is_silent_silero(audio_data)
-            except Exception as e:
-                logger.warning(
-                    f"[VAD] Silero failed ({e}) — falling back to amplitude VAD "
-                    f"for this session."
-                )
-                self._vad_backend = 'amplitude'
-                # Reset the level history so amplitude path adapts cleanly
-                self.level_history.clear()
+            from core.stt import silero_vad as _svad
+            if _svad.is_available():
+                try:
+                    return self._is_silent_silero(audio_data)
+                except Exception as e:
+                    logger.warning(
+                        f"[VAD] Silero inference failed mid-recording ({e}) — "
+                        f"falling back to amplitude for this session."
+                    )
+                    self._vad_backend = 'amplitude'
+                    self.level_history.clear()
+            # Silero pending or failed at warmup — silently use amplitude
+            # this recording. User intent (settings) is preserved.
         return self._is_silent_amplitude(audio_data)
 
     def _is_silent_amplitude(self, audio_data: np.ndarray) -> bool:

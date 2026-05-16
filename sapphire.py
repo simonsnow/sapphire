@@ -703,6 +703,16 @@ class VoiceChatSystem:
                     try:
                         from core.stt.recorder import AudioRecorder as RealAudioRecorder
                         self.whisper_recorder = RealAudioRecorder()
+                        # Kick off silero VAD warmup in background — verifies
+                        # model downloads + loads on this machine without
+                        # blocking startup. Recorder reads silero_vad.is_available()
+                        # before attempting silero; result also drives
+                        # /api/stt/vad-status for the UI status badge.
+                        try:
+                            from core.stt import silero_vad as _svad
+                            _svad.warmup_async()
+                        except Exception as _svad_err:
+                            logger.warning(f"Silero warmup kickoff failed: {_svad_err}")
                     except Exception as mic_err:
                         logger.warning(f"No mic available — STT will work via web UI only: {mic_err}")
                         from core.stt.stt_null import NullAudioRecorder

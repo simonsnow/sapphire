@@ -159,9 +159,17 @@
     "long": "When enabled, uses VAD to filter out non-speech audio before transcription. Improves accuracy by ignoring silence and background noise. Recommended to keep enabled for better results and faster processing."
   },
   
+  "STT_VAD_BACKEND": {
+    "short": "Voice activity detection engine",
+    "long": "Which VAD method to use for detecting speech vs silence. 'silero' (recommended) uses a tiny ML model robust to background noise. 'amplitude' uses adaptive level thresholding (the Classic VAD). The Silero checkbox in the UI maps to this setting — when checked, this is 'silero' and the system falls back to amplitude automatically if Silero fails. When unchecked, only amplitude runs."
+  },
+  "STT_VAD_SPEECH_THRESHOLD": {
+    "short": "Silero speech threshold (0.0-1.0)",
+    "long": "Silero's speech probability above which a chunk counts as speech. Default 0.5. Lower (0.3-0.4) if Silero misses your softer trailing words. Higher (0.6-0.7) if background noise is triggering false positives. Use the 'Test my voice' button below to see what your speech actually scores."
+  },
   "RECORDER_SILENCE_THRESHOLD": {
-    "short": "Silence detection threshold level",
-    "long": "Audio level below which sound is considered silence. Lower values (0.001-0.003) are more sensitive and stop recording sooner. Higher values require louder speech to be detected. 0.0025 works well in most environments."
+    "short": "(Classic VAD only) Silence detection threshold level",
+    "long": "Only active when Silero VAD is off or unavailable. Audio level below which sound is considered silence. Lower values (0.001-0.003) are more sensitive and stop recording sooner. Higher values require louder speech to be detected. 0.0025 works well in most environments."
   },
   "RECORDER_SILENCE_DURATION": {
     "short": "Silence duration to stop recording (seconds)",
@@ -176,8 +184,16 @@
     "long": "How long speech must be detected before starting to record. 0.2 seconds prevents very short noise bursts from triggering transcribe. Too high may miss quick utterances."
   },
   "RECORDER_BACKGROUND_PERCENTILE": {
-    "short": "(Important) What % of your audio is background noise",
-    "long": "How much of your audio is background noise. Used only with wakeword recording. This is so VAD can calculate when to cut off recording and transcribe. Use low values for good mic with noise filtering, and high values for bad webcam mics."
+    "short": "(Classic VAD only) Background noise percentile",
+    "long": "Only active when Silero VAD is off or unavailable. Percentile of the rolling level history used as the background-noise estimate. The adaptive silence threshold is set just above this. Low values (10-30) for clean mics, higher (40-60) for noisy webcam mics."
+  },
+  "RECORDER_NOISE_MULTIPLIER": {
+    "short": "(Classic VAD only) Speech-vs-background multiplier",
+    "long": "Only active when Silero VAD is off or unavailable. How much above the background-noise estimate qualifies as speech. 1.1 means speech must be at least 110% of the background level. Raise (1.3-1.5) if background noise triggers false speech; lower (1.05) if soft speech is being missed."
+  },
+  "RECORDER_LEVEL_HISTORY_SIZE": {
+    "short": "(Classic VAD only) Rolling history length",
+    "long": "Only active when Silero VAD is off or unavailable. Number of recent audio chunks used to estimate the background-noise floor. 15 chunks ≈ 350ms of rolling history at default chunk size. Larger values make adaptation slower but more stable."
   },
   "RECORDER_MAX_SECONDS": {
     "short": "Maximum recording duration (seconds)",

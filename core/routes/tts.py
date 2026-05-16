@@ -22,6 +22,54 @@ router = APIRouter()
 _TTS_MAX_CHARS = 50_000  # ~8,000 words / ~20 pages — generous for stories, blocks book dumps
 
 
+# ─── VAD (Voice Activity Detection) endpoints ─────────────────────────────────
+
+@router.get("/api/stt/vad-status")
+async def vad_status(_=Depends(require_login)):
+    """Report silero warmup state for the Settings UI status badge.
+    Returns: {state: pending|ready|failed, reason, intent, available}
+    - state: silero system capability (set by boot warmup)
+    - intent: user preference from STT_VAD_BACKEND setting
+    - available: convenience boolean — true iff state == "ready"
+    """
+    from core.stt import silero_vad as _svad
+    status = _svad.get_warmup_status()
+    intent = getattr(config, 'STT_VAD_BACKEND', 'silero')
+    threshold = float(getattr(config, 'STT_VAD_SPEECH_THRESHOLD', 0.5))
+    return {
+        "state": status["state"],
+        "reason": status["reason"],
+        "intent": intent,
+        "available": status["state"] == "ready",
+        "threshold": threshold,
+    }
+
+
+@router.post("/api/stt/vad-test")
+async def vad_test(request: Request, _=Depends(require_login)):
+    """Record ~5s from the mic and run silero on every chunk. Returns the
+    score summary + a threshold suggestion. Used by the Settings 'Test my
+    voice' button. No end-of-speech cutoff — user can pause and resume to
+    test how silero handles their natural speech pattern."""
+    check_endpoint_rate(request, 'vad_test', max_calls=10, window=60)
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    try:
+        duration_s = float(body.get('duration_s', 5.0))
+    except (TypeError, ValueError):
+        duration_s = 5.0
+    duration_s = max(1.0, min(10.0, duration_s))
+
+    from core.stt import silero_vad as _svad
+    # Run the synchronous mic-capture-and-score in a thread so we don't block
+    # the FastAPI event loop. asyncio.to_thread is the modern idiom.
+    result = await asyncio.to_thread(_svad.run_voice_test, duration_s)
+    return result
+
+
 @router.post("/api/tts")
 async def handle_tts_speak(request: Request, _=Depends(require_login), system=Depends(get_system)):
     """TTS speak endpoint."""
