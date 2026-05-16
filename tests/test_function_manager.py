@@ -135,18 +135,171 @@ class TestAbilityResolution:
             mgr._enabled_tools = []
             mgr._mode_filters = {}
             mgr.current_toolset_name = "none"
-            
+
             with patch('core.chat.function_manager.toolset_manager') as mock_ts:
                 mock_ts.toolset_exists.return_value = False
                 mgr.update_enabled_functions(['func_a', 'func_c'])
-            
+
             assert mgr.current_toolset_name == "custom"
             enabled_names = [t['function']['name'] for t in mgr._enabled_tools]
             assert enabled_names == ['func_a', 'func_c']
 
 
 # =============================================================================
-# Validation Tests  
+# Toolset Re-Apply Regression Tests (2026-05-16)
+# =============================================================================
+# Bug #1: plugin toggle / reload code paths re-passed current_toolset_name
+# back into update_enabled_functions. When that value was "custom" (the
+# sentinel for ad-hoc selection), the filter step would intersect
+# all_possible_tools with the literal string "custom" → zero matches →
+# _enabled_tools silently emptied. User symptom: tools in toolset, AI
+# can't use them, swapping to "All" works.
+#
+# Bug #2: register_plugin_tools (and register_dynamic_tools) only auto-
+# added new tools to _enabled_tools when current_toolset_name was "all".
+# If the user had a SAVED toolset active that already listed the
+# newly-registering tool by name, the tool ended up in all_possible_tools
+# but NOT _enabled_tools — LLM never saw it.
+
+
+class TestCustomSentinelReApply:
+    """Re-passing 'custom' as a toolset name must not zero out the
+    currently-enabled tools. It should re-derive the function list from
+    the current _enabled_tools state."""
+
+    def _make_mgr_with_custom_selection(self):
+        """Build a FunctionManager mid-state: current=custom with 2 tools enabled."""
+        with patch.object(FunctionManager, '__init__', lambda self: None):
+            mgr = FunctionManager()
+            mgr._tools_lock = threading.Lock()
+            mgr.function_modules = {}
+            mgr.all_possible_tools = [
+                {'function': {'name': 'func_a'}},
+                {'function': {'name': 'func_b'}},
+                {'function': {'name': 'func_c'}},
+            ]
+            mgr._enabled_tools = [
+                {'function': {'name': 'func_a'}},
+                {'function': {'name': 'func_c'}},
+            ]
+            mgr._mode_filters = {}
+            mgr.current_toolset_name = "custom"
+            return mgr
+
+    def test_custom_sentinel_preserves_enabled_tools(self):
+        """Bug #1: update_enabled_functions(['custom']) must NOT empty enabled_tools."""
+        mgr = self._make_mgr_with_custom_selection()
+        with patch('core.chat.function_manager.toolset_manager') as mock_ts:
+            mock_ts.toolset_exists.return_value = False
+            mgr.update_enabled_functions(['custom'])
+        enabled_names = sorted(t['function']['name'] for t in mgr._enabled_tools)
+        assert enabled_names == ['func_a', 'func_c'], (
+            f"Expected ['func_a', 'func_c'] preserved, got {enabled_names}. "
+            f"This is the silent-wipe regression — passing 'custom' must re-derive "
+            f"from current _enabled_tools, not filter against the literal string."
+        )
+        assert mgr.current_toolset_name == "custom"
+
+    def test_custom_sentinel_with_empty_enabled_stays_empty(self):
+        """Edge case: passing 'custom' with nothing currently enabled should
+        produce empty _enabled_tools and not error."""
+        with patch.object(FunctionManager, '__init__', lambda self: None):
+            mgr = FunctionManager()
+            mgr._tools_lock = threading.Lock()
+            mgr.function_modules = {}
+            mgr.all_possible_tools = [{'function': {'name': 'func_a'}}]
+            mgr._enabled_tools = []
+            mgr._mode_filters = {}
+            mgr.current_toolset_name = "custom"
+            with patch('core.chat.function_manager.toolset_manager') as mock_ts:
+                mock_ts.toolset_exists.return_value = False
+                mgr.update_enabled_functions(['custom'])
+            assert mgr._enabled_tools == []
+            assert mgr.current_toolset_name == "custom"
+
+
+class TestNewToolAutoJoinsActiveSavedToolset:
+    """Registering new tools (plugin or dynamic) should auto-add them to
+    _enabled_tools when the active saved toolset references them by name —
+    not just when 'all' is the active toolset."""
+
+    def _make_mgr(self, current_toolset, toolset_funcs):
+        """Build a FunctionManager with a saved toolset active."""
+        with patch.object(FunctionManager, '__init__', lambda self: None):
+            mgr = FunctionManager()
+            mgr._tools_lock = threading.Lock()
+            mgr.function_modules = {}
+            mgr.all_possible_tools = []
+            mgr._enabled_tools = []
+            mgr._mode_filters = {}
+            mgr._network_functions = set()
+            mgr._is_local_map = {}
+            mgr._function_module_map = {}
+            mgr.execution_map = {}
+            mgr.current_toolset_name = current_toolset
+            mgr._toolset_funcs = toolset_funcs  # used by mock below
+            return mgr
+
+    def test_dynamic_tools_auto_added_to_active_saved_toolset(self):
+        """Bug #2: when active toolset is a saved one whose function list
+        includes the newly-registered tool, the tool must land in _enabled_tools."""
+        mgr = self._make_mgr(current_toolset='evelyn',
+                             toolset_funcs=['body_speak', 'memory_save', 'body_see'])
+        new_tools = [
+            {'type': 'function', 'function': {'name': 'body_speak'}},
+            {'type': 'function', 'function': {'name': 'body_see'}},
+            {'type': 'function', 'function': {'name': 'unrelated_tool'}},
+        ]
+        with patch('core.chat.function_manager.toolset_manager') as mock_ts:
+            mock_ts.toolset_exists.return_value = True
+            mock_ts.get_toolset_functions.return_value = mgr._toolset_funcs
+            mgr.register_dynamic_tools('test_module', new_tools, executor=lambda *a, **k: None)
+
+        enabled_names = sorted(t['function']['name'] for t in mgr._enabled_tools)
+        assert 'body_speak' in enabled_names, (
+            "body_speak is in the active toolset's function list — must be enabled"
+        )
+        assert 'body_see' in enabled_names, (
+            "body_see is in the active toolset's function list — must be enabled"
+        )
+        assert 'unrelated_tool' not in enabled_names, (
+            "unrelated_tool is NOT in the toolset — should not be auto-enabled"
+        )
+
+    def test_dynamic_tools_not_added_when_toolset_omits_them(self):
+        """If active saved toolset doesn't reference the new tools, they
+        register in all_possible_tools but stay out of _enabled_tools."""
+        mgr = self._make_mgr(current_toolset='minimal', toolset_funcs=['only_this_one'])
+        new_tools = [
+            {'type': 'function', 'function': {'name': 'something_new'}},
+        ]
+        with patch('core.chat.function_manager.toolset_manager') as mock_ts:
+            mock_ts.toolset_exists.return_value = True
+            mock_ts.get_toolset_functions.return_value = mgr._toolset_funcs
+            mgr.register_dynamic_tools('test_module', new_tools, executor=lambda *a, **k: None)
+
+        # Tool lands in all_possible_tools
+        assert any(t['function']['name'] == 'something_new' for t in mgr.all_possible_tools)
+        # But NOT in _enabled_tools (toolset didn't reference it)
+        assert not any(t['function']['name'] == 'something_new' for t in mgr._enabled_tools)
+
+    def test_dynamic_tools_skip_auto_add_when_current_is_custom(self):
+        """When current_toolset_name is 'custom' (ad-hoc selection), don't
+        try to consult toolset_manager — there is no saved toolset to query."""
+        mgr = self._make_mgr(current_toolset='custom', toolset_funcs=[])
+        new_tools = [{'type': 'function', 'function': {'name': 'fresh_tool'}}]
+        with patch('core.chat.function_manager.toolset_manager') as mock_ts:
+            mock_ts.toolset_exists.return_value = False
+            mgr.register_dynamic_tools('test_module', new_tools, executor=lambda *a, **k: None)
+        # Should land in all_possible_tools but NOT _enabled_tools
+        assert any(t['function']['name'] == 'fresh_tool' for t in mgr.all_possible_tools)
+        assert not any(t['function']['name'] == 'fresh_tool' for t in mgr._enabled_tools)
+        # Confirm we never tried to look up a saved toolset named "custom"
+        mock_ts.toolset_exists.assert_not_called()
+
+
+# =============================================================================
+# Validation Tests
 # =============================================================================
 
 class TestValidation:

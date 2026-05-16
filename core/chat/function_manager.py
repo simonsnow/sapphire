@@ -409,6 +409,20 @@ class FunctionManager:
                         for tool in tools:
                             if tool['function']['name'] not in enabled_names:
                                 self._enabled_tools.append(tool)
+                    # If a SAVED toolset is active and it references one of
+                    # these new tools by name, auto-add it too. Without this,
+                    # a freshly-loaded plugin's tools sit in all_possible_tools
+                    # but not _enabled_tools — LLM never sees them, even though
+                    # the active toolset definition says they should be on.
+                    # 2026-05-16 fix.
+                    elif self.current_toolset_name not in ("none", "custom") \
+                            and toolset_manager.toolset_exists(self.current_toolset_name):
+                        active_funcs = set(toolset_manager.get_toolset_functions(self.current_toolset_name))
+                        enabled_names = {t['function']['name'] for t in self._enabled_tools}
+                        for tool in tools:
+                            fname = tool['function']['name']
+                            if fname in active_funcs and fname not in enabled_names:
+                                self._enabled_tools.append(tool)
 
                 logger.info(f"Plugin '{plugin_name}' tool '{module_name}': {len(tools)} tools registered")
 
@@ -520,6 +534,16 @@ class FunctionManager:
                 for tool in tools:
                     if tool['function']['name'] not in enabled_names:
                         self._enabled_tools.append(tool)
+            # Same auto-add for saved toolsets that reference these tools
+            # (mirrors register_plugin_tools fix). 2026-05-16.
+            elif self.current_toolset_name not in ("none", "custom") \
+                    and toolset_manager.toolset_exists(self.current_toolset_name):
+                active_funcs = set(toolset_manager.get_toolset_functions(self.current_toolset_name))
+                enabled_names = {t['function']['name'] for t in self._enabled_tools}
+                for tool in tools:
+                    fname = tool['function']['name']
+                    if fname in active_funcs and fname not in enabled_names:
+                        self._enabled_tools.append(tool)
 
         logger.info(f"Dynamic tools registered: {module_name} ({len(tools)} tools)")
 
@@ -618,6 +642,20 @@ class FunctionManager:
     def update_enabled_functions(self, enabled_names: list):
         """Update enabled tools based on function names from config or ability name."""
         with self._tools_lock:
+            # "custom" is a sentinel for "ad-hoc selection", not a real
+            # toolset name. Callers (plugin toggle/reload re-sync) often pass
+            # back current_toolset_name without realizing this — and naively
+            # filtering all_possible_tools against ["custom"] yields zero
+            # matches, wiping _enabled_tools silently. Re-derive from the
+            # current selection. 2026-05-16.
+            if len(enabled_names) == 1 and enabled_names[0] == "custom":
+                enabled_names = [t['function']['name'] for t in self._enabled_tools]
+                if not enabled_names:
+                    self.current_toolset_name = "custom"
+                    self._enabled_tools = []
+                    logger.info("Re-apply 'custom' with empty selection — no tools enabled")
+                    return
+
             # Determine what ability name was requested
             requested_ability = enabled_names[0] if len(enabled_names) == 1 else "custom"
 
