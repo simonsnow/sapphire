@@ -10,12 +10,14 @@
 # Suitable for closed LAN; harden when this leaves the house.
 
 import asyncio
+import json
 import logging
 import os
 import tempfile
 from typing import Optional
 
-from fastapi import APIRouter, Depends, File, Header, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Header, HTTPException, Request, UploadFile
+from fastapi.responses import StreamingResponse
 
 from core.api_fastapi import get_system
 
@@ -112,3 +114,82 @@ async def handle_body_wake(
 async def body_health(_system=Depends(get_system)):
     """Lightweight liveness probe for body → brain reachability."""
     return {"ok": True}
+
+
+# ─── SSE event stream to body (step 7) ────────────────────────────────────────
+# Body subscribes once on boot, holds connection. Brain filters internal
+# event_bus events and emits a stripped-down semantic stream — only the
+# things a body cares about. No LLM chunks, no settings updates, no chat
+# history events. Just animation cues + lifecycle markers.
+
+# Brain event type → body-state mapping. Anything not listed is dropped.
+# Body decides the visual; brain just communicates semantic state.
+_BODY_STATE_MAP = {
+    "ai_typing_start":           {"state": "thinking"},
+    "ai_typing_end":             {"state": "idle"},
+    "tool_executing":            {"state": "tool"},        # carries data.name
+    "tool_complete":             {"state": "thinking"},    # back to LLM
+    "tts_playing":               {"state": "speaking"},
+    "tts_stopped":               {"state": "idle"},
+    "continuity_task_starting":  {"state": "thinking"},
+    "continuity_task_complete":  {"state": "idle"},
+    "continuity_task_error":     {"state": "error"},
+    "stt_processing":            {"state": "thinking"},
+}
+
+
+def _to_body_event(event: dict) -> Optional[dict]:
+    """Brain event → body state payload. Returns None if irrelevant."""
+    et = event.get("type")
+    if et not in _BODY_STATE_MAP:
+        return None
+    payload = dict(_BODY_STATE_MAP[et])
+    # Pass through useful metadata where applicable
+    data = event.get("data") or {}
+    if et == "tool_executing" and data.get("name"):
+        payload["tool_name"] = data["name"]
+    payload["src"] = et
+    payload["ts"] = event.get("timestamp")
+    return payload
+
+
+@router.get("/api/body/events")
+async def body_events_stream(
+    request: Request,
+    authorization: Optional[str] = Header(default=None),
+):
+    """SSE stream of LED-relevant state cues for body subscribers.
+    Stripped subset of the brain's event bus — no chat content, no settings,
+    just semantic state cues the body maps to LED animations.
+
+    Body is expected to subscribe once on boot and hold the connection.
+    Auto-reconnect logic lives on the body side."""
+    _verify_brain_auth(authorization)
+    logger.info("[body/events] subscriber connected")
+
+    async def generate():
+        from core.event_bus import get_event_bus
+        bus = get_event_bus()
+        # Send an immediate connected event so subscribers know the channel
+        # is alive (don't have to wait for the first real event).
+        yield f"data: {json.dumps({'state': 'connected', 'src': 'sse_open'})}\n\n"
+        try:
+            async for event in bus.async_subscribe(replay=False):
+                if await request.is_disconnected():
+                    break
+                payload = _to_body_event(event)
+                if payload is None:
+                    continue
+                yield f"data: {json.dumps(payload)}\n\n"
+        finally:
+            logger.info("[body/events] subscriber disconnected")
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
