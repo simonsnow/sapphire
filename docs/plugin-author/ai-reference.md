@@ -21,11 +21,12 @@ When creating or modifying plugins:
 - App = full-page plugin UI via `capabilities.app` — `label`, `icon`, optional `nav: true` for navrail promotion (max 3)
 - Themes = custom CSS themes via `capabilities.themes[]` — `css`, `scripts`, `preview`, per-theme `settings`
 - State = `plugin_loader.get_plugin_state(name)` for persistent key-value storage
-- System access = `event.metadata.get("system")` in `pre_chat`, `post_chat`, `pre_execute` hooks
+- System access = `event.metadata.get("system")` in `pre_chat`, `post_chat`, `pre_execute`, `ghost_inject` hooks
 - `prompt_inject`, `post_execute`, `pre_tts` do NOT get system metadata — only `config`
 - System gives access to: `tts` (voice/speed/pitch/speak/stop), `toggle_stt()`, `toggle_wakeword()`, `llm_chat` (chat/history/prompt), `function_manager` (tools/scopes)
 - Enable/disable live via `PUT /api/webui/plugins/toggle/{name}`
-- All 10 hooks: `post_stt`, `pre_chat`, `prompt_inject`, `post_llm`, `post_chat`, `pre_execute`, `post_execute`, `pre_tts`, `post_tts`, `on_wake`
+- All 11 hooks: `post_stt`, `pre_chat`, `prompt_inject`, `ghost_inject`, `post_llm`, `post_chat`, `pre_execute`, `post_execute`, `pre_tts`, `post_tts`, `on_wake`
+- `prompt_inject` mutates the system prompt (long-lived, breaks Claude cache). `ghost_inject` (since 2.6.4) injects per-turn ephemera as labeled operator metadata that doesn't break cache — prefer it for time-sensitive context, ambient state, weather, calendar, etc.
 - `post_stt` fires only for voice input (after STT transcription, before chat pipeline)
 - `post_llm` fires after LLM response, before history save + TTS — mutate `response` to filter/translate/style
 - `post_tts` fires after playback completes or is stopped (daemon thread, observational)

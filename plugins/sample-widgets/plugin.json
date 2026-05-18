@@ -1,0 +1,54 @@
+{
+  "name": "sample-widgets",
+  "version": "1.0.0",
+  "description": "Reference plugin demonstrating dashboard widgets. Read the source to learn how to ship your own.",
+  "author": "sapphire",
+  "icon": "🧰",
+  "url": "https://github.com/ddxfish/sapphire",
+  "priority": 90,
+  "capabilities": {
+    "widgets": [
+      {
+        "id": "hello",
+        "name": "Hello",
+        "description": "Minimal example — title, info lines, a refresh action, cleanup.",
+        "icon": "👋",
+        "render": "widgets/hello.js",
+        "sizes": ["1x1"],
+        "default_size": "1x1"
+      },
+      {
+        "id": "note",
+        "name": "Pinned Note",
+        "description": "User-editable note with settings_schema (text + color). Shows the auto-rendered settings modal.",
+        "icon": "📝",
+        "render": "widgets/note.js",
+        "sizes": ["1x1", "1x2", "1x4"],
+        "default_size": "1x2",
+        "multi_instance": true,
+        "settings_schema": [
+          {
+            "key": "text",
+            "type": "textarea",
+            "label": "Note text",
+            "default": "Type your note in Settings...",
+            "rows": 3
+          },
+          {
+            "key": "color",
+            "type": "select",
+            "label": "Accent color",
+            "default": "blue",
+            "options": [
+              { "value": "blue",   "label": "Blue"   },
+              { "value": "green",  "label": "Green"  },
+              { "value": "orange", "label": "Orange" },
+              { "value": "pink",   "label": "Pink"   },
+              { "value": "white",  "label": "White"  }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

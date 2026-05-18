@@ -22,12 +22,25 @@ import threading
 from pathlib import Path
 from typing import Optional
 from core.setup import CONFIG_DIR, SOCKS_CONFIG_FILE, CLAUDE_API_KEY_FILE
+from core.settings_manager import _fsync_file, _fsync_dir
 
 try:
     from cryptography.fernet import Fernet, InvalidToken
 except ImportError:
     Fernet = None
     InvalidToken = Exception
+
+
+class DecryptionError(Exception):
+    """Raised by `_unscramble_strict` when an encrypted credential field
+    can't be decrypted. Signals 'this value exists on disk and is encrypted
+    but we can't read it right now' — distinct from 'this value is empty
+    or absent'. Routes that read-existing-then-save MUST distinguish these
+    because saving an empty value back through the encrypt path commits
+    real data loss (`refresh_token` / `app_password` permanently gone after
+    a routine field edit). Day-ruiner scout 2026-05-07 #C.
+    """
+    pass
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +68,7 @@ DEFAULT_CREDENTIALS = {
     "email_accounts": {},
     "bitcoin_wallets": {},
     "gcal_accounts": {},
+    "github_accounts": {},
     "ssh": {
         "servers": []
     },
@@ -254,7 +268,9 @@ class CredentialsManager:
                 tmp = settings_file.with_suffix('.json.tmp')
                 with open(tmp, 'w', encoding='utf-8') as f:
                     json.dump(user_settings, f, indent=2)
+                    _fsync_file(f)
                 tmp.replace(settings_file)
+                _fsync_dir(settings_file.parent)
                 logger.info("Cleared stale API keys from settings.json")
 
                 # Also strip from settings_manager's in-memory config so they
@@ -318,7 +334,9 @@ class CredentialsManager:
                 tmp = settings_file.with_suffix('.json.tmp')
                 with open(tmp, 'w', encoding='utf-8') as f:
                     json.dump(user_settings, f, indent=2)
+                    _fsync_file(f)
                 tmp.replace(settings_file)
+                _fsync_dir(settings_file.parent)
                 logger.info("Cleared service API keys from settings.json")
 
                 # Also strip from in-memory config
@@ -399,12 +417,14 @@ class CredentialsManager:
                 tmp_path = CREDENTIALS_FILE.with_suffix('.tmp')
                 with open(tmp_path, 'w', encoding='utf-8') as f:
                     json.dump(self._credentials, f, indent=2)
+                    _fsync_file(f)
 
                 # Set restrictive permissions on Unix (before rename so file is protected)
                 if sys.platform != 'win32':
                     os.chmod(tmp_path, 0o600)
 
                 tmp_path.replace(CREDENTIALS_FILE)
+                _fsync_dir(CREDENTIALS_FILE.parent)
 
                 logger.info(f"Saved credentials to {CREDENTIALS_FILE}")
                 return True
@@ -451,7 +471,14 @@ class CredentialsManager:
         return f"enc:{encrypted}"
 
     def _unscramble(self, value: str) -> str:
-        """Decrypt an 'enc:...' value. Plaintext passes through unchanged."""
+        """Decrypt an 'enc:...' value. Plaintext passes through unchanged.
+
+        Returns '' on decrypt failure for read paths that just want a
+        best-effort display value. CALLERS THAT WRITE BACK should use
+        `_unscramble_strict` (raises) — silently rewriting a successfully-
+        encrypted credential as `''` is a routine-edit data-loss class.
+        Day-ruiner scout 2026-05-07 #C.
+        """
         if not value or not value.startswith('enc:'):
             return value
         try:
@@ -461,6 +488,31 @@ class CredentialsManager:
         except (InvalidToken, Exception) as e:
             logger.critical(f"Failed to decrypt credential — encryption key may have changed or salt file lost: {e}")
             return ''
+
+    def _unscramble_strict(self, value: str) -> str:
+        """Like `_unscramble` but raises `DecryptionError` on failure
+        instead of returning ''. Use this from any code that will WRITE
+        BACK the result — the route handler "preserve untouched fields"
+        flow is the canonical example. Pre-fix, those routes pulled
+        encrypted fields, got '' on decrypt failure (e.g. salt file lost
+        after backup restore), and silently committed empty back through
+        the encrypt path → data loss on a routine save. With strict, the
+        route catches DecryptionError and refuses to save."""
+        if not value or not value.startswith('enc:'):
+            return value
+        try:
+            key = self._get_scramble_key()
+            f = Fernet(key)
+            return f.decrypt(value[4:].encode()).decode()
+        except (InvalidToken, Exception) as e:
+            logger.critical(
+                f"Strict decrypt failed — encryption key may have changed "
+                f"or salt file lost: {e}"
+            )
+            raise DecryptionError(
+                "Credential is encrypted but cannot be decrypted "
+                "(salt file may be missing or rotated)"
+            ) from e
 
     # =========================================================================
     # LLM API Keys
@@ -1011,6 +1063,77 @@ class CredentialsManager:
         """Check if gcal account exists and has a refresh token."""
         acct = self.get_gcal_account(scope)
         return bool(acct['client_id'] and acct['refresh_token'])
+
+    # =========================================================================
+    # GitHub
+    # =========================================================================
+
+    def get_github_account(self, scope: str = 'default') -> dict:
+        """Get GitHub account for a scope. PAT is unscrambled on read."""
+        accounts = self._credentials.get('github_accounts', {})
+        acct = accounts.get(scope, {})
+        return {
+            'username': acct.get('username', ''),
+            'pat': self._unscramble(acct.get('pat', '')),
+            'label': acct.get('label', scope),
+        }
+
+    def set_github_account(self, scope: str, username: str, pat: str, label: str = '') -> bool:
+        """Set GitHub account for a scope. PAT is scrambled before save.
+        If pat is empty string, the existing stored PAT is preserved."""
+        with self._lock:
+            try:
+                if 'github_accounts' not in self._credentials:
+                    self._credentials['github_accounts'] = {}
+
+                existing = self._credentials['github_accounts'].get(scope, {})
+                stored_pat = existing.get('pat', '') if not pat else self._scramble(pat)
+
+                self._credentials['github_accounts'][scope] = {
+                    'username': username,
+                    'pat': stored_pat,
+                    'label': label or scope,
+                }
+
+                if not self._save():
+                    logger.error(f"Failed to persist github account '{scope}' to disk")
+                    return False
+
+                logger.info(f"Set github account for scope '{scope}'")
+                return True
+            except Exception as e:
+                logger.error(f"Failed to set github account '{scope}': {e}")
+                return False
+
+    def delete_github_account(self, scope: str) -> bool:
+        """Remove a GitHub account by scope."""
+        with self._lock:
+            accounts = self._credentials.get('github_accounts', {})
+            if scope not in accounts:
+                return False
+            del accounts[scope]
+            if not self._save():
+                return False
+            logger.info(f"Deleted github account '{scope}'")
+            return True
+
+    def list_github_accounts(self) -> list:
+        """List all github accounts (no PATs)."""
+        accounts = self._credentials.get('github_accounts', {})
+        result = []
+        for scope, acct in accounts.items():
+            result.append({
+                'scope': scope,
+                'label': acct.get('label', scope),
+                'username': acct.get('username', ''),
+                'has_token': bool(acct.get('pat', '')),
+            })
+        return result
+
+    def has_github_account(self, scope: str = 'default') -> bool:
+        """Check if github account exists and has a PAT."""
+        acct = self.get_github_account(scope)
+        return bool(acct['pat'])
 
     # =========================================================================
     # SSH

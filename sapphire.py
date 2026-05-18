@@ -140,11 +140,15 @@ class VoiceChatSystem:
             logger.warning(f"Essential-plugin check failed: {_e}")
 
         # Re-apply toolset now that plugin tools are registered
-        # (toolset was applied before plugins loaded, so plugin tools were missed)
+        # (toolset was applied before plugins loaded, so plugin tools were missed).
+        # Capture the name UNDER _tools_lock so a concurrent mutation can't slip
+        # a stale value past us. Mirrors plugin_loader.py:902-905. 2026-05-16.
         fm = self.llm_chat.function_manager
-        if fm.current_toolset_name and fm.current_toolset_name != "none":
-            fm.update_enabled_functions([fm.current_toolset_name])
-            logger.info(f"Toolset '{fm.current_toolset_name}' re-applied after plugin scan")
+        with fm._tools_lock:
+            current = fm.current_toolset_name
+        if current and current != "none":
+            fm.update_enabled_functions([current])
+            logger.info(f"Toolset '{current}' re-applied after plugin scan")
 
         # RAG orphan cleanup runs AFTER plugin_loader.scan() (Phase 4 reorder).
         # Previously this ran at line 100, BEFORE plugin loading, which meant it
@@ -155,6 +159,21 @@ class VoiceChatSystem:
         # has the canonical entry, and the import here resolves to the SAME module
         # the plugin loader registered.
         self._cleanup_orphaned_rag()
+
+        # Wire reload callbacks for provider keys so live singletons swap
+        # when settings change. Without this, plugin_loader.unload_plugin
+        # sets TTS_PROVIDER='none' on disk but the live TTSClient keeps
+        # the disabled plugin's provider — user sees "voice was working,
+        # I disabled an unrelated plugin, now silent" with no log line.
+        # subsystem-integrity scout 2026-05-07 #1.
+        try:
+            from core.settings_manager import settings as _settings
+            _settings.register_reload_callback('TTS_PROVIDER', self.switch_tts_provider)
+            _settings.register_reload_callback('STT_PROVIDER', self.switch_stt_provider)
+            _settings.register_reload_callback('EMBEDDING_PROVIDER', self.switch_embedding_provider)
+            logger.info("Provider reload callbacks registered (TTS/STT/EMBEDDING)")
+        except Exception as _e:
+            logger.warning(f"Failed to register provider reload callbacks: {_e}")
 
         logger.info(f"System init took: {(time.time() - start_time)*1000:.1f}ms")
 
@@ -341,6 +360,49 @@ class VoiceChatSystem:
                 logger.info("Wakeword stopped")
             return True
 
+    def reload_wakeword_model(self, model_name=None):
+        """Hot-swap the wake word model on a live detector.
+
+        Settings already wrote the new value to config.WAKEWORD_MODEL by
+        the time this fires. If wakeword isn't currently listening, this
+        is a no-op — the next toggle_wakeword(True) cold-start will read
+        the new value from settings on its own.
+        """
+        from core.wakeword.wakeword_null import NullAudioRecorder, NullWakeWordDetector
+
+        # Disabled / never started — setting will apply on first enable
+        if isinstance(self.wake_detector, NullWakeWordDetector):
+            logger.info(f"Wakeword model set to '{config.WAKEWORD_MODEL}' (will apply when wakeword is enabled)")
+            return True
+
+        if not config.WAKE_WORD_ENABLED:
+            return True
+
+        try:
+            logger.info(f"Reloading wakeword detector with model: {config.WAKEWORD_MODEL}")
+            self.wake_detector.stop_listening()
+            self.wake_word_recorder.stop_recording()
+
+            from core.setup import ensure_wakeword_models
+            if not ensure_wakeword_models():
+                raise RuntimeError("Failed to download wakeword models")
+            from core.wakeword.audio_recorder import AudioRecorder as RealAudioRecorder
+            from core.wakeword.wake_detector import WakeWordDetector as RealWakeWordDetector
+
+            self.wake_word_recorder = RealAudioRecorder()
+            self.wake_detector = RealWakeWordDetector(model_name=config.WAKEWORD_MODEL)
+            self.wake_detector.set_audio_recorder(self.wake_word_recorder)
+            self.wake_detector.set_system(self)
+            self.wake_word_recorder.start_recording()
+            self.wake_detector.start_listening()
+            logger.info("Wakeword model reloaded successfully")
+            return True
+        except Exception as e:
+            logger.error(f"Wakeword model reload failed: {e}")
+            self.wake_word_recorder = NullAudioRecorder()
+            self.wake_detector = NullWakeWordDetector(None)
+            return False
+
     def switch_stt_provider(self, provider_name: str):
         """Hot-swap STT provider at runtime."""
         if not provider_name or provider_name == 'none':
@@ -453,8 +515,29 @@ class VoiceChatSystem:
         if kill_process_on_port(tts_port):
             logger.info(f"Cleaned up orphaned TTS process on port {tts_port}")
         logger.info("Starting Kokoro TTS server...")
+
+        # Multi-GPU users can pin Kokoro to a specific GPU via the
+        # KOKORO_CUDA_DEVICE setting. Without it, both Kokoro and Whisper
+        # default to cuda:0 — concurrent CUDA-context init at startup
+        # corrupts the heap (SIGABRT in malloc, observed by user "defiance"
+        # on dual-GPU Linux 2026-04-25). We set CUDA_VISIBLE_DEVICES at
+        # the OS level for the Kokoro subprocess so it physically can't
+        # see the other GPU. Whisper meanwhile uses FASTER_WHISPER_CUDA_DEVICE
+        # on the main process. Common config: KOKORO_CUDA_DEVICE=1,
+        # FASTER_WHISPER_CUDA_DEVICE=0 → no shared GPU. Single-GPU users
+        # leave this empty (default) — same behavior as before. 2026-04-26.
+        def _env_callback():
+            import os
+            env = os.environ.copy()
+            kokoro_dev = getattr(config, 'KOKORO_CUDA_DEVICE', '')
+            if kokoro_dev != '' and str(kokoro_dev).strip() != '':
+                env['CUDA_VISIBLE_DEVICES'] = str(kokoro_dev).strip()
+                logger.info(f"Kokoro subprocess pinned to CUDA_VISIBLE_DEVICES={env['CUDA_VISIBLE_DEVICES']}")
+            return env
+
         self.tts_server_manager = ProcessManager(
-            script_path=tts_script, log_name="kokoro", base_dir=base_dir
+            script_path=tts_script, log_name="kokoro", base_dir=base_dir,
+            env_callback=_env_callback,
         )
         self.tts_server_manager.start()
         self.tts_server_manager.monitor_and_restart(check_interval=10)
@@ -555,7 +638,13 @@ class VoiceChatSystem:
             'file': "File creation error",
             'speech': "No speech heard",
             'recording': "Recording error",
-            'processing': "Processing error"
+            'processing': "Processing error",
+            # New keys mapped from recorder.last_failure_reason. These
+            # replace generic 'file' for the actual failure modes a user
+            # can do something about. 2026-04-28.
+            'mic_busy': "Microphone is busy. Please try again.",
+            'no_speech_captured': "I didn't hear anything.",
+            'save_failed': "Could not save audio file.",
         }
         self.tts.speak(error_messages.get(error_type, "Error"))
 
@@ -582,6 +671,12 @@ class VoiceChatSystem:
             if not skip_tts:
                 self.speak_error('processing')
         finally:
+            # Voice path has no toast channel — drain notices so they don't
+            # accumulate and leak into the next web turn as stale toasts
+            # (e.g. user voice-chats with missing toolset, fixes it, opens
+            # web → stale "missing" toast fires). In finally so the drain
+            # still runs if chat() raised mid-turn. 2026-05-16.
+            self.llm_chat.pending_notices = []
             self._processing_lock.release()
 
         return None
@@ -618,6 +713,16 @@ class VoiceChatSystem:
                     try:
                         from core.stt.recorder import AudioRecorder as RealAudioRecorder
                         self.whisper_recorder = RealAudioRecorder()
+                        # Kick off silero VAD warmup in background — verifies
+                        # model downloads + loads on this machine without
+                        # blocking startup. Recorder reads silero_vad.is_available()
+                        # before attempting silero; result also drives
+                        # /api/stt/vad-status for the UI status badge.
+                        try:
+                            from core.stt import silero_vad as _svad
+                            _svad.warmup_async()
+                        except Exception as _svad_err:
+                            logger.warning(f"Silero warmup kickoff failed: {_svad_err}")
                     except Exception as mic_err:
                         logger.warning(f"No mic available — STT will work via web UI only: {mic_err}")
                         from core.stt.stt_null import NullAudioRecorder
@@ -643,6 +748,7 @@ class VoiceChatSystem:
 
         from core.plugin_loader import plugin_loader as _pl
         stop_actions = [
+            ("plugin daemons", _pl.stop_all_daemons),
             ("agents", lambda: hasattr(self, 'agent_manager') and self.agent_manager and self.agent_manager.shutdown()),
             ("voice components", self.stop_components),
             ("continuity scheduler", lambda: hasattr(self, 'continuity_scheduler') and self.continuity_scheduler and self.continuity_scheduler.stop()),

@@ -260,23 +260,50 @@ class ExecutionContext:
             msg_start_idx = len(messages)
             messages.append({"role": "user", "content": user_input})
 
-        # `or config.X` coerces falsy values to the default — but an explicit
-        # 0 is a valid-looking-but-actually-lethal value here: max_parallel=0
-        # slices tool_calls to empty, assistant keeps re-requesting the same
-        # tools, infinite loop to iterations cap. Use None-check so explicit
-        # 0 is either honored (for context_limit: 0 meaning "unlimited") or
-        # coerced to 1 (for tool rounds/parallel which can't be 0).
-        # Chaos scout #5/#10 — 2026-04-20.
-        _rounds = self.task_settings.get("max_tool_rounds")
-        max_iterations = max(1, _rounds if _rounds is not None else config.MAX_TOOL_ITERATIONS)
-        _parallel = self.task_settings.get("max_parallel_tools")
-        max_parallel = max(1, _parallel if _parallel is not None else config.MAX_PARALLEL_TOOLS)
-        # context_limit: 0 IS a legitimate "no limit" signal; only None falls through.
+        # The scheduler stores 0 as the "unset / use default" sentinel for
+        # max_tool_rounds and max_parallel_tools (scheduler.py:320-321,
+        # frontend never exposes these by default). Treat 0 as "fall through
+        # to config default" — `or` does this naturally for both None and 0.
+        # Then max(1, ...) defends against negative or otherwise-falsy
+        # surprises. Without this, a heartbeat task created without explicit
+        # rounds was capped to 1 iteration: LLM uses it on a tool call, never
+        # gets to respond, loop exhausts silently. 2026-05-10 bug.
+        # Chaos scout #5/#10 (2026-04-20) protected against literal-0 cap-out
+        # but mistook the scheduler's 0-default as a real value — preserved
+        # the safety here by falling through to config defaults instead.
+        # context_limit IS different: 0 there legitimately means "unlimited"
+        # and the downstream `if context_limit > 0` check expects that.
+        _rounds = self.task_settings.get("max_tool_rounds") or config.MAX_TOOL_ITERATIONS
+        max_iterations = max(1, _rounds)
+        _parallel = self.task_settings.get("max_parallel_tools") or config.MAX_PARALLEL_TOOLS
+        max_parallel = max(1, _parallel)
         _ctx = self.task_settings.get("context_limit")
         context_limit = _ctx if _ctx is not None else getattr(config, 'CONTEXT_LIMIT', 0)
 
+        # Tool schemas are part of the actual API payload, so they MUST be
+        # included in the budget. Without this, a task with 158 tools loaded
+        # blows past the provider context cap even when message-content trim
+        # claims things are fine. Reported in the wild 2026-05-05 — a heartbeat
+        # with a heavy toolset hit this and produced an empty bubble. Trim of
+        # message content can't free schema bytes; the user has to either
+        # reduce the toolset or raise context_limit. Surfacing both numbers
+        # in the error message tells them which lever to pull.
+        from core.chat.history import count_tokens
+        tool_schema_tokens = 0
+        if self.tools:
+            try:
+                import json as _json
+                tool_schema_tokens = sum(
+                    count_tokens(_json.dumps(t, ensure_ascii=False))
+                    for t in self.tools
+                )
+            except Exception:
+                # Rough fallback if a tool schema isn't JSON-serializable
+                tool_schema_tokens = len(self.tools) * 100
+
         logger.info(f"[ExecCtx] Running: provider='{self.provider_key}', "
-                     f"tools={len(self.tools) if self.tools else 0}, "
+                     f"tools={len(self.tools) if self.tools else 0} "
+                     f"(~{tool_schema_tokens} schema tokens), "
                      f"history={len(history_messages) if history_messages else 0} msgs")
         final_content = None
 
@@ -290,8 +317,8 @@ class ExecutionContext:
             # orphaned tool-result heads, retry under 80% of limit, and only
             # give up with a specific reason if trim can't help.
             if context_limit > 0:
-                from core.chat.history import count_tokens
-                total_tokens = sum(count_tokens(str(m.get("content", ""))) for m in messages)
+                msg_tokens = sum(count_tokens(str(m.get("content", ""))) for m in messages)
+                total_tokens = msg_tokens + tool_schema_tokens
                 if total_tokens > context_limit * 0.9:
                     sys_idx = 1 if messages and messages[0].get("role") == "system" else 0
                     non_system = len(messages) - sys_idx
@@ -305,17 +332,35 @@ class ExecutionContext:
                         # just got dropped (would become orphan at LLM call time)
                         if len(messages) > sys_idx and messages[sys_idx].get("role") == "assistant" and messages[sys_idx].get("tool_calls"):
                             messages.pop(sys_idx)
-                        new_total = sum(count_tokens(str(m.get("content", ""))) for m in messages)
+                        new_msg_tokens = sum(count_tokens(str(m.get("content", ""))) for m in messages)
+                        new_total = new_msg_tokens + tool_schema_tokens
                         logger.warning(
                             f"[ExecCtx] Context trim: dropped ~{drop} oldest msgs "
-                            f"({total_tokens} → {new_total} tokens, limit {context_limit})"
+                            f"({total_tokens} → {new_total} tokens, "
+                            f"limit {context_limit}; tool schemas {tool_schema_tokens})"
                         )
                         total_tokens = new_total
+                        msg_tokens = new_msg_tokens
                     if total_tokens > context_limit * 0.9:
                         # Trim couldn't rescue this turn — give a specific reason
+                        # that points at the actual lever to pull. With heavy
+                        # toolsets, schemas often exceed the limit on their own
+                        # and clearing chat history won't help.
+                        n_tools = len(self.tools) if self.tools else 0
+                        if tool_schema_tokens > context_limit * 0.7:
+                            advice = (
+                                f"Toolset is too large for this context_limit "
+                                f"({n_tools} tools = {tool_schema_tokens} schema tokens). "
+                                f"Reduce toolset size or raise context_limit."
+                            )
+                        else:
+                            advice = (
+                                f"Clear older chat history or raise context_limit."
+                            )
                         overflow_reason = (
-                            f"(Context overflow — {total_tokens}/{context_limit} tokens even after "
-                            f"trim. Clear older chat history or raise this task's context_limit.)"
+                            f"(Context overflow — {total_tokens}/{context_limit} tokens "
+                            f"({msg_tokens} messages + {tool_schema_tokens} tool schemas "
+                            f"from {n_tools} tools). {advice})"
                         )
                         logger.error(f"[ExecCtx] {overflow_reason}")
                         break
@@ -327,9 +372,13 @@ class ExecutionContext:
             if response_msg.has_tool_calls:
                 filtered = filter_to_thinking_only(response_msg.content or "")
                 tool_calls = response_msg.get_tool_calls_as_dicts()[:max_parallel]
+                # Carry `thinking` for DeepSeek-reasoner round-trip on next
+                # iteration; harmless for other providers. 2026-05-14.
+                _thinking = getattr(response_msg, "thinking", None)
                 messages.append({
                     "role": "assistant", "content": filtered,
-                    "tool_calls": tool_calls
+                    "tool_calls": tool_calls,
+                    "thinking": _thinking,
                 })
                 self.tool_log.extend(tc.get('function', {}).get('name', '?') for tc in tool_calls)
                 # Cap at source: a runaway agent can append thousands. The
@@ -342,7 +391,7 @@ class ExecutionContext:
                     allowed_tools=self._allowed_tool_names
                 )
                 if tool_images:
-                    _inject_tool_images(messages, tool_images)
+                    _inject_tool_images(messages, tool_images, self.provider)
                 logger.info(f"[ExecCtx] Loop {i+1}: {tools_executed} tools executed")
                 # If the LLM requested tool calls but NONE executed (hallucinated
                 # tool names filtered out by allowed_tools, every call rejected),
@@ -371,14 +420,25 @@ class ExecutionContext:
                         allowed_tools=self._allowed_tool_names
                     )
                     if tool_images:
-                        _inject_tool_images(messages, tool_images)
+                        _inject_tool_images(messages, tool_images, self.provider)
                     continue
 
                 final_content = response_msg.content
                 messages.append({"role": "assistant", "content": final_content})
                 break
             else:
-                logger.warning("[ExecCtx] Empty response from LLM")
+                # Provider returned no content AND no tool_calls. This is
+                # rare but happens with some smaller / quantized models or
+                # when a provider trims to fit its own input cap and has
+                # no budget left for output. Without setting degraded_reason
+                # the empty assistant message hits the chat with no signal
+                # to the user — surface the cause via metadata. Scout 2 #3.
+                self.degraded_reason = (
+                    "LLM returned empty content with no tool calls "
+                    "(provider may have hit its own input cap or model "
+                    "produced no output)."
+                )
+                logger.warning(f"[ExecCtx] {self.degraded_reason}")
                 break
 
         # Before synthesizing a final placeholder, inject tool-result placeholders
@@ -424,10 +484,24 @@ class ExecutionContext:
                     # Insert placeholders right after the last real tool response
                     # (or right after the asst if there are none), preserving order.
                     pos = insert_after + 1
+                    # Map tool_call_id -> function name from the asst(tc) so the
+                    # placeholder carries `name`. history.get_messages_for_llm
+                    # used to do msg["name"] (KeyError → swallowed → empty
+                    # history return). Reader is fixed too, but writing the
+                    # field is the right thing — keeps persisted history
+                    # well-formed for any other consumer. 2026-05-10.
+                    name_by_id = {}
+                    for tc in tcs:
+                        if isinstance(tc, dict):
+                            tc_id = tc.get("id")
+                            fn_name = (tc.get("function") or {}).get("name", "tool")
+                            if tc_id:
+                                name_by_id[tc_id] = fn_name
                     for tc_id in missing:
                         messages.insert(pos, {
                             "role": "tool",
                             "tool_call_id": tc_id,
+                            "name": name_by_id.get(tc_id, "tool"),
                             "content": "(Tool did not execute — loop exhausted before resolution.)",
                         })
                         pos += 1

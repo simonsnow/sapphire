@@ -1008,8 +1008,16 @@ def _update_goal(goal_id, scope='default', **kwargs):
         updates.append('updated_at = ?')
         params.append(datetime.now().isoformat())
         params.append(goal_id)
+        params.append(scope)
 
-        cursor.execute(f'UPDATE goals SET {", ".join(updates)} WHERE id = ?', params)
+        # Belt-and-suspenders scope guard. `_validate_goal_exists` above
+        # already filtered by scope, but add it on the UPDATE itself to
+        # close the TOCTOU window where another connection could repurpose
+        # the id between validate and write. Day-ruiner scout 2026-05-07 #F.
+        cursor.execute(
+            f'UPDATE goals SET {", ".join(updates)} WHERE id = ? AND scope = ?',
+            params
+        )
 
         # Append progress note
         if progress_note:
@@ -1087,14 +1095,22 @@ def _delete_goal(goal_id, cascade=True, scope='default'):
         cursor.execute('DELETE FROM goal_progress WHERE goal_id = ?', (goal_id,))
 
         if subtask_count > 0 and cascade:
-            # Delete subtask progress notes too
+            # Delete subtask progress notes too — scope-bound to the parent's
+            # scope. Without `AND scope=?`, a cascade wipes children in any
+            # scope, which can happen if a parent_id is shared across scopes
+            # (manual db edit, restore-from-backup id collision). Day-ruiner
+            # scout 2026-05-07 #F.
             cursor.execute(
-                'DELETE FROM goal_progress WHERE goal_id IN (SELECT id FROM goals WHERE parent_id = ?)',
-                (goal_id,)
+                'DELETE FROM goal_progress WHERE goal_id IN '
+                '(SELECT id FROM goals WHERE parent_id = ? AND scope = ?)',
+                (goal_id, scope)
             )
-            cursor.execute('DELETE FROM goals WHERE parent_id = ?', (goal_id,))
+            cursor.execute(
+                'DELETE FROM goals WHERE parent_id = ? AND scope = ?',
+                (goal_id, scope)
+            )
 
-        cursor.execute('DELETE FROM goals WHERE id = ?', (goal_id,))
+        cursor.execute('DELETE FROM goals WHERE id = ? AND scope = ?', (goal_id, scope))
         conn.commit()
 
     sub_note = ""

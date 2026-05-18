@@ -67,12 +67,28 @@
 **Wake word not triggering**
 - Check which wakeword you are using in settings
 - Make sure you pip installed install/requirements-wakeword.txt
-- Check wakeword is enabled in settings, reboot app after
+- Wake word is enabled in settings (the model setting now hot-reloads — no restart needed)
 - Turn your mic volume up to 70-100%
 - Set system mic to the mic you want wakeword on
 - Try using Hey Mycroft as a wakeword instead of Hey Sapphire
 - Reduce sensitivity threshold to 0.5
 - Test a different mic
+
+**Switching to a different built-in wake word (`hey_mycroft`, `hey_jarvis`, `alexa`, etc.) didn't take effect**
+- Older Sapphire versions required a full app restart after changing `WAKEWORD_MODEL` — the running detector didn't reload. Fixed: the model now hot-swaps when you save the setting.
+- If you're on a build from before the fix, restart Sapphire once after the model change.
+- First time you select a new built-in, OpenWakeWord downloads the model (`hey_mycroft_v0.1.onnx` etc.) into its package directory — give it a few seconds before testing.
+
+**Adding a custom wake word**
+- Drop your `.onnx` or `.tflite` model into `user/wakeword/models/` and select it from the wakeword dropdown in settings.
+- The dropdown name is the **filename stem** — `my_word.onnx` shows up as `my_word`.
+- Built-in OpenWakeWord set: `alexa`, `hey_mycroft`, `hey_jarvis`, `hey_rhasspy`, `timer`, `weather`. Sapphire ships with `hey_sapphire`.
+
+**Training your own wake word**
+- OpenWakeWord (the engine Sapphire uses) supports custom-trained models. Project + training instructions: <https://github.com/dscripka/openWakeWord>
+- Fastest path is the official Colab notebook in that repo — generates a model from a phrase in ~1 hour, no audio recording required (it synthesizes training data with TTS).
+- Output is a `.onnx` file. Drop it into `user/wakeword/models/` and pick it from the dropdown.
+- For phrase quality tips and threshold tuning, see the `openWakeWord` docs and issues — the Sapphire side is just a thin loader.
 
 ## Prompt issues
 **If you broke your default prompts**
@@ -272,3 +288,48 @@ docker compose up -d
 The Docker container's config dir is ephemeral — password resets automatically when the container is recreated.
 
 You'll need to re-run setup and reconfigure settings.
+
+---
+
+## Boot crash with `malloc(): invalid size` on Linux (multi-GPU systems)
+
+**Symptom:** Sapphire crashes immediately at startup on a fresh install. Last log lines show wakeword model loading successfully, then:
+
+```
+Wakeword hot-started successfully
+malloc(): invalid size (unsorted)
+Fatal Python error: Aborted
+```
+
+The crash is in C-extension code (no Python traceback), and it's deterministic — happens every boot. Manually toggling wake word ON *after* boot works fine.
+
+**Cause:** Two separate audio libraries both default to GPU 0 and initialize at the same time:
+
+- **Kokoro** (TTS) loads as a subprocess, picks `cuda:0` by default
+- **Whisper** (STT) loads in the main process, defaults to `cuda:0`
+
+When both grab the same GPU during the boot init storm, their CUDA contexts conflict and corrupt the heap. The next allocation (often inside the wakeword model's first audio buffer) trips glibc's malloc integrity check and the process aborts.
+
+After boot, manually toggling features works because only one library initializes at a time — no concurrent grab.
+
+**Fix on multi-GPU systems:** put TTS and STT on different cards.
+
+In your settings (`user/settings.json` or via the Settings UI):
+
+```json
+{
+  "FASTER_WHISPER_CUDA_DEVICE": 0,
+  "KOKORO_CUDA_DEVICE": "1"
+}
+```
+
+`KOKORO_CUDA_DEVICE` accepts the device index as a string. It sets `CUDA_VISIBLE_DEVICES` on the Kokoro subprocess at the OS level, so Kokoro physically can't see the other GPU. Whisper uses `FASTER_WHISPER_CUDA_DEVICE` directly via PyTorch.
+
+Restart Sapphire after changing these. Verify in `user/logs/sapphire.log`:
+
+```
+Kokoro subprocess pinned to CUDA_VISIBLE_DEVICES=1
+Using CUDA device 0 (NVIDIA ...)   ← whisper
+```
+
+**Single-GPU systems:** leave both at default (empty `KOKORO_CUDA_DEVICE`, `FASTER_WHISPER_CUDA_DEVICE=0`). The race is less common with deferred-action sequencing (already in place for the boot init order), and there's no second GPU to escape to. If you still hit the crash, disable wake word at boot and toggle it on manually after Sapphire is up — that bypasses the concurrent-init window entirely.

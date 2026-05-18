@@ -69,6 +69,7 @@ class ProviderRegistry(_BaseRegistry):
                 'required_fields': ['api_key', 'model'],
                 'optional_fields': ['timeout'],
                 'model_options': {
+                    'claude-opus-4-7': 'Opus 4.7',
                     'claude-opus-4-6': 'Opus 4.6',
                     'claude-sonnet-4-6': 'Sonnet 4.6',
                     'claude-sonnet-4-5': 'Sonnet 4.5',

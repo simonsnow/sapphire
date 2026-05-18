@@ -7,9 +7,13 @@ import { createCameraOrbitSystem } from './camera-orbits.js';
 import { createPlayerController } from './player-controller.js';
 import { createMissileCommand } from './missile-command.js';
 
-const THREE_CDN = 'https://esm.sh/three@0.170.0';
-const GLTF_CDN = 'https://esm.sh/three@0.170.0/addons/loaders/GLTFLoader.js';
-const ORBIT_CDN = 'https://esm.sh/three@0.170.0/addons/controls/OrbitControls.js';
+// Routed through Sapphire's /cdn-cache/ proxy — first request fetches from
+// esm.sh and saves to user/cdn_cache/, subsequent serves from disk. ?bundle
+// inlines all internal deps so the cached file is self-contained (otherwise
+// internal esm.sh imports would still hit the CDN). 2026-05-13.
+const THREE_CDN = '/cdn-cache/esm.sh/three@0.170.0?bundle&target=es2022';
+const GLTF_CDN  = '/cdn-cache/esm.sh/three@0.170.0/addons/loaders/GLTFLoader.js?bundle&target=es2022&external=three';
+const ORBIT_CDN = '/cdn-cache/esm.sh/three@0.170.0/addons/controls/OrbitControls.js?bundle&target=es2022&external=three';
 const CROSSFADE_MS = 400;
 
 // Hardcoded fallback defaults (used when no config exists)
@@ -77,9 +81,18 @@ const TRANSITIONS = {
 
 // Track cleanup between sidebar reloads
 let _cleanup = null;
+// Monotonic init token. Bumped on each init() entry. The setup body is
+// async — without a token, two concurrent loadSidebar()/init() calls (chat
+// switch + SPICE_CHANGED + PROMPT_DELETED fire in burst) both see _cleanup
+// as null (the first hasn't assigned yet because its setup is mid-flight)
+// and both run full WebGL + observer + RAF setup. The earlier one's
+// resources get orphaned, leaking WebGL contexts toward the browser cap.
+// Token check at end of init() lets only the latest entry win. 2026-05-14.
+let _initToken = 0;
 
 export async function init(container) {
     if (_cleanup) _cleanup();
+    const myToken = ++_initToken;
 
     const canvas = container.querySelector('#avatar-canvas');
     const statusEl = container.querySelector('#avatar-status');
@@ -150,7 +163,7 @@ export async function init(container) {
     document.addEventListener('fullscreenchange', _onFsChange);
 
     // Early cleanup — covers cases where Three.js or model loading fails
-    _cleanup = () => {
+    const _earlyCleanup = () => {
         clearInterval(_micPoll);
         _chatUnsubs.forEach(fn => fn());
         document.removeEventListener('keydown', _onEscKey);
@@ -159,8 +172,15 @@ export async function init(container) {
             displayEl.classList.remove('avatar-fullwindow');
             canvas.style.height = '280px';
         }
-        _cleanup = null;
+        if (_cleanup === _earlyCleanup) _cleanup = null;
     };
+    // Stale-init guard: another init() may have entered while this one was
+    // running. If our token isn't current, tear down what we built and abort.
+    if (myToken !== _initToken) {
+        _earlyCleanup();
+        return;
+    }
+    _cleanup = _earlyCleanup;
 
     // --- Fullwindow STT mic ---
     let _micPoll = null;
@@ -799,7 +819,7 @@ export async function init(container) {
     animate();
 
     // Cleanup
-    _cleanup = () => {
+    const _thisCleanup = () => {
         running = false;
         clearTimeout(resetTimer);
         clearTimeout(idleTimer);
@@ -820,13 +840,39 @@ export async function init(container) {
             displayEl.classList.remove('avatar-fullwindow');
             canvas.style.height = '280px';
         }
-        _cleanup = null;
+        if (_cleanup === _thisCleanup) _cleanup = null;
     };
 
+    // Stale-init guard: if another init() entered while this one was building
+    // (rapid sidebar reload bursts), abandon THIS instance — teardown the
+    // resources we just created and don't overwrite the newer instance's
+    // _cleanup. Without this, both instances run concurrently, both register
+    // observers + RAF loops, and the earlier one leaks. 2026-05-14.
+    if (myToken !== _initToken) {
+        _thisCleanup();
+        return;
+    }
+    _cleanup = _thisCleanup;
+
+    // Debounced disposal — a brief detach during framework DOM rebuild
+    // (sidebar accordion refresh, view switch) should NOT permanently dispose
+    // the WebGL context. Only treat detachment as final after 1s. Previously
+    // any momentary detach killed the avatar irreversibly. 2026-05-13.
+    let _detachTimer = null;
     const observer = new MutationObserver(() => {
         if (!document.contains(canvas)) {
-            if (_cleanup) _cleanup();
-            observer.disconnect();
+            if (!_detachTimer) {
+                _detachTimer = setTimeout(() => {
+                    _detachTimer = null;
+                    if (!document.contains(canvas)) {
+                        if (_cleanup) _cleanup();
+                        observer.disconnect();
+                    }
+                }, 1000);
+            }
+        } else if (_detachTimer) {
+            clearTimeout(_detachTimer);
+            _detachTimer = null;
         }
     });
     observer.observe(container.parentElement || document.body, { childList: true, subtree: true });

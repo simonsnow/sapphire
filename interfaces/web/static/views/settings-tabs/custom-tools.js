@@ -37,7 +37,9 @@ export default {
             const label = toolName.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
             const rows = entries.map(e => {
                 const isOverridden = ctx.overrides.includes(e.key);
-                const value = ctx.settings[e.key] !== undefined ? ctx.settings[e.key] : e.value;
+                // Use ctx.getValue so unsaved pendingChanges survive tab switches
+                const stored = ctx.getValue(e.key);
+                const value = stored !== undefined ? stored : e.value;
                 const isFullWidth = typeof value === 'boolean';
                 return `
                     <div class="setting-row${isOverridden ? ' overridden' : ''}${isFullWidth ? ' full-width' : ''}" data-key="${e.key}">

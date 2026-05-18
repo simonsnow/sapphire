@@ -1,3 +1,26 @@
+# 2.6.5 - Silero VAD
+- Vastly improved VAD
+- Wakeword speech cuts off at right times now
+- Bug fix for tools in toolset not being reachable
+# 2.6.4 - Ghost Message
+- Ghost messages are invisible message sent to AI and they work with caching
+- Spices and time shifted to new ghost messages
+- Ghost message hook added for plugins
+- 33 bug fixes on tts/stt
+- Featured plugins are special layout now
+# 2.6.3 - Settings Dashboard
+- Settings Hero box with animations and widgets
+- Plugins now support widgets for Settings Dashboard Hero
+- Added recommended plugins to Dashboard
+# 2.6.2 - Plugin Store
+- Brought plugin store to the app
+- Featured plugins feature
+# 2.6.1 - Plugin page and fixes
+- New plugin page
+- Default wakewords load properly now
+- totally blank prompts allowed
+- self info plugin expanded, custom commands
+- Fixed cache % calculation on Claude
 # 2.6.0 - Scopes
 - Collective update from 2.5.0
 - Improved core and plugins instead of expanding

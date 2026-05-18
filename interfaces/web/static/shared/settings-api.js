@@ -78,7 +78,20 @@ export function parseValue(value, originalValue) {
         const parsed = parseFloat(value);
         return isNaN(parsed) ? originalValue : parsed;
     }
-    if (typeof originalValue === 'object') {
+    // `typeof null === 'object'` in JavaScript (legacy quirk). A null default
+    // means "no canonical type" — typically a polymorphic setting that can hold
+    // null, a string, or a number depending on user choice (e.g. audio device).
+    // Don't try to JSON.parse the value — pass it through and let the backend
+    // accept whatever type the UI control produces. 2026-05-16 fix.
+    if (originalValue !== null && typeof originalValue === 'object') {
+        // If value is ALREADY an object/array (came from a custom control via
+        // ctx.markChanged with a JS structure rather than a serialized string),
+        // pass it through — JSON.parse would coerce arrays to comma-strings
+        // via .toString() and throw, breaking the whole save batch. The
+        // backend accepts the parsed structure natively. Privacy whitelist
+        // (network.js) is the canonical case — its markChanged passes a JS
+        // array, not a string. 2026-05-16 fix.
+        if (value !== null && typeof value === 'object') return value;
         try { return JSON.parse(value); }
         catch { throw new Error('Invalid JSON'); }
     }

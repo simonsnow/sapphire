@@ -19,17 +19,11 @@ async function loadApps() {
 }
 
 function renderGrid(container) {
-    if (appsData.length === 0) {
-        container.innerHTML = `
-            <div class="view-placeholder">
-                <h2>Apps</h2>
-                <p style="color:var(--text-muted)">No plugin apps installed.</p>
-                <p style="color:var(--text-muted);font-size:var(--font-sm)">
-                    Plugins can ship full-page apps. Check the plugin docs for details.
-                </p>
-            </div>`;
-        return;
-    }
+    const ghostTile = `
+        <button class="app-tile app-tile-ghost" data-action="get-more">
+            <span class="app-tile-icon">+</span>
+            <span class="app-tile-label">Get More Apps</span>
+        </button>`;
 
     container.innerHTML = `
         <div class="apps-page">
@@ -44,12 +38,15 @@ function renderGrid(container) {
                         ${app.description ? `<span class="app-tile-desc">${_esc(app.description)}</span>` : ''}
                     </button>
                 `).join('')}
+                ${ghostTile}
             </div>
         </div>`;
 
-    container.querySelectorAll('.app-tile').forEach(tile => {
+    container.querySelectorAll('.app-tile[data-app]').forEach(tile => {
         tile.addEventListener('click', () => openApp(tile.dataset.app, container));
     });
+
+    container.querySelector('[data-action="get-more"]')?.addEventListener('click', () => switchView('store'));
 }
 
 async function openApp(appName, container) {

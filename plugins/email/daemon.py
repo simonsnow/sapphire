@@ -153,14 +153,22 @@ def _get_snippet(msg) -> str:
     return ""
 
 
-def _imap_connect(creds):
-    """Connect and authenticate to IMAP. Handles both password and OAuth2."""
+def _imap_connect(account_scope, creds):
+    """Connect and authenticate to IMAP. Handles both password and OAuth2.
+
+    `account_scope` is the credentials-manager scope name for THIS account
+    (e.g. 'work', 'personal'). Required so that OAuth refresh writes the
+    rotated tokens to the correct scope's record. Pre-fix, refresh used
+    address-matching to look up the scope, which wrote tokens to the
+    wrong scope when two scopes legitimately shared an address (shared
+    mailbox in work + personal). Day-ruiner scout 2026-05-07 #I.
+    """
     imap = imaplib.IMAP4_SSL(creds["imap_server"], int(creds.get("imap_port", 993)))
     if creds.get("auth_type") == "oauth2":
         # Refresh token if needed
         oauth_expires = creds.get("oauth_expires_at", 0)
         if time.time() > oauth_expires - 60:
-            creds = _refresh_oauth(creds)
+            creds = _refresh_oauth(account_scope, creds)
             if not creds:
                 raise RuntimeError("OAuth token refresh failed")
         auth_string = f"user={creds['address']}\x01auth=Bearer {creds['oauth_access_token']}\x01\x01"
@@ -170,47 +178,71 @@ def _imap_connect(creds):
     return imap
 
 
-def _refresh_oauth(creds):
-    """Refresh OAuth2 token. Returns updated creds or None."""
+def _refresh_oauth(account_scope, creds):
+    """Refresh OAuth2 token. Returns updated creds or None.
+
+    Writes rotated tokens directly to `account_scope` rather than looking
+    up the scope by address-match (which wrote to the wrong scope's record
+    when two scopes shared an address). Day-ruiner scout 2026-05-07 #I.
+
+    Acquires the per-scope refresh lock (shared with the tool-call path
+    via `email_tool._lock_for`) so daemon poll + tool call can't both
+    refresh the same scope concurrently and clobber each other's rotated
+    refresh_token. Day-ruiner scout 2026-05-07 #D.
+    """
     import requests as http_requests
     from core.credentials_manager import credentials
+    from plugins.email.tools.email_tool import _lock_for
 
     tenant = creds.get("oauth_tenant_id", "common")
     token_url = f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
     scope = creds.get("oauth_scope", "https://outlook.office365.com/IMAP.AccessAsUser.All offline_access")
 
-    try:
-        resp = http_requests.post(token_url, data={
-            "client_id": creds["oauth_client_id"],
-            "client_secret": creds.get("oauth_client_secret", ""),
-            "refresh_token": creds["oauth_refresh_token"],
-            "grant_type": "refresh_token",
-            "scope": scope,
-        }, timeout=15)
-        resp.raise_for_status()
-        tokens = resp.json()
+    with _lock_for(account_scope):
+        # Re-read creds inside the lock — another thread may have refreshed
+        # while we waited. Skip the refresh if our token is now fresh.
+        try:
+            fresh = credentials.get_email_account(account_scope)
+            if fresh and fresh.get("oauth_expires_at", 0) > time.time() + 60:
+                creds["oauth_access_token"] = fresh["oauth_access_token"]
+                creds["oauth_expires_at"] = fresh["oauth_expires_at"]
+                if fresh.get("oauth_refresh_token"):
+                    creds["oauth_refresh_token"] = fresh["oauth_refresh_token"]
+                logger.debug(f"[EMAIL] Refresh skipped — another thread rotated for scope '{account_scope}'")
+                return creds
+        except Exception:
+            pass
 
-        access_token = tokens["access_token"]
-        expires_at = time.time() + tokens.get("expires_in", 3600)
-        new_refresh = tokens.get("refresh_token", "")
+        try:
+            resp = http_requests.post(token_url, data={
+                "client_id": creds["oauth_client_id"],
+                "client_secret": creds.get("oauth_client_secret", ""),
+                "refresh_token": creds["oauth_refresh_token"],
+                "grant_type": "refresh_token",
+                "scope": scope,
+            }, timeout=15)
+            resp.raise_for_status()
+            tokens = resp.json()
 
-        # Find scope name for this account
-        for acct in credentials.list_email_accounts():
-            if acct["address"] == creds["address"]:
-                credentials.update_email_oauth_tokens(acct["scope"], access_token, expires_at, new_refresh)
-                break
+            access_token = tokens["access_token"]
+            expires_at = time.time() + tokens.get("expires_in", 3600)
+            new_refresh = tokens.get("refresh_token", "")
 
-        creds["oauth_access_token"] = access_token
-        creds["oauth_expires_at"] = expires_at
-        return creds
-    except Exception as e:
-        logger.error(f"[EMAIL] OAuth refresh failed: {e}")
-        return None
+            credentials.update_email_oauth_tokens(account_scope, access_token, expires_at, new_refresh)
+
+            creds["oauth_access_token"] = access_token
+            creds["oauth_expires_at"] = expires_at
+            if new_refresh:
+                creds["oauth_refresh_token"] = new_refresh
+            return creds
+        except Exception as e:
+            logger.error(f"[EMAIL] OAuth refresh failed: {e}")
+            return None
 
 
 def _check_account(scope: str, creds: dict):
     """Check one account for new UNSEEN mail. Emit events for each new message."""
-    imap = _imap_connect(creds)
+    imap = _imap_connect(scope, creds)
     try:
         imap.select("INBOX", readonly=True)
         _, data = imap.uid("search", None, "UNSEEN")
@@ -321,10 +353,11 @@ def _reply_handler(task, event_data: dict, response_text: str):
             logger.warning(f"[EMAIL] Reply handler: no credentials for account '{account}'")
             return
 
-        # Refresh OAuth if needed
+        # Refresh OAuth if needed — `account` is the scope name passed in
+        # by the daemon dispatch path, used directly for the refresh write.
         if creds.get("auth_type") == "oauth2":
             if time.time() > creds.get("oauth_expires_at", 0) - 60:
-                creds = _refresh_oauth(creds)
+                creds = _refresh_oauth(account, creds)
                 if not creds:
                     logger.error("[EMAIL] Reply handler: OAuth refresh failed")
                     return

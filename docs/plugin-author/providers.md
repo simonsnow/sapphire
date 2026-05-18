@@ -151,13 +151,22 @@ Optional methods:
 from core.stt.providers.base import BaseSTTProvider
 
 class MyProvider(BaseSTTProvider):
-    def transcribe_file(self, audio_path: str) -> str | None:
-        """Transcribe an audio file. Return text or None."""
+    def _transcribe_impl(self, audio_path: str) -> str | None:
+        """Transcribe an audio file. Return raw text or None.
+
+        Do NOT apply the Whisper hallucination filter here — the base
+        class's concrete `transcribe_file()` wraps your impl and filters
+        the result automatically (since 2.6.4). That way wakeword,
+        browser STT, and any future continuous-listen consumer all get
+        filtered output uniformly without each having to remember.
+        """
         ...
 
     def is_available(self) -> bool:
         ...
 ```
+
+**Important:** providers implement `_transcribe_impl` (abstract). The base class's concrete `transcribe_file()` is what every consumer of the STT system calls — it invokes `_transcribe_impl`, runs the result through `is_whisper_hallucination()` (`core/stt/hallucination.py`), and returns `None` for known canned-phrase hallucinations like `"Thank you"`, `"[music]"`, `"Thanks for watching"` that Whisper produces on silence/noise. Your provider should NOT also filter — that would double-filter and possibly hide useful text.
 
 ### Embedding — `BaseEmbeddingProvider`
 

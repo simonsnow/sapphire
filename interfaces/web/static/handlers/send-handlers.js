@@ -60,6 +60,14 @@ export async function handleSend() {
     try {
         let streamOk = false;
         const audioFn = getTtsEnabled() ? audio.playText : null;
+        // Stream-id capture: Stop→immediate-Send can leave OLD stream's
+        // trailing chunks in the SSE pipeline. They'd previously land on
+        // the NEW message's DOM (visible content bleed). Capture ui's
+        // stream-id at the moment WE call startStreaming; later UI calls
+        // bail if the id changed (another startStreaming/cancelStreaming
+        // happened in between). 2026-05-14.
+        let myStreamId = -1;
+        const streamStillMine = () => myStreamId !== -1 && ui.getCurrentStreamId() === myStreamId;
 
         await api.streamChat(
             txt,
@@ -67,8 +75,10 @@ export async function handleSend() {
                 if (!streamOk) {
                     ui.updateStatus('Generating...');
                     ui.startStreaming();
+                    myStreamId = ui.getCurrentStreamId();
                     streamOk = true;
                 }
+                if (!streamStillMine()) return;  // a newer stream took over — drop this chunk
                 ui.appendStream(chunk);
                 // Hide status once actual visible content appears
                 if (ui.hasVisibleContent()) {
@@ -120,11 +130,14 @@ export async function handleSend() {
                 if (!streamOk) {
                     ui.updateStatus('Generating...');
                     ui.startStreaming();
+                    myStreamId = ui.getCurrentStreamId();
                     streamOk = true;
                 }
+                if (!streamStillMine()) return;
                 ui.startTool(id, name, args);
             },
             (id, name, result, error) => {
+                if (!streamStillMine()) return;
                 ui.endTool(id, name, result, error);
             },
             // Stream started handler

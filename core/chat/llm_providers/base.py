@@ -128,6 +128,13 @@ class LLMResponse:
     tool_calls: List[ToolCall] = field(default_factory=list)
     finish_reason: Optional[str] = None
     usage: Optional[Dict[str, int]] = None  # {prompt_tokens, completion_tokens, total_tokens}
+    # Raw reasoning content (DeepSeek-reasoner, Fireworks reasoning models, etc.)
+    # exposed separately so the assistant-with-tool_calls message dict can carry
+    # `thinking` for the DeepSeek-official round-trip sanitizer to find. Without
+    # this, the in-memory messages list omits `thinking`, the sanitizer never
+    # emits `reasoning_content`, and the next API call after tool execution
+    # fails with 400 "Missing reasoning_content field". 2026-05-14.
+    thinking: Optional[str] = None
     
     @property
     def has_tool_calls(self) -> bool:

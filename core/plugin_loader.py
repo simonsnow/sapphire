@@ -448,6 +448,48 @@ class PluginLoader:
         if tool_paths and self._function_manager:
             self._function_manager.register_plugin_tools(name, plugin_dir, tool_paths)
 
+        # Register dashboard widgets — same shape as other capabilities.
+        # Widget render modules are served at /plugin-web/{name}/{render_path}.
+        widgets = capabilities.get("widgets", [])
+        if widgets:
+            # Reserve plugin name 'core' for built-in widget registration.
+            # Registering a plugin under 'core' would merge its widgets with
+            # built-ins in the registry; unloading would wipe ALL built-ins.
+            # 2026-05-07 chaos-scout finding.
+            if name == "core":
+                logger.warning(
+                    f"[PLUGINS] plugin name 'core' is reserved for built-in widgets; "
+                    f"refusing to register widgets from plugin '{name}'"
+                )
+                widgets = []
+        if widgets:
+            try:
+                from core.dashboard_widgets import register_widget, WidgetSpec
+                for w in widgets:
+                    if not isinstance(w, dict):
+                        continue
+                    widget_id = w.get("id")
+                    if not widget_id:
+                        logger.warning(f"[PLUGINS] {name} widget missing 'id'; skipping")
+                        continue
+                    render_path = w.get("render", f"widgets/{widget_id}.js")
+                    register_widget(WidgetSpec(
+                        plugin=name,
+                        widget_id=widget_id,
+                        name=w.get("name", widget_id),
+                        render_url=f"/plugin-web/{name}/{render_path}",
+                        description=w.get("description", ""),
+                        icon=w.get("icon", ""),
+                        sizes=w.get("sizes", ["1x1"]),
+                        default_size=w.get("default_size", "1x1"),
+                        multi_instance=w.get("multi_instance", False),
+                        settings_schema=w.get("settings_schema", []) or [],
+                        api_version=w.get("api_version", 1),
+                    ))
+                logger.info(f"[PLUGINS] Registered {len(widgets)} widget(s) for {name}")
+            except Exception as e:
+                logger.warning(f"[PLUGINS] Widget registration failed for {name}: {e}")
+
         # Register HTTP routes
         routes = capabilities.get("routes", [])
         if routes:
@@ -680,11 +722,21 @@ class PluginLoader:
         return None
 
     def unload_plugin(self, name: str):
-        """Unload a plugin — deregister all hooks, tools, routes, providers, schedule tasks, event sources, and scopes."""
+        """Unload a plugin — deregister all hooks, tools, routes, providers, schedule tasks, event sources, scopes, and dashboard widgets."""
         hook_runner.unregister_plugin(name)
         if self._function_manager:
             self._function_manager.unregister_plugin_tools(name)
         self._unregister_routes(name)
+
+        # Unregister dashboard widgets contributed by this plugin.
+        # Refuse to touch the 'core' namespace — that's where built-ins live;
+        # blasting it would wipe System/Updates/Backups/Maintenance/Spotlight.
+        try:
+            from core.dashboard_widgets import unregister_plugin_widgets
+            if name != "core":
+                unregister_plugin_widgets(name)
+        except Exception as e:
+            logger.warning(f"[PLUGINS] {name}: failed to unregister widgets: {e}")
 
         # Unregister scopes this plugin contributed so a later manifest edit
         # with a different default takes effect on re-register instead of
@@ -740,6 +792,24 @@ class PluginLoader:
             if pkg:
                 import sys
                 sys.modules.pop(pkg, None)
+
+        # Evict plugin's lib/ modules from sys.modules so the next load picks
+        # up edited code instead of stale cache. Without this, hook files
+        # that do `from lib import X` get the old X even after re-exec
+        # because Python caches imports globally. 2026-05-13.
+        import sys as _sys
+        plugin_path = self._plugins.get(name, {}).get("path")
+        if plugin_path:
+            plugin_path_str = str(plugin_path)
+            evict = [
+                mod_name for mod_name, mod in list(_sys.modules.items())
+                if getattr(mod, "__file__", None)
+                and str(mod.__file__).startswith(plugin_path_str)
+            ]
+            for mod_name in evict:
+                _sys.modules.pop(mod_name, None)
+            if evict:
+                logger.info(f"[PLUGINS] Evicted {len(evict)} cached module(s) for {name}: {evict}")
 
         # Finalize state under lock
         with self._lock:
@@ -822,11 +892,17 @@ class PluginLoader:
             if should_load:
                 try:
                     self._load_plugin(name)
-                    # Re-enable tools in active toolset
+                    # Re-enable tools in active toolset. Capture the toolset
+                    # name UNDER the function_manager's tools lock so a
+                    # concurrent toolset save (dev-watcher fires while user
+                    # is mid-save) can't slip a stale name past us and
+                    # silently clobber their save. 2026-05-16.
                     if self._function_manager:
-                        current = self._function_manager.current_toolset_name
+                        fm = self._function_manager
+                        with fm._tools_lock:
+                            current = fm.current_toolset_name
                         if current:
-                            self._function_manager.update_enabled_functions([current])
+                            fm.update_enabled_functions([current])
                     logger.info(f"[PLUGINS] Reloaded: {name}")
                     from core.event_bus import publish, Events
                     publish(Events.PLUGIN_RELOADED, {"plugin": name})
@@ -1419,6 +1495,23 @@ class PluginLoader:
         )
         self._watcher_thread.start()
         logger.info("[PLUGINS] File watcher started (dev mode)")
+
+    def stop_all_daemons(self):
+        """Stop all loaded plugin daemons. Must be called before audio/system teardown."""
+        with self._lock:
+            daemon_items = [
+                (name, info.get("daemon_module"))
+                for name, info in self._plugins.items()
+                if info.get("loaded") and info.get("daemon_module")
+            ]
+
+        for name, daemon_mod in daemon_items:
+            if daemon_mod and hasattr(daemon_mod, "stop"):
+                try:
+                    daemon_mod.stop()
+                    logger.info(f"[PLUGINS] Stopped daemon for {name}")
+                except Exception as e:
+                    logger.warning(f"[PLUGINS] Failed to stop daemon for {name}: {e}")
 
     def stop_watcher(self):
         """Stop the file watcher."""

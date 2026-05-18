@@ -247,13 +247,22 @@ class ContinuityExecutor:
             if setting_key in task:
                 settings[setting_key] = task[setting_key]
             else:
-                settings[setting_key] = "default"
+                # Pre-2026-05-07 we wrote 'default' here. That defeated the
+                # force-None protection in ExecutionContext._build_scopes:
+                # by the time it ran, every scope key was already in
+                # task_settings, so the `if setting_key not in task_settings`
+                # branch was dead code. The "silent-default closed" comment
+                # was a lie — only the warning fired, the real protection
+                # was bypassed. Now we leave the key UNSET so _build_scopes
+                # can force-None it, disabling the scope for this task as
+                # designed. Wildcard scout 2026-05-07 finding (verified).
                 missing_scopes.append(setting_key)
         if missing_scopes:
             logger.warning(
                 f"[Continuity] Task '{task.get('name', '?')}' missing scope keys "
-                f"{missing_scopes} — defaulting to 'default' scope. Writes from "
-                f"this task land in shared memory. Edit the task to set explicit scopes."
+                f"{missing_scopes} — those scopes will be DISABLED for this run "
+                f"(force-None at task entry). Edit the task to set explicit scopes "
+                f"if writes from this task should land somewhere."
             )
         return settings
 
@@ -321,7 +330,6 @@ class ContinuityExecutor:
                     error_msg = f"Task failed: {friendly or e}"
                     logger.error(f"[Continuity] {error_msg}", exc_info=True)
                     result["errors"].append(error_msg)
-                    from core.event_bus import publish, Events
                     publish(Events.CONTINUITY_TASK_ERROR, {
                         "task": task.get("name", "Unknown"),
                         "error": friendly or str(e),
@@ -338,7 +346,6 @@ class ContinuityExecutor:
                 error_msg = f"Background task failed: {friendly or e}"
                 logger.error(f"[Continuity] {error_msg}", exc_info=True)
                 result["errors"].append(error_msg)
-                from core.event_bus import publish, Events
                 publish(Events.CONTINUITY_TASK_ERROR, {
                     "task": task.get("name", "Unknown"),
                     "error": friendly or str(e),
@@ -447,15 +454,46 @@ class ContinuityExecutor:
                 # Run through isolated ExecutionContext — no singleton contact
                 response = ctx.run(msg, history_messages=history_messages)
 
+                # If the run ended degraded (context overflow, tool exhaustion,
+                # empty LLM, hallucinated tools), the empty assistant message
+                # in ctx.new_messages is intentionally blank — Apr-24 fix kept
+                # error text out of TTS / Discord / Telegram. But the chat UI
+                # then renders a totally empty bubble with no signal to the
+                # user. Attach degraded_reason as metadata on the empty asst
+                # message so the frontend can render it as an italic system
+                # note. Frontend MUST keep this out of any speak/relay paths.
+                degraded = getattr(ctx, 'degraded_reason', None)
+                if degraded and ctx.new_messages:
+                    for _m in ctx.new_messages:
+                        if _m.get("role") == "assistant" and not _m.get("content"):
+                            _meta = dict(_m.get("metadata") or {})
+                            _meta["degraded_reason"] = degraded
+                            _m["metadata"] = _meta
+                            break
+
                 # Persist the FULL conversation (including tool calls + results)
                 # to the target chat. ctx.new_messages has everything generated
                 # during this run: user msg, assistant+tool_calls, tool results,
                 # and the final assistant response — not just the bookends.
+                # Convert wire-format tool results to canonical persistence
+                # shape first — Claude / Anthropic-compat providers emit tool
+                # results as `role=user` with list-content `tool_result` blocks
+                # which the frontend renderer can't display. Without this
+                # conversion every Claude-backed scheduled task corrupts its
+                # named chat with empty user bubbles. 2026-05-11.
                 if hasattr(ctx, 'new_messages') and ctx.new_messages:
-                    session_manager.append_messages_to_chat(target_chat, ctx.new_messages)
+                    from core.chat.chat_tool_calling import wire_to_canonical
+                    canonical_messages = wire_to_canonical(ctx.new_messages)
+                    session_manager.append_messages_to_chat(target_chat, canonical_messages)
                 else:
                     # Fallback to simple pair if new_messages not available
                     session_manager.append_to_chat(target_chat, msg, response or "")
+
+                if degraded:
+                    publish(Events.CONTINUITY_TASK_ERROR, {
+                        "task": task.get("name", "Unknown"),
+                        "error": degraded,
+                    })
 
                 if response_cb and response:
                     try: response_cb(response)
@@ -481,7 +519,6 @@ class ContinuityExecutor:
                 error_msg = f"Task failed: {friendly or e}"
                 logger.error(f"[Continuity] {error_msg}", exc_info=True)
                 result["errors"].append(error_msg)
-                from core.event_bus import publish, Events
                 publish(Events.CONTINUITY_TASK_ERROR, {
                     "task": task.get("name", "Unknown"),
                     "error": friendly or str(e),
@@ -498,7 +535,6 @@ class ContinuityExecutor:
             error_msg = f"Persistent chat task failed: {friendly or e}"
             logger.error(f"[Continuity] {error_msg}", exc_info=True)
             result["errors"].append(error_msg)
-            from core.event_bus import publish, Events
             publish(Events.CONTINUITY_TASK_ERROR, {
                 "task": task.get("name", "Unknown"),
                 "error": friendly or str(e),
@@ -576,7 +612,6 @@ class ContinuityExecutor:
         except Exception as e:
             logger.error(f"[Continuity] Plugin task '{task.get('name')}' failed: {e}", exc_info=True)
             result["errors"].append(str(e))
-            from core.event_bus import publish, Events
             publish(Events.CONTINUITY_TASK_ERROR, {
                 "task": task.get("name", "Unknown"),
                 "error": str(e),

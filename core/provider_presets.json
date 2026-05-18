@@ -25,10 +25,14 @@
       "base_url": "https://api.fireworks.ai/inference/v1",
       "api_key_env": "FIREWORKS_API_KEY",
       "suggested_models": [
+        {"id": "accounts/fireworks/models/deepseek-v4-pro", "name": "DeepSeek V4 Pro"},
         {"id": "accounts/fireworks/models/deepseek-v3p2", "name": "DeepSeek V3.2"},
+        {"id": "accounts/fireworks/models/qwen3p6-plus", "name": "Qwen3.6 Plus"},
         {"id": "accounts/fireworks/models/qwen3-235b-a22b-thinking-2507", "name": "Qwen3 235B Thinking"},
         {"id": "accounts/fireworks/models/qwen3-coder-480b-a35b-instruct", "name": "Qwen3 Coder 480B"},
+        {"id": "accounts/fireworks/models/kimi-k2p6", "name": "Kimi K2.6"},
         {"id": "accounts/fireworks/models/kimi-k2-thinking", "name": "Kimi K2 Thinking"},
+        {"id": "accounts/fireworks/models/gemma-4-31b-it", "name": "Gemma 4 31B"},
         {"id": "accounts/fireworks/models/glm-5", "name": "GLM 5"},
         {"id": "accounts/fireworks/models/glm-4p7", "name": "GLM 4.7"},
         {"id": "accounts/fireworks/models/minimax-m2p5", "name": "MiniMax M2.5"},
@@ -51,6 +55,17 @@
         {"id": "meta-llama/Llama-3.3-70B-Instruct", "name": "Llama 3.3 70B"}
       ],
       "generation_defaults": {"temperature": 0.75, "top_p": 0.9, "max_tokens": 4096}
+    },
+    "deepseek_official": {
+      "template": "openai",
+      "display_name": "DeepSeek (Official)",
+      "base_url": "https://api.deepseek.com/v1",
+      "api_key_env": "DEEPSEEK_API_KEY",
+      "suggested_models": [
+        {"id": "deepseek-chat", "name": "DeepSeek V3 (Chat)"},
+        {"id": "deepseek-reasoner", "name": "DeepSeek V3 (Reasoner)"}
+      ],
+      "generation_defaults": {"temperature": 0.7, "top_p": 0.95, "max_tokens": 4096}
     },
     "openrouter": {
       "template": "openai",

@@ -606,7 +606,16 @@ def create_or_update_person(name, relationship=None, phone=None, email=None, add
                 updates.append('embedding_dim = ?'); params.append(embedding_dim)
             updates.append('updated_at = ?'); params.append(now)
             params.append(pid)
-            cursor.execute(f'UPDATE people SET {", ".join(updates)} WHERE id = ?', params)
+            params.append(scope)
+            # Belt-and-suspenders scope guard. The existing-lookup above is
+            # scope-filtered, but a concurrent deletion + reinsert could
+            # repurpose the id between the SELECT and this UPDATE. Adding
+            # AND scope=? makes the UPDATE atomic against scope drift.
+            # Day-ruiner scout 2026-05-07 #G.
+            cursor.execute(
+                f'UPDATE people SET {", ".join(updates)} WHERE id = ? AND scope = ?',
+                params
+            )
             conn.commit()
             is_new_flag = False
         else:
@@ -1642,11 +1651,18 @@ def _search_knowledge(query=None, category=None, entry_id=None, limit=10, scope=
     if entry_id:
         with _get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute('''
+            # Scope filter via the parent tab so an AI in scope `work` can't
+            # read entries from `personal` by guessing the integer id. The
+            # AI tool description encourages passing ids around — that's
+            # safe within scope but used to leak across. Day-ruiner scout
+            # 2026-05-07 #B. `_scope_condition` allows the current scope
+            # plus the 'global' overlay, matching all other scoped reads.
+            scope_sql, scope_params = _scope_condition(scope, 't.scope')
+            cursor.execute(f'''
                 SELECT e.id, e.content, t.name, t.type
                 FROM knowledge_entries e JOIN knowledge_tabs t ON e.tab_id = t.id
-                WHERE e.id = ?
-            ''', (entry_id,))
+                WHERE e.id = ? AND {scope_sql}
+            ''', [entry_id] + scope_params)
             row = cursor.fetchone()
         if not row:
             return f"Entry {entry_id} not found.", True
@@ -1750,12 +1766,18 @@ def _delete_knowledge(entry_id=None, category=None, scope='default'):
         cursor = conn.cursor()
 
         if entry_id:
-            # Delete single entry — must belong to an AI tab
-            cursor.execute('''
+            # Delete single entry — must belong to an AI tab AND the caller's
+            # scope (or 'global'). Without the scope filter, an AI in scope
+            # `work` can wipe entries in `personal` with a guessed id. The
+            # delete itself happens via `delete_entry` below; gating the
+            # lookup here is the simplest spot to enforce scope. Day-ruiner
+            # scout 2026-05-07 #B.
+            scope_sql, scope_params = _scope_condition(scope, 't.scope')
+            cursor.execute(f'''
                 SELECT e.id, e.content, t.id, t.name, t.type
                 FROM knowledge_entries e JOIN knowledge_tabs t ON e.tab_id = t.id
-                WHERE e.id = ?
-            ''', (entry_id,))
+                WHERE e.id = ? AND {scope_sql}
+            ''', [entry_id] + scope_params)
             row = cursor.fetchone()
             if not row:
                 return f"Entry {entry_id} not found.", False

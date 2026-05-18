@@ -34,6 +34,7 @@ const VIEW_MODULES = {
     settings: `./views/settings.js${_v}`,
     help:     `./views/help.js${_v}`,
     apps:     `./views/apps.js${_v}`,
+    store:    `./views/store.js${_v}`,
 };
 
 async function loadViews() {
@@ -146,11 +147,21 @@ async function init() {
                     const rail = document.getElementById('nav-rail');
                     const navAppsBtn = document.getElementById('nav-apps');
                     for (const app of navApps.slice(0, MAX_NAV_APPS)) {
-                        // Create nav item
+                        // Create nav item — use DOM API for icon/label since
+                        // they originate from plugin manifest data which is
+                        // user-supplied and shouldn't reach innerHTML.
+                        // Day-ruiner scout 2026-05-07 #A.
                         const btn = document.createElement('button');
                         btn.className = 'nav-item';
                         btn.dataset.view = `app-${app.name}`;
-                        btn.innerHTML = `<span class="nav-icon">${app.icon || '📦'}</span><span class="nav-label">${app.label}</span>`;
+                        const iconSpan = document.createElement('span');
+                        iconSpan.className = 'nav-icon';
+                        iconSpan.textContent = app.icon || '📦';
+                        const labelSpan = document.createElement('span');
+                        labelSpan.className = 'nav-label';
+                        labelSpan.textContent = app.label || '';
+                        btn.appendChild(iconSpan);
+                        btn.appendChild(labelSpan);
                         if (navAppsBtn) rail.insertBefore(btn, navAppsBtn);
                         else {
                             const spacer = rail.querySelector('.nav-spacer');
@@ -337,17 +348,38 @@ function syncNavWithPlugins() {
     }).catch(() => {});
 }
 
-const _loadedPluginScripts = new Set();
+// Per-plugin load tracker. Previously a Set keyed by name only — once added,
+// never forgotten. This broke two flows in 2.6.4:
+//   1. Store-installed plugin with default_enabled:true never got main.js loaded
+//      until full page reload (store didn't dispatch plugin_toggled).
+//   2. Uninstall→reinstall same plugin → Set.has(name) was true → script skipped,
+//      and even if forgotten, ES module URL cache returned the OLD module.
+// Map now tracks (name → loadId). Reloads when the plugin drops out of the
+// current enabled+has_script set (e.g., uninstalled), and uses loadId as a
+// cache-bust query param so reinstalled plugins get a fresh module instance.
+// 2026-05-14.
+const _loadedPluginScripts = new Map();
+let _pluginLoadCounter = 0;
 
 function loadPluginScripts(plugins) {
+    const currentNames = new Set();
     for (const p of plugins) {
-        if (!p.enabled || !p.has_script || _loadedPluginScripts.has(p.name)) continue;
-        _loadedPluginScripts.add(p.name);
-        const url = `/plugin-web/${p.name}/main.js${_v}`;
+        if (!p.enabled || !p.has_script) continue;
+        currentNames.add(p.name);
+        if (_loadedPluginScripts.has(p.name)) continue;
+        const loadId = ++_pluginLoadCounter;
+        _loadedPluginScripts.set(p.name, loadId);
+        const cacheBust = _v ? `${_v}&t=${loadId}` : `?t=${loadId}`;
+        const url = `/plugin-web/${p.name}/main.js${cacheBust}`;
         import(url).then(mod => {
             if (mod.default?.init) mod.default.init();
             console.log(`[Plugins] Loaded script: ${p.name}`);
         }).catch(() => {}); // Plugin has no main.js or it failed — that's fine
+    }
+    // Forget any plugins that are no longer enabled+has_script (uninstall /
+    // toggle off). Lets a later re-enable / reinstall reload cleanly.
+    for (const tracked of [..._loadedPluginScripts.keys()]) {
+        if (!currentNames.has(tracked)) _loadedPluginScripts.delete(tracked);
     }
 }
 

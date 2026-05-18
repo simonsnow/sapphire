@@ -105,6 +105,15 @@ export default {
         // backend no longer knows about and silently fall through to 'default'.
         eventBus.on('scope_changed', () => loadSidebar());
 
+        // Backend transient notices (dangling toolset detected, empty-content
+        // fallback after tool calls, etc.) — surfaced as toasts so the user
+        // sees them clearly instead of having to scan the chat for "(no
+        // response)" or chase a missing toolset in logs.
+        eventBus.on('chat_notice', (data) => {
+            if (!data?.message) return;
+            ui.showToast(data.message, data.severity || 'warning');
+        });
+
         // Refresh sidebar (incl. scope dropdowns) when a plugin is toggled.
         // Plugin scopes are only shown when the owning plugin is enabled, so a
         // toggle changes which dropdowns should be visible. Also refreshes init
@@ -115,6 +124,8 @@ export default {
         });
 
         // Accordion headers in sidebar (event delegation — handles core + plugin accordions)
+        // Persists open/closed state to localStorage so the user's choices
+        // (especially "Avatar always open") survive across reloads. 2026-04-30.
         const sbFull = container.querySelector('.sb-full-content');
         if (sbFull) sbFull.addEventListener('click', e => {
             const header = e.target.closest('.sidebar-accordion-header');
@@ -122,6 +133,8 @@ export default {
             const content = header.nextElementSibling;
             const open = header.classList.toggle('open');
             content.style.display = open ? 'block' : 'none';
+            const section = header.closest('.sidebar-accordion');
+            if (section) _persistAccordionOpen(section, open);
         });
 
         // Sidebar chat picker
@@ -411,6 +424,68 @@ async function loadDocuments(container, chatName) {
     }
 }
 
+// ── Sidebar accordion open/closed memory ──────────────────────────────
+// Stores the user's open/closed preference for each accordion in
+// localStorage so it survives reloads. Plugin accordions are keyed by
+// `data-plugin-accordion`; core accordions are keyed by their header
+// label (which is stable across templates). Closed = absence from the
+// stored map (smaller storage, default-closed for new accordions).
+// 2026-04-30 — addresses "I keep forgetting to open the avatar."
+
+const _ACCORDION_STATE_KEY = 'sapphire_sb_accordion_state';
+
+function _accordionKey(section) {
+    if (section.dataset.pluginAccordion) {
+        return `plugin:${section.dataset.pluginAccordion}`;
+    }
+    const header = section.querySelector('.sidebar-accordion-header');
+    if (!header) return '';
+    // First non-arrow span carries the human-readable label
+    const titleSpan = header.querySelector('span:not(.accordion-arrow)');
+    const text = (titleSpan?.textContent || header.textContent || '').trim();
+    return text ? `core:${text}` : '';
+}
+
+function _loadAccordionState() {
+    try {
+        return JSON.parse(localStorage.getItem(_ACCORDION_STATE_KEY) || '{}') || {};
+    } catch {
+        return {};
+    }
+}
+
+function _saveAccordionState(state) {
+    try {
+        localStorage.setItem(_ACCORDION_STATE_KEY, JSON.stringify(state));
+    } catch {
+        // localStorage full / disabled — silently skip; failure is harmless.
+    }
+}
+
+function _persistAccordionOpen(section, open) {
+    const key = _accordionKey(section);
+    if (!key) return;
+    const state = _loadAccordionState();
+    if (open) state[key] = true;
+    else delete state[key];  // closed = absence
+    _saveAccordionState(state);
+}
+
+function _restoreAccordionStates(container) {
+    const state = _loadAccordionState();
+    const sections = container.querySelectorAll('.sidebar-accordion');
+    sections.forEach(section => {
+        const key = _accordionKey(section);
+        if (!key || !state[key]) return;
+        const header = section.querySelector('.sidebar-accordion-header');
+        const content = section.querySelector('.sidebar-accordion-content');
+        if (header && content) {
+            header.classList.add('open');
+            content.style.display = 'block';
+        }
+    });
+}
+
 async function _loadPluginAccordions(container, init) {
     const slot = container.querySelector('#sb-plugin-accordions');
     if (!slot) return;
@@ -454,19 +529,27 @@ async function _loadPluginAccordions(container, init) {
         section.appendChild(content);
         slot.appendChild(section);
 
+        // Sequence: HTML must land in content.innerHTML BEFORE the script's
+        // init() runs — init typically queries content for DOM nodes that
+        // come from the HTML. On first page load this races by luck (script
+        // import is slower than HTML fetch); on revisit the module is cached
+        // so import() returns instantly, beating the HTML, and init bails
+        // out finding nothing. Avatar disappearing after tab-switch root
+        // cause. 2026-05-13.
+        let htmlReady = Promise.resolve();
         if (acc.content) {
-            pending.push(
-                fetch(`/plugin-web/${plugin.name}/${acc.content}`)
-                    .then(r => r.ok ? r.text() : Promise.reject())
-                    .then(html => { content.innerHTML = html; })
-                    .catch(() => {
-                        content.innerHTML = `<div class="sb-field" style="color:var(--error)">Failed to load</div>`;
-                    })
-            );
+            htmlReady = fetch(`/plugin-web/${plugin.name}/${acc.content}`)
+                .then(r => r.ok ? r.text() : Promise.reject())
+                .then(html => { content.innerHTML = html; })
+                .catch(() => {
+                    content.innerHTML = `<div class="sb-field" style="color:var(--error)">Failed to load</div>`;
+                });
+            pending.push(htmlReady);
         }
         if (acc.script) {
             pending.push(
-                import(`/plugin-web/${plugin.name}/${acc.script}`)
+                htmlReady
+                    .then(() => import(`/plugin-web/${plugin.name}/${acc.script}`))
                     .then(mod => { if (mod.init) mod.init(content, plugin.name); })
                     .catch(e => console.warn(`[SIDEBAR] Failed to load accordion script for ${plugin.name}:`, e))
             );
@@ -680,6 +763,12 @@ async function loadSidebar() {
 
         // Inject plugin-registered accordions
         await _loadPluginAccordions(container, init);
+
+        // Restore each accordion's open/closed state from localStorage.
+        // Runs after plugin accordions are in the DOM so it covers core
+        // AND plugin sections in one pass. The user's "Avatar open"
+        // preference now survives reloads. 2026-04-30.
+        _restoreAccordionStates(container);
 
         sidebarLoaded = true;
     } catch (e) {

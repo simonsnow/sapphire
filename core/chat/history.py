@@ -399,16 +399,30 @@ class ConversationHistory:
                 # Include tool_calls if present
                 if msg.get("tool_calls"):
                     llm_msg["tool_calls"] = msg["tool_calls"]
-                    
+
                     # Claude needs thinking_raw during tool cycles (has signatures)
                     if provider == "claude" and in_tool_cycle and msg.get("thinking_raw"):
                         llm_msg["thinking_raw"] = msg["thinking_raw"]
+
+                    # Carry `thinking` through on tool-calling assistant turns so
+                    # providers that require reasoning round-trip can pull from it
+                    # via their sanitizer (DeepSeek-reasoner official enforces this
+                    # — 400 without it on request 2+ of a tool cycle). Providers
+                    # that don't need it ignore the field. 2026-05-11.
+                    if msg.get("thinking"):
+                        llm_msg["thinking"] = msg["thinking"]
                 
             elif role == "tool":
+                # Tolerate tool messages missing `name` — historically
+                # placeholder writes from execution_context._patch_dangling_tool_calls
+                # (and any future hand-edited / partial history) lacked the
+                # field. A bare msg["name"] KeyError used to swallow into the
+                # outer except and return [] — silently empty history poisoned
+                # every subsequent heartbeat read of that chat. 2026-05-10.
                 llm_msg = {
                     "role": "tool",
                     "tool_call_id": msg["tool_call_id"],
-                    "name": msg["name"],
+                    "name": msg.get("name", "tool"),
                     "content": msg.get("content", "")
                 }
                 
@@ -458,12 +472,27 @@ class ConversationHistory:
         if context_limit > 0:
             safety_buffer = int(context_limit * 0.01) + 512
             effective_limit = context_limit - safety_buffer - reserved_tokens
-            
-            total_tokens = sum(count_tokens(str(m.get("content", ""))) for m in msgs)
-            
+
+            # Use the multimodal-aware helper. Pre-fix this used
+            # `count_tokens(str(m.get("content", "")))` which stringifies a
+            # multimodal list to include the base64 image data — a 5MB JPEG
+            # was scoring ~1.7M tokens and tripping the trim to nuke ALL
+            # history the moment an image landed in the chat. The user-
+            # visible symptom was "I sent an image and Sapphire suddenly
+            # forgot the last 30 turns." `count_message_tokens` (defined
+            # above at L122-160) handles dict-typed multimodal blocks
+            # correctly and excludes images by default. Wildcard scout
+            # 2026-05-07 multimodal #1.
+            total_tokens = sum(
+                count_message_tokens(m.get("content", ""), include_images=False)
+                for m in msgs
+            )
+
             while total_tokens > effective_limit and len(msgs) > 1:
                 removed = msgs.pop(0)
-                total_tokens -= count_tokens(str(removed.get("content", "")))
+                total_tokens -= count_message_tokens(
+                    removed.get("content", ""), include_images=False
+                )
 
         # Clean up orphaned tool results at the front.
         # Trimming can remove an assistant message with tool_calls while leaving
@@ -471,7 +500,9 @@ class ConversationHistory:
         while len(msgs) > 1 and msgs[0].get("role") in ("tool",):
             removed = msgs.pop(0)
             if context_limit > 0:
-                total_tokens -= count_tokens(str(removed.get("content", "")))
+                total_tokens -= count_message_tokens(
+                    removed.get("content", ""), include_images=False
+                )
 
         # Clean up orphaned tool_use blocks.
         # If server shuts down mid-tool-call, an assistant message with tool_calls
@@ -494,6 +525,25 @@ class ConversationHistory:
                 # Orphaned — strip tool_calls so it's just a text message
                 del msg["tool_calls"]
                 msg.pop("thinking_raw", None)
+
+        # Drop assistant messages that ended up with no tool_calls AND no
+        # content. Without this, the orphan strip above produces an empty-
+        # content assistant; Claude/Anthropic providers (claude.py:715,
+        # anthropic_compat.py:145/164) DROP empty assistants from the API
+        # payload via `if content and content.strip()`. The result is two
+        # adjacent user messages — alternation violation → API 400 → every
+        # subsequent send fails with the same 400 → user has to delete the
+        # chat to recover. Filtering the empty assistant here keeps the
+        # alternation valid. Voice mode amplifies (more crash windows mid-
+        # tool-call). Wildcard scout 2026-05-07 chat-wedge.
+        msgs = [
+            m for m in msgs
+            if not (
+                m.get("role") == "assistant"
+                and not m.get("tool_calls")
+                and not str(m.get("content", "")).strip()
+            )
+        ]
 
         return msgs
 
@@ -518,20 +568,40 @@ class ConversationHistory:
         return True
 
     def remove_from_user_message(self, user_content: str) -> bool:
-        """Remove all messages starting from a specific user message to the end."""
+        """Remove all messages starting from a specific user message to the end.
+
+        Matches on the message's TEXT content. For multimodal messages (image
+        paste, file attachments), `content` is a list-of-parts shape rather
+        than a string — direct equality with user_content always fails. We
+        extract the text portion before comparing so deletion/resend works
+        regardless of attachment shape. 2026-04-25 user report: pasting an
+        image and trying to delete the message produced a 404 because the
+        match couldn't find a list ≠ string.
+        """
         if not user_content:
             return False
-        
+
+        def _text_of(content):
+            if isinstance(content, str):
+                return content
+            if isinstance(content, list):
+                return "\n".join(
+                    p.get("text", "") for p in content
+                    if isinstance(p, dict) and p.get("type") == "text"
+                )
+            return ""
+
         user_index = -1
         for i in range(len(self.messages) - 1, -1, -1):
-            if self.messages[i]["role"] == "user" and self.messages[i]["content"] == user_content:
+            msg = self.messages[i]
+            if msg["role"] == "user" and _text_of(msg.get("content")) == user_content:
                 user_index = i
                 break
-        
+
         if user_index == -1:
             logger.warning(f"User message not found for deletion: {user_content[:50]}...")
             return False
-        
+
         messages_to_delete = len(self.messages) - user_index
         self.messages = self.messages[:user_index]
         logger.info(f"Deleted {messages_to_delete} messages from user message at index {user_index}")
@@ -651,6 +721,15 @@ class ChatSessionManager:
         # delete / save guards. Counter represents how many streams are
         # currently active; `_is_streaming` property reads > 0.
         self._streaming_count = 0
+        # Event signals "no streams currently active." append_messages_to_chat
+        # waits on this instead of polling _streaming_count every 200ms — so
+        # heartbeat appends fire as soon as the stream ends, not up to 200ms
+        # later. Initially set (no streams). Cleared on first begin, set when
+        # the last end_streaming brings the counter back to 0. Race scout
+        # 2026-05-07 #1 — replaces the 15s poll-and-fall-through path that
+        # corrupted history mid-tool-call under voice cadence.
+        self._no_streams_event = threading.Event()
+        self._no_streams_event.set()
         
         # Initialize database
         self._init_db()
@@ -689,21 +768,50 @@ class ChatSessionManager:
     def _is_streaming(self, val):
         """Back-compat setter — tests and legacy code that flip this bool
         directly still work. Real writers should use begin/end_streaming()
-        for atomic concurrency-safe counting."""
+        for atomic concurrency-safe counting.
+
+        Keeps the no-streams event consistent with the legacy bool path so
+        tests that toggle this directly don't leave waiters stuck.
+        """
         self._streaming_count = 1 if val else 0
+        evt = getattr(self, '_no_streams_event', None)
+        if evt is not None:
+            if val:
+                evt.clear()
+            else:
+                evt.set()
 
     def begin_streaming(self):
-        """Increment active-stream counter. Safe for concurrent streams."""
+        """Increment active-stream counter. Safe for concurrent streams.
+
+        Clears the no-streams event on the 0→1 transition so any append
+        waiters block until end_streaming brings the counter back to 0.
+        """
         with self._lock:
-            self._streaming_count = getattr(self, '_streaming_count', 0) + 1
+            prev = getattr(self, '_streaming_count', 0)
+            self._streaming_count = prev + 1
+            if prev == 0:
+                # Lazy-init guard for the legacy bool setter path that
+                # bypasses __init__ in some test fixtures.
+                evt = getattr(self, '_no_streams_event', None)
+                if evt is not None:
+                    evt.clear()
 
     def end_streaming(self):
         """Decrement active-stream counter (floored at 0). Safe for
         concurrent streams. A double-decrement (bug elsewhere) is silent
-        — counter stays at 0."""
+        — counter stays at 0.
+
+        Sets the no-streams event when the counter reaches 0 so any
+        append waiters can proceed immediately.
+        """
         with self._lock:
             cur = getattr(self, '_streaming_count', 0)
             self._streaming_count = cur - 1 if cur > 0 else 0
+            if self._streaming_count == 0:
+                evt = getattr(self, '_no_streams_event', None)
+                if evt is not None:
+                    evt.set()
 
     @contextmanager
     def _get_connection(self):
@@ -722,6 +830,9 @@ class ChatSessionManager:
         conn = sqlite3.connect(str(self._db_path), timeout=30.0)
         try:
             conn.execute("PRAGMA busy_timeout=30000")
+            # synchronous is a per-connection PRAGMA — must set at every open.
+            # journal_mode=WAL is persistent in the db header; no need to re-set.
+            conn.execute("PRAGMA synchronous=NORMAL")
             conn.row_factory = sqlite3.Row
             yield conn
         finally:
@@ -731,6 +842,20 @@ class ChatSessionManager:
         """Initialize SQLite database with schema."""
         try:
             with self._get_connection() as conn:
+                # WAL + synchronous=NORMAL: massively reduces write-lock
+                # contention vs the default rollback journal, lets readers
+                # proceed while a writer holds the WAL. journal_mode=WAL
+                # persists in the db header — set once. synchronous=NORMAL
+                # is per-connection but cheap and we set it at every
+                # connection open via PRAGMA below. auto_vacuum=INCREMENTAL
+                # lets the file shrink after deletes (ours: chat purge,
+                # tool_image prune) without the full-VACUUM pause. All
+                # three are no-ops on subsequent inits. Longevity scout
+                # 2026-05-07 — backup.py wal_checkpoint was a silent no-op
+                # before this lands.
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA synchronous=NORMAL")
+                conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
                 conn.execute("""
                     CREATE TABLE IF NOT EXISTS chats (
                         name TEXT PRIMARY KEY,
@@ -739,7 +864,7 @@ class ChatSessionManager:
                         updated_at TEXT NOT NULL
                     )
                 """)
-                
+
                 conn.execute("""
                     CREATE TABLE IF NOT EXISTS tool_images (
                         id TEXT PRIMARY KEY,
@@ -858,6 +983,39 @@ class ChatSessionManager:
                 self.current_settings = get_system_defaults()
                 self.current_settings.update(file_settings)
 
+                # Belt-and-suspenders: if the loaded history ends with an
+                # assistant(tool_calls) whose tool_results are missing, the
+                # previous run was killed mid-tool-cycle. Arm `_in_tool_cycle`
+                # so the next stream's cancel-cleanup `finally` fires and
+                # injects placeholder tool_results — without this the orphan
+                # state is invisible to the streamer until something already
+                # tried to use it. The read-time strip in
+                # `get_messages_for_llm` ALSO defends, but that path only
+                # fires at LLM-call time; arming here closes the gap for any
+                # other consumer of `current_chat.messages`. Wildcard scout
+                # 2026-05-07 chat-wedge belt-and-suspenders.
+                msgs = self.current_chat.messages
+                if msgs:
+                    last_asst_idx = None
+                    for k in range(len(msgs) - 1, -1, -1):
+                        if msgs[k].get("role") == "assistant":
+                            last_asst_idx = k
+                            break
+                    if last_asst_idx is not None:
+                        last_asst = msgs[last_asst_idx]
+                        if last_asst.get("tool_calls"):
+                            call_ids = {tc.get("id", "") for tc in last_asst["tool_calls"]}
+                            result_ids = set()
+                            for m in msgs[last_asst_idx + 1:]:
+                                if m.get("role") == "tool":
+                                    result_ids.add(m.get("tool_call_id", ""))
+                            if not call_ids.issubset(result_ids):
+                                self._in_tool_cycle = True
+                                logger.info(
+                                    f"Chat '{chat_name}' loaded with unresolved "
+                                    f"tool_calls — arming _in_tool_cycle for cleanup"
+                                )
+
                 logger.info(f"Loaded chat '{chat_name}' with {len(self.current_chat.messages)} messages")
                 return True
                 
@@ -906,7 +1064,6 @@ class ChatSessionManager:
             except Exception as e:
                 logger.error(f"Failed to save chat '{self.active_chat_name}': {e}")
                 try:
-                    from core.event_bus import publish, Events
                     publish(Events.CONTINUITY_TASK_ERROR, {
                         "task": "Chat Save",
                         "error": f"Failed to save chat: {e}. Messages may be lost on restart."
@@ -1012,6 +1169,18 @@ class ChatSessionManager:
                 except Exception:
                     pass  # Table may not exist yet
                 conn.commit()
+                # Reclaim freed pages now that we deleted a chat (potentially
+                # with megabytes of tool_images blobs). `auto_vacuum=INCREMENTAL`
+                # is enabled at _init_db but only does anything when something
+                # actually calls `incremental_vacuum`. Without this call, the
+                # file high-water-mark only shrinks during weekly VACUUM runs
+                # in backup.py. Cap at 100 pages (~400KB) to avoid a long
+                # pause on a heavy delete. Wildcard scout 2026-05-07 L1.
+                try:
+                    conn.execute("PRAGMA incremental_vacuum(100)")
+                    conn.commit()
+                except Exception:
+                    pass
                 logger.info(f"Deleted chat: {chat_name}")
                 
                 # Ensure default exists
@@ -1234,7 +1403,7 @@ class ChatSessionManager:
         ])
 
     def append_messages_to_chat(self, chat_name: str, new_messages: list,
-                                 max_wait_if_streaming: float = 15.0):
+                                 max_wait_if_streaming: float = 60.0) -> bool:
         """Append a list of messages to a named chat WITHOUT switching active chat.
 
         Preserves the full conversation structure including tool_calls and tool
@@ -1248,23 +1417,44 @@ class ChatSessionManager:
         cron write with a stale in-memory snapshot. The `_is_streaming` guard
         already protects `delete_chat` and `set_active_chat` — extending it
         here closes the asymmetry.
+
+        Returns True if the messages were written, False if the wait timed out
+        and the write was skipped to avoid corruption. Pre-2026-05-07 the wait
+        used 200ms polling and fell through after 15s, writing anyway and
+        risking interleaved tool_call/tool_result corruption — voice mode's
+        short turn cadence made that path the common case. Now an Event
+        signals stream end immediately, the wait window extended to 60s,
+        and the write is SKIPPED on timeout (data loss > corruption).
         """
-        import time as _time
         self._ensure_db()
 
         # Defer if the target is the active chat and a stream is running.
-        # Poll rather than event-wait so this works whether the caller is in
-        # an async context or a worker thread.
+        # Event-based wait — fires as soon as the last stream ends, no poll.
         if chat_name == self.active_chat_name and self._is_streaming:
-            deadline = _time.time() + max_wait_if_streaming
-            while self._is_streaming and _time.time() < deadline:
-                _time.sleep(0.2)
-            if self._is_streaming:
-                logger.warning(
-                    f"append_messages_to_chat('{chat_name}') waited "
-                    f"{max_wait_if_streaming:.0f}s for active stream to end — "
-                    f"proceeding anyway; ordering race possible"
+            evt = getattr(self, '_no_streams_event', None)
+            if evt is not None:
+                got = evt.wait(timeout=max_wait_if_streaming)
+            else:
+                # Legacy fallback for fixtures that bypass __init__.
+                import time as _time
+                deadline = _time.time() + max_wait_if_streaming
+                while self._is_streaming and _time.time() < deadline:
+                    _time.sleep(0.2)
+                got = not self._is_streaming
+            if not got or self._is_streaming:
+                # Write SKIPPED. Better to drop a heartbeat append than to
+                # write through and corrupt the chat's tool_call/tool_result
+                # invariants. Caller (heartbeat / cron / agent completion)
+                # should treat False as "your write didn't happen" — current
+                # callers ignore the return, which means the heartbeat output
+                # is lost in this rare case. Acceptable trade vs corruption.
+                logger.error(
+                    f"append_messages_to_chat('{chat_name}') gave up after "
+                    f"{max_wait_if_streaming:.0f}s waiting for active stream "
+                    f"to end — write SKIPPED to avoid history corruption. "
+                    f"{len(new_messages)} message(s) dropped."
                 )
+                return False
 
         timestamp = datetime.now().isoformat()
         try:
@@ -1275,7 +1465,7 @@ class ChatSessionManager:
                 row = cursor.fetchone()
                 if not row:
                     logger.warning(f"Chat '{chat_name}' not found — skipping append (may have been deleted)")
-                    return
+                    return False
                 messages = json.loads(row["messages"])
 
                 for msg in new_messages:
@@ -1298,8 +1488,10 @@ class ChatSessionManager:
                         self.current_chat.messages.append(msg)
 
                 publish(Events.MESSAGE_ADDED, {"role": "pair", "chat_name": chat_name})
+                return True
         except Exception as e:
             logger.error(f"Failed to append to chat '{chat_name}': {e}")
+            return False
 
     def remove_last_messages(self, count: int) -> bool:
         result = self.current_chat.remove_last_messages(count)
@@ -1364,6 +1556,13 @@ class ChatSessionManager:
                         (chat_name, *orphans),
                     )
                     conn.commit()
+                    # Reclaim freed pages from the BLOB deletes — see
+                    # delete_chat for the rationale. Wildcard scout 2026-05-07 L1.
+                    try:
+                        conn.execute("PRAGMA incremental_vacuum(100)")
+                        conn.commit()
+                    except Exception:
+                        pass
                     logger.debug(
                         f"Pruned {len(orphans)} orphan tool_image(s) from chat '{chat_name}'"
                     )

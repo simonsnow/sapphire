@@ -177,6 +177,20 @@ class StreamingChat:
             enabled_tools = self.main_chat.function_manager.enabled_tools
             _allowed_tool_names = {t["function"]["name"] for t in enabled_tools if "function" in t}
             _executor_snapshot = self.main_chat.function_manager.snapshot_executors()
+
+            # Drain dangling-toolset state and surface as SSE notice (parallel
+            # to non-streaming chat.py logic). Cleared after consume so it
+            # only fires once per detection. getattr is defensive — some tests
+            # mock function_manager without this attribute.
+            bad_ts = getattr(self.main_chat.function_manager, 'last_dangling_toolset', None)
+            if bad_ts:
+                self.main_chat.function_manager.last_dangling_toolset = None
+                yield {
+                    "type": "notice",
+                    "message": f"Toolset '{bad_ts}' is missing — tools disabled for this chat. Fix in chat settings.",
+                    "severity": "warning",
+                }
+
             provider_key, provider, model_override = self.main_chat._select_provider()
             
             # Determine effective model (per-chat override or provider default)
@@ -399,12 +413,19 @@ class StreamingChat:
                     # Combine prefill with current content for history
                     full_content = prefill + current_content if has_prefill else current_content
                     
-                    # Store message with tool calls - include thinking_raw for Claude tool cycles
+                    # Store message with tool calls - include thinking_raw for Claude
+                    # tool cycles, AND `thinking` for DeepSeek-reasoner's required
+                    # reasoning_content round-trip on subsequent iterations. Without
+                    # the `thinking` field here, the in-memory messages list omits
+                    # it, the openai_compat sanitizer's gate at line 427-430 finds
+                    # `msg.get('thinking') == None`, and the next API call after
+                    # tool execution hits 400 "Missing reasoning_content". 2026-05-14.
                     messages.append({
                         "role": "assistant",
                         "content": full_content,
                         "tool_calls": tool_calls_to_execute,
-                        "thinking_raw": thinking_raw  # Has signatures for Claude API
+                        "thinking_raw": thinking_raw,  # Has signatures for Claude API
+                        "thinking": current_thinking if current_thinking else None,
                     })
                     
                     # Save to history with new schema
@@ -430,10 +451,48 @@ class StreamingChat:
                         function_name = tool_call["function"]["name"]
                         tool_call_id = tool_call["id"]
 
-                        try:
-                            function_args = json.loads(tool_call["function"]["arguments"])
-                        except json.JSONDecodeError:
+                        raw_args = tool_call.get("function", {}).get("arguments", "")
+                        # Empty string is valid for no-arg tools — Claude/Anthropic
+                        # sends arguments='' (not '{}') when a tool has no params.
+                        # json.loads('') would fail. Treat empty as {} explicitly.
+                        # 2026-05-15.
+                        if raw_args == "" or raw_args is None:
                             function_args = {}
+                        else:
+                            try:
+                                function_args = json.loads(raw_args)
+                            except json.JSONDecodeError:
+                                # Mirror the non-streaming path (chat_tool_calling.py:372-385):
+                                # surface the parse error back to the LLM as a tool result
+                                # instead of silently calling the tool with empty args.
+                                # Smaller/quantized models occasionally emit malformed JSON;
+                                # without feedback the LLM can't self-correct and the tool
+                                # runs with default args (potentially destructive for tools
+                                # with permissive defaults). 2026-05-14.
+                                logger.error(
+                                    f"[STREAMING] Failed to parse tool arguments for "
+                                    f"{function_name}: {raw_args!r}"
+                                )
+                                error_result = "Error: Invalid JSON arguments."
+                                # CRITICAL: also append to messages — without this, the next
+                                # LLM call sees a tool_use with no matching tool_result and
+                                # Anthropic returns a 400 that kills the whole turn.
+                                # 2026-05-15.
+                                wrapped_err = provider.format_tool_result(
+                                    tool_call_id, function_name, error_result
+                                )
+                                messages.append(wrapped_err)
+                                self.main_chat.session_manager.add_tool_result(
+                                    tool_call_id, function_name, error_result
+                                )
+                                yield {
+                                    "type": "tool_end",
+                                    "id": tool_call_id,
+                                    "name": function_name,
+                                    "result": error_result,
+                                    "is_error": True,
+                                }
+                                continue
 
                         # Emit typed tool_start event
                         yield {
@@ -448,7 +507,7 @@ class StreamingChat:
 
                         try:
                             function_result = self.main_chat.function_manager.execute_function(function_name, function_args, scopes=_scopes, allowed_tools=_allowed_tool_names, executor_snapshot=_executor_snapshot)
-                            result_str, tool_imgs = _extract_tool_images(function_result, self.main_chat.session_manager)
+                            result_str, tool_imgs = _extract_tool_images(function_result, self.main_chat.session_manager, provider)
                             if tool_imgs:
                                 iteration_tool_images.extend(tool_imgs)
                                 logger.info(f"[TOOL] {function_name} returned {len(tool_imgs)} image(s)")
@@ -511,10 +570,17 @@ class StreamingChat:
                     # Inject tool-returned images for next LLM turn
                     if iteration_tool_images:
                         from .chat import _inject_tool_images
-                        _inject_tool_images(messages, iteration_tool_images)
+                        _inject_tool_images(messages, iteration_tool_images, provider)
 
-                    # Refresh tools list — tool_load may have added new tools
+                    # Refresh tools list — tool_load may have added new tools.
+                    # Also refresh the allowed_tool_names guard set and the
+                    # executor snapshot so newly-loaded tools become callable
+                    # on the next iteration. Without this, the LLM would see
+                    # new tools in tools= but execute_function would reject
+                    # them as "not in active toolset". Mirrors chat.py:680.
                     enabled_tools = self.main_chat.function_manager.enabled_tools
+                    _allowed_tool_names = {t["function"]["name"] for t in enabled_tools if "function" in t}
+                    _executor_snapshot = self.main_chat.function_manager.snapshot_executors()
 
                     if self.cancel_flag:
                         break
@@ -553,7 +619,7 @@ class StreamingChat:
                         # Inject tool-returned images for next LLM turn
                         if text_tool_images:
                             from .chat import _inject_tool_images
-                            _inject_tool_images(messages, text_tool_images)
+                            _inject_tool_images(messages, text_tool_images, provider)
 
                         # Emit tool events for UI
                         tool_name = function_call_data["function_call"]["name"]
@@ -718,8 +784,20 @@ class StreamingChat:
                 if final_content:
                     full_final = (force_prefill or "") + final_content
                 else:
-                    full_final = f"I used {tool_call_count} tools and gathered information."
+                    # Empty content after tool calls — short placeholder + toast.
+                    # Old text ("I used N tools and gathered information") was
+                    # a confident lie when tools had silently errored. Mirrors
+                    # non-streaming chat.py fix. 2026-05-16.
+                    full_final = "(no response)"
                     yield {"type": "content", "text": full_final}
+                    yield {
+                        "type": "notice",
+                        "message": (
+                            f"Generation ended without a reply after {tool_call_count} tool call(s). "
+                            f"A tool likely errored or isn't in the active toolset — check the logs, or rephrase."
+                        ),
+                        "severity": "warning",
+                    }
 
                 # post_llm hook — plugins can mutate forced-final response
                 if hook_runner.has_handlers("post_llm"):

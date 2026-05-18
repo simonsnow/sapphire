@@ -85,6 +85,11 @@ body = {
     "max_runs": 1,
     "toolset": s.get('toolset') or s.get('ability') or 'all',
     "prompt": s.get('persona') or s.get('prompt') or 'sapphire',
+    # Forward chat's bound LLM provider/model. Without this, provider defaults
+    # to 'auto' → first available → wrong model from global fallback order
+    # (same silent-default class as the 2026-04-19 fix). 2026-05-15.
+    "provider": s.get('llm_primary') or 'auto',
+    "model": s.get('llm_model') or '',
     "chat_target": os.environ['CHAT_NAME'],
     "initial_message": os.environ['MSG'],
     "tts_enabled": False,

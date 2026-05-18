@@ -54,8 +54,11 @@ export function switchView(viewId) {
         btn.classList.toggle('active', isActive);
     });
 
-    // Update hash without triggering hashchange
-    if (location.hash !== `#${viewId}`) {
+    // Update hash without triggering hashchange. Preserve nested routes
+    // (e.g. #store/plugins/lattice-theme) — only force the hash if the
+    // current hash's base view doesn't already match the target.
+    const currentBase = (location.hash || '#').slice(1).split('/')[0];
+    if (currentBase !== viewId) {
         history.replaceState(null, '', `#${viewId}`);
     }
 }

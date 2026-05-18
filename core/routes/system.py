@@ -715,3 +715,131 @@ async def webhook_endpoint(path: str, request: Request, system=Depends(get_syste
     publish(Events.WEBHOOK_FIRED, {"path": path, "method": method, "task_id": task["id"]})
 
     return {"status": "triggered", "task": task["name"], "queued": result.get("queued", False)}
+
+
+# =============================================================================
+# DASHBOARD HERO — system-info readout
+# =============================================================================
+
+def _format_uptime(seconds: float) -> str:
+    """Compact uptime string. e.g. '3d 4h 12m', '5h 22m', '14m', '47s'."""
+    s = int(seconds)
+    if s < 60:
+        return f"{s}s"
+    m, s = divmod(s, 60)
+    if m < 60:
+        return f"{m}m"
+    h, m = divmod(m, 60)
+    if h < 24:
+        return f"{h}h {m}m"
+    d, h = divmod(h, 24)
+    return f"{d}d {h}h {m}m"
+
+
+@router.get("/api/dashboard/system-info")
+async def dashboard_system_info(_=Depends(require_login)):
+    """Lightweight stats for the dashboard hero: process memory, disk usage
+    on the volume Sapphire's user/ lives on, thread count, uptime.
+    Cross-platform via psutil (Linux/Mac/Windows). Cheap to call (~ms)."""
+    try:
+        import psutil
+    except ImportError:
+        raise HTTPException(status_code=500, detail="psutil not installed")
+
+    proc = psutil.Process()
+    user_dir = PROJECT_ROOT / "user"
+    # Anchor disk_usage on a path that exists; fall back to PROJECT_ROOT if
+    # user/ is somehow missing (fresh install before first boot).
+    target = user_dir if user_dir.exists() else PROJECT_ROOT
+    try:
+        du = psutil.disk_usage(str(target))
+    except Exception:
+        du = None
+
+    mem_mb = round(proc.memory_info().rss / 1024 / 1024)
+    uptime_seconds = max(0.0, time.time() - proc.create_time())
+
+    # Pull the backup schedule hour so the Backups panel can show
+    # "Daily 03:00" without a second round-trip.
+    try:
+        backups_hour = int(getattr(config, 'BACKUPS_HOUR', 3))
+    except Exception:
+        backups_hour = 3
+
+    display_name = (getattr(config, 'DASHBOARD_DISPLAY_NAME', '') or 'Sapphire').strip() or 'Sapphire'
+
+    return {
+        "mem_mb": mem_mb,
+        "threads": proc.num_threads(),
+        "uptime_seconds": int(uptime_seconds),
+        "uptime_str": _format_uptime(uptime_seconds),
+        "disk_used_gb": round(du.used / 1024 ** 3, 1) if du else None,
+        "disk_total_gb": round(du.total / 1024 ** 3, 1) if du else None,
+        "disk_free_gb": round(du.free / 1024 ** 3, 1) if du else None,
+        "disk_pct": round(du.percent, 1) if du else None,
+        "backups_hour": backups_hour,
+        "display_name": display_name,
+    }
+
+
+@router.get("/api/dashboard/component-status")
+async def dashboard_component_status(_=Depends(require_login)):
+    """Health pills for the dashboard hero — embeddings, TTS, STT, wakeword.
+    Each returns: 'ok' (configured & alive), 'idle' (configured off / Null
+    provider), 'warn' (configured but provider unhealthy), 'error' (system
+    expects it but it's missing). Frontend mood-derives off this set."""
+    system = get_system()
+
+    def _tts_status() -> str:
+        try:
+            tts = getattr(system, 'tts', None)
+            if tts is None:
+                return 'idle' if not getattr(config, 'TTS_ENABLED', False) else 'error'
+            provider_name = type(getattr(tts, '_provider', None)).__name__.lower()
+            if 'null' in provider_name:
+                return 'idle'
+            return 'ok'
+        except Exception:
+            return 'warn'
+
+    def _stt_status() -> str:
+        try:
+            if not getattr(config, 'STT_ENABLED', False):
+                return 'idle'
+            recorder = getattr(system, 'whisper_recorder', None)
+            if recorder is None:
+                return 'error'
+            if 'null' in type(recorder).__name__.lower():
+                return 'idle'
+            return 'ok'
+        except Exception:
+            return 'warn'
+
+    def _wakeword_status() -> str:
+        try:
+            if not getattr(config, 'WAKEWORD_ENABLED', False):
+                return 'idle'
+            detector = getattr(system, 'wake_detector', None)
+            if detector is None:
+                return 'error'
+            if 'null' in type(detector).__name__.lower():
+                return 'idle'
+            return 'ok'
+        except Exception:
+            return 'warn'
+
+    def _embedding_status() -> str:
+        try:
+            provider = (getattr(config, 'EMBEDDING_PROVIDER', '') or '').lower()
+            if not provider or provider == 'none':
+                return 'idle'
+            return 'ok'
+        except Exception:
+            return 'warn'
+
+    return {
+        'tts': _tts_status(),
+        'stt': _stt_status(),
+        'ww':  _wakeword_status(),
+        'emb': _embedding_status(),
+    }

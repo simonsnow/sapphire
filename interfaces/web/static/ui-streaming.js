@@ -5,6 +5,13 @@ import { createAccordion, createCodeBlock, processMarkdown, wrapImageGalleries, 
 // Streaming state
 let streamMsg = null;
 let streamContent = '';
+// Monotonic id bumped on every startStreaming / cancelStreaming. Lets the
+// SSE reader in api.js drop chunks that belong to a stream the UI already
+// abandoned. Without this, Stop→immediate-Send can land OLD stream's
+// trailing chunks (still in the SSE buffer between abort and rejection)
+// in the NEW message's DOM. 2026-05-14.
+let _streamId = 0;
+export const getCurrentStreamId = () => _streamId;
 let state = {
     inThink: false, thinkBuf: '', thinkCnt: 0, thinkType: null, thinkAcc: null, thinkAccEl: null,
     inCode: false, codeLang: '', codeBuf: '', codePre: null,
@@ -114,13 +121,14 @@ const processPendingToolEvents = (scrollCallback) => {
 };
 
 export const startStreaming = (container, messageElement, scrollCallback) => {
+    _streamId++;  // new stream — invalidates any in-flight chunks from a previous one
     const contentDiv = messageElement.querySelector('.message-content');
     const p = createElem('p');
     contentDiv.appendChild(p);
-    
+
     const existingThinks = container.querySelectorAll('details summary');
     const thinkCount = Array.from(existingThinks).filter(s => s.textContent.includes('Think')).length;
-    
+
     streamMsg = { el: contentDiv, para: p, last: p };
     streamContent = '';
     resetState(p);
@@ -138,23 +146,30 @@ export const startStreaming = (container, messageElement, scrollCallback) => {
 // Check if streaming is ready
 export const isStreamReady = () => streamMsg !== null;
 
+const COPY_ICON_SVG = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>';
+const CHECK_ICON_SVG = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="20 6 9 17 4 12"></polyline></svg>';
+
+const escapeHtml = (text) => {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+};
+
 // Create streaming code block preview (unhighlighted)
 const createCodePreview = (lang) => {
     const pre = createElem('pre');
     pre.className = 'streaming-code';
-    
-    // Add header if language specified
-    if (lang && lang !== 'plaintext') {
-        const header = document.createElement('div');
-        header.className = 'code-block-header';
-        header.innerHTML = `<span class="code-lang">${lang}</span><span class="code-status">...</span>`;
-        pre.appendChild(header);
-    }
-    
+
+    const header = document.createElement('div');
+    header.className = 'code-block-header';
+    const langText = (lang && lang !== 'plaintext') ? lang : '';
+    header.innerHTML = `<span class="code-lang">${escapeHtml(langText)}</span><span class="code-status">...</span>`;
+    pre.appendChild(header);
+
     const code = createElem('code');
     code.className = `language-${lang || 'plaintext'}`;
     pre.appendChild(code);
-    
+
     return { pre, code };
 };
 
@@ -185,15 +200,20 @@ const finalizeCodeBlock = () => {
             const copyBtn = document.createElement('button');
             copyBtn.className = 'code-copy';
             copyBtn.title = 'Copy code';
-            copyBtn.textContent = 'Copy';
+            copyBtn.setAttribute('aria-label', 'Copy code');
+            copyBtn.innerHTML = COPY_ICON_SVG;
             copyBtn.addEventListener('click', async () => {
                 try {
                     await navigator.clipboard.writeText(codeText);
-                    copyBtn.textContent = 'Copied!';
-                    setTimeout(() => copyBtn.textContent = 'Copy', 2000);
+                    copyBtn.innerHTML = CHECK_ICON_SVG;
+                    copyBtn.classList.add('copied');
+                    setTimeout(() => {
+                        copyBtn.innerHTML = COPY_ICON_SVG;
+                        copyBtn.classList.remove('copied');
+                    }, 2000);
                 } catch (e) {
-                    copyBtn.textContent = 'Failed';
-                    setTimeout(() => copyBtn.textContent = 'Copy', 2000);
+                    copyBtn.classList.add('failed');
+                    setTimeout(() => copyBtn.classList.remove('failed'), 2000);
                 }
             });
             status.replaceWith(copyBtn);
@@ -618,9 +638,38 @@ export const finishStreaming = (updateToolbarsCallback) => {
 };
 
 export const cancelStreaming = () => {
-    const streamingMessage = document.getElementById('streaming-message');
-    if (streamingMessage) streamingMessage.remove();
-    
+    _streamId++;  // any chunks still in the SSE pipeline are now stale
+    // Don't delete the partial — finalize it like finishStreaming does, so the
+    // user sees what was rendered up to the stop. The full message lands in
+    // history once the backend finishes draining; F5 / refresh shows the
+    // authoritative version. Without this, the partial vanishes and only
+    // reappears after the chat reloads, which looks broken.
+    const msg = document.getElementById('streaming-message');
+    if (msg) {
+        msg.removeAttribute('id');
+        delete msg.dataset.streaming;
+        msg.dataset.cancelled = 'true';
+
+        const contentDiv = msg.querySelector('.message-content');
+        if (contentDiv) {
+            contentDiv.querySelectorAll('p').forEach(p => {
+                if (!p.textContent.trim() && !p.innerHTML.trim()) p.remove();
+            });
+            contentDiv.querySelectorAll('.accordion-think.streaming').forEach(acc => {
+                acc.classList.remove('streaming');
+            });
+            contentDiv.querySelectorAll('.accordion-tool.loading').forEach(acc => {
+                acc.remove();
+            });
+            wrapImageGalleries(contentDiv);
+
+            const marker = document.createElement('div');
+            marker.className = 'cancel-marker';
+            marker.textContent = '⊘ Cancelled';
+            contentDiv.appendChild(marker);
+        }
+    }
+
     streamMsg = null;
     streamContent = '';
     resetState();

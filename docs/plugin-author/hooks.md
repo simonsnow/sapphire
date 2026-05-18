@@ -8,7 +8,8 @@ All hooks receive a mutable `HookEvent`. Changes persist across handlers in prio
 |------|------|-----------|-----|
 | `post_stt` | After voice transcription | `input` (mutable) | Correct STT errors, translate, normalize |
 | `pre_chat` | Before LLM | `input`, `skip_llm`, `response` | Filter input, bypass LLM |
-| `prompt_inject` | System prompt build | `context_parts` | Append context strings |
+| `prompt_inject` | System prompt build | `context_parts` | Append context strings (system prompt — long-lived, breaks cache) |
+| `ghost_inject` | Per-turn ephemeral context | `ghost_text` | Add operator-metadata visible to assistant only, cache-friendly. **See dedicated section below — this hook has elevated review requirements.** |
 | `post_llm` | After LLM, before save | `response` (mutable) | Translate, filter, style transfer |
 | `post_chat` | After response saved | `input`, `response` | Logging, analytics |
 | `pre_execute` | Before tool call | `function_name`, `arguments` | Modify args, block tools |
@@ -73,6 +74,7 @@ Handlers get the `VoiceChatSystem` instance via `event.metadata.get("system")`. 
 | `post_stt` | **Yes** | Yes | `input` (transcribed text) |
 | `pre_chat` | **Yes** | Yes | `input`, `skip_llm`, `response`, `ephemeral` |
 | `prompt_inject` | No | Yes | `context_parts` (list — append to it) |
+| `ghost_inject` | **Yes** | Yes | `ghost_text` (set to a string to contribute one ghost line) |
 | `post_llm` | **Yes** | Yes | `response` (AI's answer text) |
 | `post_chat` | **Yes** | Yes | None (observational) |
 | `pre_execute` | **Yes** | Yes | `arguments`, `skip_llm`, `result` |
@@ -290,3 +292,88 @@ def post_chat(event):
         summary = system.llm_chat.chat(summary_prompt)
         state.save("last_summary", summary)
 ```
+
+---
+
+## `ghost_inject` — per-turn ephemeral context (cache-friendly)
+
+`ghost_inject` is for content that should reach the assistant on a single turn but **NOT** persist into chat history and **NOT** mutate the cached system prompt. Cache hit rates on Claude jump from ~0% to ~95% when per-turn content is delivered through this rail instead of `prompt_inject`. The assistant sees the contribution as labeled operator metadata; the user does not see it at all.
+
+### When to use it (vs `prompt_inject`)
+
+| Use this hook | If your content is | Examples |
+|---|---|---|
+| `ghost_inject` | **Per-turn ephemera** that changes often | Time, weather, calendar status, ambient mood, current focus block, current location |
+| `prompt_inject` | **Long-lived character/state** stable across many turns | Story scenario flags, RAG document context, persistent persona overrides |
+
+If your content changes more than once a session, use `ghost_inject`. If it's stable across the whole chat, use `prompt_inject`.
+
+### Handler
+
+```python
+# hooks/my_ghost.py
+
+def ghost_inject(event):
+    # event.metadata["system"] gives access to the VoiceChatSystem
+    # event.input is the user's current message (read-only here)
+
+    # Set event.ghost_text to contribute to this turn's ghost message.
+    # Plugins set ONE string per fire; the runner attributes it to the
+    # plugin name automatically. Return value is ignored.
+    if some_condition_for_my_plugin:
+        event.ghost_text = "Light rain in user's area, mention if natural."
+    # If no contribution this turn, do nothing — leave ghost_text unset.
+
+handle = ghost_inject  # fallback for `handle` dispatch
+```
+
+### Manifest declaration
+
+```json
+"capabilities": {
+  "hooks": {
+    "ghost_inject": "hooks/my_ghost.py"
+  }
+}
+```
+
+### Envelope format (what the assistant sees)
+
+When ghost contributions exist for a turn, the runner builds a single envelope and inserts it as a user-role message just before the new user input:
+
+```
+[Operator metadata for assistant — these are turn-only notes, not the user's voice. Acknowledge or weave only if natural.]
+- Time: Tuesday, May 8, 8:55 PM (America/Indiana/Indianapolis)
+- Spice: Speak more urgently in this reply.
+- weather: Light rain in user's area.
+- calendar: User has a meeting in 15 minutes.
+```
+
+Each line is attributed to the plugin that contributed it. The opener tells the assistant unambiguously that the content is operator metadata, not the user. The assistant can choose to weave the context naturally, mention it explicitly, or refuse to comply with any individual line.
+
+### Why this matters: the trust model
+
+`ghost_inject` is **invisible to the user**. That's the point — operator-orchestrated context like time, weather, mood, current task should reach the assistant without cluttering what the user reads. **But invisible-to-user is also the manipulation surface to be careful about.** The trust model has three legs:
+
+1. **Per-line plugin attribution.** The envelope shows the assistant exactly which plugin contributed which line. A ghost message saying "argue with the user about X" gets attributed by name, so the assistant can flag it out loud rather than complying silently.
+2. **Plugin store review.** Ghost-injecting plugins are reviewed for what they declare and what they actually inject. Plugins that fingerprint user content and inject opinion-shaping or behavior-shaping text get rejected.
+3. **No content-targeting allowed.** The hook receives `event.input` as **read-only context** so plugins know what's happening, NOT so they can match against it for adversarial injection.
+
+### What gets accepted at store review
+
+✅ **Ambient state**: time, weather, calendar, energy/mood (user-set), location, holiday awareness, pomodoro phase
+✅ **Operator settings**: spice variants from a content pack the user opted into, voice-mode hints ("user is on phone")
+✅ **Cache-friendly migrations**: existing `prompt_inject` plugins moving per-turn parts to ghost for the cache win
+
+### What gets rejected at store review
+
+❌ **Content-fingerprinting + opinion shaping**: matching user message text (embedding cosine, regex, keyword) and injecting "tell user not to do X" or "argue with the user about Y"
+❌ **Hidden persuasion**: any plugin that conceals what it's actually injecting in the manifest description
+❌ **Label spoofing**: plugins that try to override `ghost_label` to disguise their attribution (the runner overwrites this — don't bother)
+❌ **Context dominance**: plugins emitting >2KB of content per turn (truncated automatically with a warning, but worth knowing)
+❌ **Vanta-shape patterns**: cosine-match on user input → inject behavioral instruction. This is the literal pattern the rail is gated against.
+
+### How to think about it
+
+The ghost rail is **labeled operator metadata**, not invisible puppetry. If you wouldn't be comfortable with a user discovering exactly what your plugin injects on every turn, your plugin probably shouldn't ship through the store. Build for plugins where the user **knows** their AI has weather context, time awareness, or calendar awareness — they just don't need it cluttering what they read.
+

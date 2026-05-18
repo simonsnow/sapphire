@@ -83,6 +83,8 @@ export function renderAIConfig(t, data, opts = {}) {
     }
 
     return `
+        <div id="ed-validation-notice" class="task-validation-notice" style="display:none;margin-top:12px"></div>
+
         <div class="sched-field" style="margin-top:16px">
             <label>\uD83D\uDC64 Persona <span class="help-tip" data-tip="Auto-fills prompt, voice, toolset, model, scopes, and more from a persona profile. You can still override individual settings below.">?</span></label>
             <select id="ed-persona">
@@ -335,6 +337,9 @@ export async function wireAIConfig(modal, t, data) {
             if (aiPrev) aiPrev.textContent = s.prompt && s.prompt !== 'default' ? s.prompt : '';
             const voicePrev = modal.querySelector('#ed-voice-preview');
             if (voicePrev) voicePrev.textContent = s.voice || '';
+            // Toolset just changed via auto-fill — re-run cross-field validation
+            // so the amber notice updates without requiring a manual edit.
+            modal.querySelector('#ed-toolset')?.dispatchEvent(new Event('change'));
         } catch (e) { console.warn('Failed to load persona:', e); }
     });
 
@@ -405,6 +410,61 @@ export async function wireAIConfig(modal, t, data) {
 
     // Scope "+" button handler is now wired via the shared renderer's onCreateScope
     // callback (see the scopeContainer block above). No separate querySelectorAll needed.
+
+    // Cross-field validation: re-runs on toolset / context-limit change.
+    // Only one rule today — context_limit too low for the selected toolset's
+    // schema cost. Top-of-modal amber notice; never blocks save.
+    const runValidation = () => _validateAIConfig(modal, data);
+    modal.querySelector('#ed-toolset')?.addEventListener('change', runValidation);
+    modal.querySelector('#ed-context-limit')?.addEventListener('input', runValidation);
+    runValidation();
+}
+
+// ── Validation ──
+
+// Rough estimate — a typical OpenAI-style tool schema runs 60-150 tokens
+// depending on description length. 100/tool is the empirical mean across
+// Sapphire's built-in toolsets. Used only for warn thresholds, not budgets.
+const _TOKENS_PER_TOOL_ESTIMATE = 100;
+
+function _validateAIConfig(modal, data) {
+    const notice = modal.querySelector('#ed-validation-notice');
+    if (!notice) return;
+
+    const toolsetName = modal.querySelector('#ed-toolset')?.value || 'none';
+    const ctxLimit = parseInt(modal.querySelector('#ed-context-limit')?.value) || 0;
+
+    const issues = [];
+
+    // Rule 1: context_limit too low for selected toolset.
+    // ctxLimit=0 means "use global" — skip this rule, can't reason about it
+    // here. (Server-side trim will handle it against config.CONTEXT_LIMIT.)
+    if (ctxLimit > 0 && toolsetName && toolsetName !== 'none') {
+        const ts = (data.toolsets || []).find(t => t.name === toolsetName);
+        const toolCount = ts?.function_count || 0;
+        const estCost = toolCount * _TOKENS_PER_TOOL_ESTIMATE;
+        // Warn if schemas alone would consume >2/3 of the budget. The actual
+        // overflow check on the backend uses real tiktoken counts, but for a
+        // heads-up at modal time this estimate catches the obvious cases.
+        if (toolCount > 5 && estCost * 1.5 > ctxLimit) {
+            issues.push(
+                `<strong>Context window may be too low</strong> &mdash; the ` +
+                `<em>${toolsetName}</em> toolset has ~${toolCount} tools ` +
+                `(~${estCost.toLocaleString()} schema tokens) which approaches ` +
+                `or exceeds your ${ctxLimit.toLocaleString()}-token budget. ` +
+                `The task will likely fail on first run. ` +
+                `Raise context window or use a smaller toolset.`
+            );
+        }
+    }
+
+    if (issues.length === 0) {
+        notice.style.display = 'none';
+        notice.innerHTML = '';
+    } else {
+        notice.style.display = '';
+        notice.innerHTML = issues.map(i => `<div>${i}</div>`).join('');
+    }
 }
 
 /**

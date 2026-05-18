@@ -53,6 +53,14 @@ def _build_import_map():
         rel = js_file.relative_to(STATIC_DIR).as_posix()
         url = f"/static/{rel}"
         imports[url] = f"{url}?v={BOOT_VERSION}"
+
+    # Bare-specifier mappings for CDN libraries used via /cdn-cache/. Lets
+    # esm.sh's `?external=three` addons (GLTFLoader, OrbitControls) resolve
+    # `import * from "three"` to the cached three.js — sharing one module
+    # instance across all importers so instanceof checks work across them.
+    # 2026-05-13.
+    imports["three"] = "/cdn-cache/esm.sh/three@0.170.0?bundle&target=es2022"
+
     return json.dumps({"imports": imports})
 
 
@@ -87,6 +95,32 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 if USER_PUBLIC_DIR.exists():
     app.mount("/user-assets", StaticFiles(directory=str(USER_PUBLIC_DIR)), name="user-assets")
 
+# Dashboard fonts — bootstrap on import (downloads from Google Fonts on first
+# boot if missing; honors DASHBOARD_FONTS_AUTOFETCH). Mounted regardless so
+# the dir exists before mount; missing files 404 cleanly and CSS falls back.
+USER_FONTS_DIR = PROJECT_ROOT / "user" / "fonts"
+try:
+    from core.font_bootstrap import ensure_dashboard_fonts
+    ensure_dashboard_fonts(PROJECT_ROOT / "user")
+except Exception as _font_e:  # never block boot on font fetch
+    import logging as _logging
+    _logging.getLogger(__name__).warning(f"font bootstrap failed: {_font_e}")
+USER_FONTS_DIR.mkdir(parents=True, exist_ok=True)
+app.mount("/user-fonts", StaticFiles(directory=str(USER_FONTS_DIR)), name="user-fonts")
+
+# Dashboard built-in widgets — register with the central widget registry,
+# then mount their JS render modules at /core-widgets/ so the dashboard
+# host can dynamic-import them.
+try:
+    from core.dashboard_builtins import register_all as _register_builtin_widgets
+    _register_builtin_widgets()
+except Exception as _w_e:
+    import logging as _logging
+    _logging.getLogger(__name__).warning(f"built-in widget registration failed: {_w_e}")
+CORE_WIDGETS_DIR = PROJECT_ROOT / "core" / "dashboard_builtins" / "web"
+CORE_WIDGETS_DIR.mkdir(parents=True, exist_ok=True)
+app.mount("/core-widgets", StaticFiles(directory=str(CORE_WIDGETS_DIR)), name="core-widgets")
+
 # Plugin web assets — serves from plugins/{name}/web/ and user/plugins/{name}/web/
 SYSTEM_PLUGINS_DIR = PROJECT_ROOT / "plugins"
 USER_PLUGINS_DIR_WEB = PROJECT_ROOT / "user" / "plugins"
@@ -118,6 +152,140 @@ async def serve_plugin_web(plugin_name: str, path: str, _=Depends(require_login)
             content_type = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
             return FileResponse(file_path, media_type=content_type)
     return JSONResponse({"error": "Not found"}, status_code=404)
+
+# ── CDN cache proxy ─────────────────────────────────────────────────────────
+# Plugins that need browser-side libraries (three.js, etc.) can import via
+# /cdn-cache/<host>/<path> instead of hitting esm.sh/jsdelivr/unpkg directly.
+# First request fetches + caches to user/cdn_cache/<sha256>; subsequent
+# requests serve from disk. Cache is permanent — CDN URLs are version-pinned
+# (e.g. three@0.170.0), so stale isn't a concern. Allowlist prevents the
+# endpoint from becoming an open relay. Added 2026-05-13 — avatar was the
+# only CDN consumer; drives' Chart.js dep was removed earlier today.
+
+CDN_HOST_ALLOWLIST = {"esm.sh", "cdn.jsdelivr.net", "unpkg.com"}
+CDN_CACHE_DIR = (PROJECT_ROOT / "user" / "cdn_cache").resolve()
+CDN_FETCH_TIMEOUT = 30.0
+
+# Regex: match quoted root-relative module paths inside JS bodies that look
+# like CDN package references — paths that start with `/` and contain
+# `@version` somewhere. Conservative — won't rewrite arbitrary `/foo/bar`
+# strings, only paths with the @digit signature CDNs use for pinned versions.
+import re as _re
+_CDN_PATH_REWRITE_RE = _re.compile(
+    r'''(["'])(/[^"'\s]*?@\d[^"'\s]*?)(["'])'''
+)
+
+
+def _rewrite_cdn_paths(body_bytes: bytes, host: str) -> bytes:
+    """Rewrite root-relative paths in JS module responses to flow back through
+    /cdn-cache/<host>/. esm.sh's `?bundle` output references internal files
+    via root-relative imports (e.g. `from "/three@0.170.0/es2022/three.bundle.mjs"`)
+    which would otherwise resolve against the document origin and 404.
+    """
+    try:
+        body_str = body_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        return body_bytes  # binary — don't touch
+    rewritten = _CDN_PATH_REWRITE_RE.sub(
+        lambda m: f'{m.group(1)}/cdn-cache/{host}{m.group(2)}{m.group(3)}',
+        body_str,
+    )
+    return rewritten.encode("utf-8")
+
+
+@app.get("/cdn-cache/{path:path}")
+async def serve_cdn_cache(request: Request, path: str, _=Depends(require_login)):
+    """Local cache proxy for whitelisted CDN libraries.
+
+    Path: <host>/<remaining-url-path>, query string preserved.
+    Cache key: SHA256 of full upstream URL (including query).
+    JS responses get root-relative module paths rewritten so subimports
+    flow back through us — necessary for esm.sh's bundle format.
+    """
+    import hashlib as _hashlib
+    from fastapi.responses import Response as _Response
+
+    if "/" not in path:
+        host, rest = path, ""
+    else:
+        host, rest = path.split("/", 1)
+    if host not in CDN_HOST_ALLOWLIST:
+        raise HTTPException(status_code=400, detail=f"host not allowed: {host}")
+
+    query = request.url.query or ""
+    upstream_url = f"https://{host}/{rest}"
+    if query:
+        upstream_url = f"{upstream_url}?{query}"
+
+    key = _hashlib.sha256(upstream_url.encode("utf-8")).hexdigest()
+    cache_file = CDN_CACHE_DIR / key
+    meta_file = CDN_CACHE_DIR / f"{key}.ct"
+
+    # Cache hit
+    if cache_file.exists() and meta_file.exists():
+        try:
+            content_type = meta_file.read_text(encoding="utf-8").strip()
+        except Exception:
+            content_type = "application/octet-stream"
+        return _Response(content=cache_file.read_bytes(),
+                         media_type=content_type or "application/octet-stream")
+
+    # Cache miss — fetch upstream. SSRF prevention: don't follow redirects
+    # blindly; resolve each hop manually so we can re-validate the target
+    # host against the allowlist. A compromised or sloppily-configured CDN
+    # could otherwise redirect to 127.0.0.1, metadata endpoints, or internal
+    # services running on the same VPS. Hop cap = 5 (sane). 2026-05-13.
+    try:
+        import httpx as _httpx
+        from urllib.parse import urljoin, urlparse
+
+        current_url = upstream_url
+        hops = 0
+        async with _httpx.AsyncClient(timeout=CDN_FETCH_TIMEOUT) as client:
+            while True:
+                r = await client.get(current_url, follow_redirects=False)
+                if r.status_code in (301, 302, 303, 307, 308):
+                    if hops >= 5:
+                        raise HTTPException(status_code=502,
+                                            detail="cdn redirect chain too long")
+                    location = r.headers.get("location", "")
+                    if not location:
+                        break
+                    next_url = urljoin(current_url, location)
+                    next_host = urlparse(next_url).hostname or ""
+                    if next_host not in CDN_HOST_ALLOWLIST:
+                        raise HTTPException(
+                            status_code=502,
+                            detail=f"cdn redirect to disallowed host: {next_host}",
+                        )
+                    current_url = next_url
+                    hops += 1
+                    continue
+                break
+
+        if r.status_code != 200:
+            raise HTTPException(status_code=502,
+                                detail=f"upstream {host} returned {r.status_code}")
+        content = r.content
+        content_type = r.headers.get("content-type", "application/octet-stream")
+
+        # Rewrite root-relative module paths in JS responses so subimports
+        # flow back through the proxy.
+        if "javascript" in content_type.lower() or "ecmascript" in content_type.lower():
+            content = _rewrite_cdn_paths(content, host)
+
+        # Atomic write
+        CDN_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = cache_file.with_suffix(".tmp")
+        tmp.write_bytes(content)
+        tmp.replace(cache_file)
+        meta_file.write_text(content_type, encoding="utf-8")
+        return _Response(content=content, media_type=content_type)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"cdn fetch failed: {e}")
+
 
 # Avatar assets (user/avatar/)
 @app.get("/api/avatar/{filename}")
@@ -235,6 +403,53 @@ async def security_headers(request: Request, call_next):
     response.headers['X-Content-Type-Options'] = 'nosniff'
     response.headers['X-Frame-Options'] = 'DENY'
     response.headers['X-XSS-Protection'] = '1; mode=block'
+
+    # Permissive CSP — defense in depth around the community-content surfaces.
+    # 'unsafe-inline' on script-src and style-src is required because Sapphire's
+    # templates use inline <script> and inline style="" attributes throughout
+    # (see login.html, setup.html, index.html). Even with that allowance, the
+    # CSP still blocks the high-impact attacks:
+    #   - connect-src 'self' prevents any XSS from exfiltrating session cookie
+    #     via fetch/XHR to an attacker domain
+    #   - frame-ancestors 'none' blocks clickjacking
+    #   - default-src 'self' blocks surprise external resource loads
+    #
+    # Allowed external script CDNs: esm.sh, jsdelivr, unpkg — the standard
+    # ESM hosts plugin authors use to load runtime deps (e.g. avatar plugin
+    # imports three.js from esm.sh). Plugins using exotic CDNs need to vendor
+    # or use these.
+    #
+    # blob: in media-src is required for TTS playback — `URL.createObjectURL`
+    # returns blob: URLs that <audio src> consumes. blob: in img-src covers
+    # generated-image surfaces (image-gen plugin and similar).
+    #
+    # blob: in connect-src is required for three.js GLTFLoader to decode
+    # embedded GLB textures: it extracts each image as a Blob, wraps it in
+    # `URL.createObjectURL`, then `ImageBitmapLoader` calls `fetch(blobUrl)`
+    # on it. Without `blob:` in connect-src, that fetch is silently
+    # CSP-blocked, the texture never binds, and the avatar renders with
+    # white surfaces (geometry + animation still work because the GLB
+    # buffer load is XHR to same-origin /api/avatar/<file>). 2026-05-11.
+    # blob: in worker-src is cheap insurance for any future loader that
+    # spawns a worker from a blob (KTX2 transcoder, Draco mesh decoder,
+    # basis-universal, etc.). blob: URLs are ephemeral and same-origin
+    # by construction — no exfiltration risk added.
+    #
+    # Tightening to strict CSP requires cleaning up the inline handlers across
+    # the codebase first — out of scope.
+    response.headers['Content-Security-Policy'] = (
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline' https://esm.sh https://cdn.jsdelivr.net https://unpkg.com; "
+        "style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data: blob: https:; "
+        "media-src 'self' blob:; "
+        "font-src 'self' data:; "
+        "connect-src 'self' blob:; "
+        "worker-src 'self' blob:; "
+        "frame-ancestors 'none'; "
+        "base-uri 'self'; "
+        "form-action 'self'"
+    )
 
     # Static assets: cached 1hr, busted by ?v=BOOT_VERSION (changes every restart)
     # Import map in index.html ensures ALL JS modules get versioned URLs
@@ -456,41 +671,47 @@ def _apply_chat_settings(system, settings: dict):
         if "prompt" in settings:
             prompt_name = settings["prompt"]
             prompt_data = prompts.get_prompt(prompt_name)
-            content = prompt_data.get('content', '') if isinstance(prompt_data, dict) else ''
-            if content:
+            # Existence is "prompt_data is a dict", NOT "content is truthy".
+            # The 'blank' prompt is an intentional empty-content prompt — it
+            # exists so users can run with NO system prompt. Treating empty
+            # content as "missing" silently kept the previous prompt loaded
+            # (Sapphire) and made `blank` a no-op. 2026-04-27 fix.
+            if isinstance(prompt_data, dict):
+                content = prompt_data.get('content', '') or ''
                 system.llm_chat.set_system_prompt(content)
                 prompts.set_active_preset_name(prompt_name)
 
                 if hasattr(prompts.prompt_manager, 'scenario_presets') and prompt_name in prompts.prompt_manager.scenario_presets:
                     prompts.apply_scenario(prompt_name)
 
-                logger.info(f"Applied prompt: {prompt_name}")
+                logger.info(f"Applied prompt: {prompt_name}{' (empty content — blank mode)' if not content else ''}")
             else:
-                # Chat settings named a prompt that no longer exists (likely
-                # deleted after the chat was configured with it). Fall back to
-                # 'default' loudly AND rewrite the chat's settings so the
-                # next activation doesn't take the same wrong turn. Silent
-                # no-op here = chat sticks with whatever prompt the previous
-                # chat left loaded. H3 fix 2026-04-22.
+                # Prompt genuinely missing — fall back to 'default' if it
+                # exists, and rewrite chat settings so the next activation
+                # doesn't take the same wrong turn. H3 fix 2026-04-22.
                 logger.warning(
                     f"Chat references unknown prompt '{prompt_name}' "
                     f"— falling back to 'default' and rewriting chat settings."
                 )
                 default_data = prompts.get_prompt('default')
-                default_content = default_data.get('content', '') if isinstance(default_data, dict) else ''
-                if default_content:
+                if isinstance(default_data, dict):
+                    default_content = default_data.get('content', '') or ''
                     system.llm_chat.set_system_prompt(default_content)
                     prompts.set_active_preset_name('default')
                 try:
                     chat_name = system.llm_chat.session_manager.get_active_chat_name()
                     if chat_name:
+                        # update_chat_settings takes ONE dict arg, not two
+                        # (it operates on the active chat). Old 2-arg call
+                        # raised TypeError silently inside the try/except,
+                        # so the chat's prompt setting kept pointing at the
+                        # missing name. 2026-04-27 fix.
                         system.llm_chat.session_manager.update_chat_settings(
-                            chat_name, {"prompt": "default"}
+                            {"prompt": "default"}
                         )
                 except Exception as e:
                     logger.debug(f"Could not rewrite chat.prompt after fallback: {e}")
                 try:
-                    from core.event_bus import publish, Events
                     publish(Events.SETTINGS_CHANGED, {
                         "key": "chat_prompt_fallback",
                         "value": "default",
@@ -572,8 +793,12 @@ def reapply_if_active(system, domain: str, name: str):
             publish(Events.TOOLSET_CHANGED, {"name": name})
         elif domain == 'prompt':
             data = prompts.get_prompt(name)
-            content = data.get('content', '') if isinstance(data, dict) else ''
-            if content:
+            # Same fix as _apply_chat_settings: existence is "is dict",
+            # not "content truthy". An intentionally-empty prompt (the
+            # 'blank' prompt) must hot-reload correctly when edited.
+            # 2026-04-27 fix.
+            if isinstance(data, dict):
+                content = data.get('content', '') or ''
                 system.llm_chat.set_system_prompt(content)
                 publish(Events.PROMPT_CHANGED, {"name": name, "action": "reapplied"})
         elif domain == 'persona':
@@ -604,6 +829,9 @@ from core.routes.plugins import router as plugins_router
 from core.routes.media import router as media_router
 from core.routes.agents import router as agents_router
 from core.routes.docs import router as docs_router
+from core.routes.store import router as store_router
+from core.routes.dashboard import router as dashboard_router
+from core.routes.body import router as body_router
 
 app.include_router(chat_router)
 app.include_router(tts_router)
@@ -615,4 +843,7 @@ app.include_router(plugins_router)
 app.include_router(media_router)
 app.include_router(agents_router)
 app.include_router(docs_router)
+app.include_router(store_router)
+app.include_router(dashboard_router)
+app.include_router(body_router)
 

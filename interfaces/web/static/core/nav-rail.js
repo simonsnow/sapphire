@@ -115,7 +115,15 @@ function initMobileOverflow(rail) {
                 const btn = document.createElement('button');
                 btn.className = 'nav-overflow-item';
                 btn.dataset.view = viewId;
-                btn.innerHTML = `<span>${icon}</span><span>${label}</span>`;
+                // textContent-derived but still going through innerHTML — use
+                // DOM API so the round-trip stays safe even if upstream nav
+                // items ever start carrying HTML. Day-ruiner #A defense-depth.
+                const iconSpan = document.createElement('span');
+                iconSpan.textContent = icon;
+                const labelSpan = document.createElement('span');
+                labelSpan.textContent = label;
+                btn.appendChild(iconSpan);
+                btn.appendChild(labelSpan);
                 menu.appendChild(btn);
             });
         }

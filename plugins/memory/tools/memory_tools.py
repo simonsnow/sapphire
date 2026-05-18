@@ -795,12 +795,27 @@ def _save_memory(content: str, label: str = None, scope: str = 'default',
         embedding_blob = None
         embedding_provider = None
         embedding_dim = None
+        embed_failed_mid_session = False
         embedder = _get_embedder()
         if embedder.available:
             embs = embedder.embed([content], prefix='search_document')
             if embs is not None:
                 from core.embeddings import stamp_embedding
                 embedding_blob, embedding_provider, embedding_dim = stamp_embedding(embs[0], embedder)
+            else:
+                # Embedder is available but the call returned None — transient
+                # failure (network blip on remote provider, model reload).
+                # Pre-fix, we silently INSERTed with embedding=NULL and the
+                # global `_backfill_done` latch may already be True from
+                # earlier in the session, so the unembedded row would never
+                # be picked up by re-embed. Clear the latch so the next
+                # search-triggered backfill sweep picks this row up. Memory
+                # day-ruiner scout 2026-05-07 #H.
+                embed_failed_mid_session = True
+                logger.warning(
+                    "[MEMORY] Embed call returned None during save — row will be "
+                    "stored with NULL vector and re-embedded on next search."
+                )
 
         with _get_connection() as conn:
             cursor = conn.cursor()
@@ -811,6 +826,13 @@ def _save_memory(content: str, label: str = None, scope: str = 'default',
             )
             memory_id = cursor.lastrowid
             conn.commit()
+
+        if embed_failed_mid_session:
+            # Clear the latch so the next search-time backfill picks up
+            # this row. `global` write because `_backfill_done` is module-
+            # level state; safe under save's serialized path.
+            global _backfill_done
+            _backfill_done = False
 
         label_str = f", label: {label}" if label else ""
         priv_str = " [private]" if private_key else ""

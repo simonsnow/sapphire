@@ -17,129 +17,11 @@ from core import prompts
 from core.stt.stt_null import NullWhisperClient as _NullWhisperClient
 from core.stt.utils import can_transcribe
 from core.wakeword.wakeword_null import NullWakeWordDetector as _NullWakeWordDetector
+from core.chat.display_format import format_messages_for_display
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
-
-
-def format_messages_for_display(messages):
-    """Transform message structure into display format for UI."""
-    display_messages = []
-    current_block = None
-
-    def finalize_block(block):
-        result = {
-            "role": "assistant",
-            "parts": block.get("parts", []),
-            "timestamp": block.get("timestamp")
-        }
-        if block.get("metadata"):
-            result["metadata"] = block["metadata"]
-        if block.get("persona"):
-            result["persona"] = block["persona"]
-        return result
-
-    for msg in messages:
-        role = msg.get("role")
-
-        if role == "user":
-            if current_block:
-                display_messages.append(finalize_block(current_block))
-                current_block = None
-
-            content = msg.get("content", "")
-            user_msg = {
-                "role": "user",
-                "timestamp": msg.get("timestamp")
-            }
-            if msg.get("persona"):
-                user_msg["persona"] = msg["persona"]
-
-            if isinstance(content, list):
-                text_parts = []
-                images = []
-                user_files = []
-                for block in content:
-                    if isinstance(block, dict):
-                        if block.get("type") == "text":
-                            text_parts.append(block.get("text", ""))
-                        elif block.get("type") == "image":
-                            images.append({
-                                "data": block.get("data", ""),
-                                "media_type": block.get("media_type", "image/jpeg")
-                            })
-                        elif block.get("type") == "file":
-                            user_files.append({
-                                "filename": block.get("filename", ""),
-                                "text": block.get("text", "")
-                            })
-                    elif isinstance(block, str):
-                        text_parts.append(block)
-                user_msg["content"] = " ".join(text_parts)
-                if images:
-                    user_msg["images"] = images
-                if user_files:
-                    user_msg["files"] = user_files
-            else:
-                user_msg["content"] = content
-
-            display_messages.append(user_msg)
-
-        elif role == "assistant":
-            if current_block is None:
-                current_block = {
-                    "role": "assistant",
-                    "parts": [],
-                    "timestamp": msg.get("timestamp")
-                }
-
-            content = msg.get("content", "")
-            if content:
-                current_block["parts"].append({
-                    "type": "content",
-                    "text": content
-                })
-
-            if msg.get("metadata"):
-                current_block["metadata"] = msg["metadata"]
-
-            if msg.get("persona") and "persona" not in current_block:
-                current_block["persona"] = msg["persona"]
-
-            if msg.get("tool_calls"):
-                for tc in msg.get("tool_calls", []):
-                    current_block["parts"].append({
-                        "type": "tool_call",
-                        "id": tc.get("id"),
-                        "name": tc.get("function", {}).get("name"),
-                        "arguments": tc.get("function", {}).get("arguments")
-                    })
-
-        elif role == "tool":
-            if current_block is None:
-                current_block = {
-                    "role": "assistant",
-                    "parts": [],
-                    "timestamp": msg.get("timestamp")
-                }
-
-            tool_part = {
-                "type": "tool_result",
-                "name": msg.get("name"),
-                "result": msg.get("content", ""),
-                "tool_call_id": msg.get("tool_call_id")
-            }
-
-            if "tool_inputs" in msg:
-                tool_part["inputs"] = msg["tool_inputs"]
-
-            current_block["parts"].append(tool_part)
-
-    if current_block:
-        display_messages.append(finalize_block(current_block))
-
-    return display_messages
 
 
 @router.get("/api/health")
@@ -197,7 +79,15 @@ async def handle_chat(request: Request, _=Depends(require_login), system=Depends
         response = await asyncio.to_thread(system.process_llm_query, data['text'], True)
     finally:
         system.web_active_dec()
-    return {"response": response}
+    # Drain any UX notices the chat run wanted to surface (dangling toolset,
+    # empty-content fallback). Notices are transient — read + clear so they
+    # don't bleed into the next turn.
+    notices = system.llm_chat.pending_notices
+    system.llm_chat.pending_notices = []
+    payload = {"response": response}
+    if notices:
+        payload["notices"] = notices
+    return payload
 
 
 @router.post("/api/chat/stream")
@@ -250,6 +140,8 @@ async def handle_chat_stream(request: Request, _=Depends(require_login), system=
                             yield f"data: {json.dumps({'type': 'tool_end', 'id': event.get('id'), 'name': event.get('name'), 'result': event.get('result', ''), 'error': event.get('error', False)})}\n\n"
                         elif event_type == "reload":
                             yield f"data: {json.dumps({'type': 'reload'})}\n\n"
+                        elif event_type == "notice":
+                            yield f"data: {json.dumps({'type': 'notice', 'message': event.get('message', ''), 'severity': event.get('severity', 'warning')})}\n\n"
                         else:
                             yield f"data: {json.dumps(event)}\n\n"
                     else:

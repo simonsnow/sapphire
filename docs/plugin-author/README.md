@@ -10,7 +10,7 @@ A plugin is a package that can contain tools, yes, but also hooks into parts of 
 
 - **Intercept voice input** after speech-to-text, before the LLM ever sees it (`post_stt`)
 - **Filter or rewrite the AI's response** before it's saved to history (`post_llm`)
-- **Inject context into the system prompt** every turn, silently (`prompt_inject`)
+- **Inject context into the system prompt** every turn, silently (`prompt_inject`) — long-lived state. For per-turn ephemera (time, weather, mood) that should NOT break cache, use `ghost_inject` instead.
 - **Block or modify tool arguments** before execution (`pre_execute`)
 - **Control TTS** — change the voice, rewrite text, or cancel speech entirely (`pre_tts`)
 - **React to wakeword detection** before recording starts (`on_wake`)
@@ -32,12 +32,13 @@ A tool is a single function the AI can call. A plugin is an autonomous package t
 | Guide | What's Inside |
 |-------|--------------|
 | [Manifest](manifest.md) | `plugin.json` reference — fields, priority bands, directory structure |
-| [Hooks](hooks.md) | All 10 hook points, HookEvent fields, system access, examples |
+| [Hooks](hooks.md) | All 11 hook points (incl. `ghost_inject`), HookEvent fields, system access, examples |
 | [Voice Commands](voice-commands.md) | Keyword triggers that bypass the LLM — match modes, handlers, macros |
 | [Tools](tools.md) | Tool file format, schema flags, scopes, reading settings, privacy patterns |
 | [Routes](routes.md) | Custom HTTP endpoints — path params, auth enforcement, handler signature |
 | [Schedule](schedule.md) | Cron tasks — manifest fields, handler contract, examples |
 | [Daemons](daemons.md) | Background event listeners — Telegram, Discord, Email, custom sources |
+| [Widgets](widgets.md) | Dashboard panels — manifest, render contract, settings schema, sample plugin |
 | [Settings](settings.md) | Manifest-declared settings, custom web UI, settings API, danger confirms |
 | [Web UI](web-ui.md) | Shared JS modules, CSS variables, modals, CSRF, style injection |
 | [Signing](signing.md) | Verification states, sideloading, signing your own plugins |

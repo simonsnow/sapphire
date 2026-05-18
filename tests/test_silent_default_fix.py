@@ -79,11 +79,23 @@ def test_ask_sapphire_rejects_empty_settings_response():
 
 # ─── executor: warn-not-silent on missing scope keys ─────────────────────
 
-def test_executor_warns_when_task_missing_scope_keys(caplog):
-    """[REGRESSION_GUARD] _extract_task_settings used to silently substitute
-    'default' for any missing scope key. Now it still does (for backward
-    compat) but emits a WARNING so the silent-default bug class is visible
-    in logs."""
+def test_executor_omits_missing_scope_keys_and_warns(caplog):
+    """[REGRESSION_GUARD] Pre-2026-05-07, _extract_task_settings silently
+    substituted 'default' for missing scope keys (with a warning). That
+    fallback defeated the force-None protection in
+    `execution_context.py:_build_scopes` — by the time it ran, every key
+    was already in task_settings, so the `if setting_key not in
+    task_settings` branch was dead code. Tasks with missing scopes
+    silently wrote to shared 'default' memory.
+
+    Today's fix: the pre-fill is removed. Missing keys now propagate to
+    ExecutionContext where force-None DISABLES the scope (sets ContextVar
+    to None). The warning still fires for diagnostic visibility.
+
+    Assertion: missing keys are NOT in the returned settings (so
+    force-None can fire downstream), AND the warning is emitted.
+
+    See `scope_isolation_is_fine.md` 2026-05-07 update."""
     from core.continuity.executor import ContinuityExecutor
     task = {
         "name": "test-missing-scopes",
@@ -93,9 +105,14 @@ def test_executor_warns_when_task_missing_scope_keys(caplog):
     }
     with caplog.at_level(logging.WARNING, logger='core.continuity.executor'):
         settings = ContinuityExecutor._extract_task_settings(task)
-    # Still returned — backward compat
-    assert settings['memory_scope'] == 'default'
-    # But logged loudly
+    # Missing scope keys must NOT be present in the returned dict — that's
+    # what lets `_build_scopes` force-None them. If a future change re-adds
+    # the 'default' fallback, this assertion fails loud.
+    assert 'memory_scope' not in settings, (
+        f"memory_scope should NOT be in extracted settings (forces silent "
+        f"'default' fallback to land in shared scope). got: {settings.get('memory_scope')!r}"
+    )
+    # But logged loudly so users see the omission
     msgs = [r.message for r in caplog.records]
     assert any('missing scope keys' in m for m in msgs), \
         f"expected 'missing scope keys' warning, got: {msgs}"

@@ -165,41 +165,33 @@ class ClaudeProvider(BaseProvider):
         cache_ttl = claude_config.get('cache_ttl', '5m')
         
         # Skip system-prompt caching when we know the prompt text changes
-        # between turns. All these cause guaranteed cache misses plus a
-        # 25% write penalty, so the net is worse than no cache.
+        # between turns — those cause guaranteed cache misses plus a 25%
+        # write penalty, so the net is worse than no cache.
         #
-        # What we catch:
-        #   - spice_enabled: randomized persona lines each turn
-        #   - inject_datetime: "Current time is X" — changes per minute
-        #   - prompt_inject hooks: ANY registered plugin hook can append
-        #     per-turn content to the system prompt (see chat.py:258).
+        # 2026-05-08 — spice and inject_datetime moved to the ghost-message
+        # rail (core/ghost_messages.py), which lives OUTSIDE the cached
+        # prefix. They no longer mutate the system prompt, so they no
+        # longer disqualify it from caching. Pre-fix this gate disabled
+        # cache for almost every user (spice defaults on). Removing those
+        # checks here is THE big-win cache change.
+        #
+        # Still gated by:
+        #   - prompt_inject hooks: a plugin handler can append to the
+        #     system prompt's `context_parts` (see chat.py:_get_system_prompt).
         #     We don't know what the hook produces, so we assume dynamic.
         #     Conservative — if a plugin only injects static strings, the
-        #     plugin author can opt its hook out of this by not registering
-        #     when idle, or we can add a per-hook "dynamic" flag later.
+        #     plugin author can move to ghost_inject for per-turn content
+        #     instead, which keeps the cache live.
         # Tools still cache separately (they're stable across turns).
         cache_system_prompt = True
         if cache_enabled:
             try:
-                from core import system as sys_module
-                if hasattr(sys_module, 'system_instance') and sys_module.system_instance:
-                    chat_settings = sys_module.system_instance.llm_chat.session_manager.get_chat_settings()
-                    if chat_settings.get('spice_enabled', False):
-                        cache_system_prompt = False
-                        logger.debug("[CACHE] Spice enabled - skipping system prompt cache")
-                    elif chat_settings.get('inject_datetime', False):
-                        cache_system_prompt = False
-                        logger.debug("[CACHE] Datetime injection enabled - skipping system prompt cache")
-                # prompt_inject hook registered by any plugin → assume dynamic.
-                # Checked even when sys_module isn't available since hook_runner
-                # is a module-level singleton.
-                if cache_system_prompt:
-                    from core.hooks import hook_runner
-                    if hook_runner.has_handlers("prompt_inject"):
-                        cache_system_prompt = False
-                        logger.debug("[CACHE] prompt_inject hook registered - skipping system prompt cache")
+                from core.hooks import hook_runner
+                if hook_runner.has_handlers("prompt_inject"):
+                    cache_system_prompt = False
+                    logger.debug("[CACHE] prompt_inject hook registered - skipping system prompt cache")
             except Exception as e:
-                logger.debug(f"[CACHE] Could not check chat settings: {e}")
+                logger.debug(f"[CACHE] Could not check hook state: {e}")
 
         return cache_enabled, cache_ttl, cache_system_prompt
     
@@ -230,9 +222,17 @@ class ClaudeProvider(BaseProvider):
                 system_prompt, dynamic_system, cache_enabled, cache_system_prompt, cache_ttl
             )
 
+        # Phase 1.5 — extend cache through history. System+tools already
+        # caches; this adds a cache_control marker on the last history
+        # message, which makes the cached prefix cover the full conversation
+        # except the ghost + new user input. ~80% input cost reduction on
+        # long chats. 2026-05-08.
+        if cache_enabled:
+            self._apply_history_cache_control(claude_messages, cache_ttl)
+
         if "temperature" in params:
             request_kwargs["temperature"] = params["temperature"]
-        
+
         # Add extended thinking if enabled (unless explicitly disabled)
         # Read from provider config first, fall back to global config
         thinking_enabled = self.config.get('thinking_enabled')
@@ -320,9 +320,14 @@ class ClaudeProvider(BaseProvider):
                 system_prompt, dynamic_system, cache_enabled, cache_system_prompt, cache_ttl
             )
 
+        # Phase 1.5 — see chat_completion() for rationale. Extends cache
+        # through full history; only ghost+new-user is fresh.
+        if cache_enabled:
+            self._apply_history_cache_control(claude_messages, cache_ttl)
+
         if "temperature" in params:
             request_kwargs["temperature"] = params["temperature"]
-        
+
         # Add extended thinking if enabled (unless explicitly disabled for this request)
         # Read from provider config first, fall back to global config
         thinking_enabled = self.config.get('thinking_enabled')
@@ -566,6 +571,12 @@ class ClaudeProvider(BaseProvider):
         
         Claude expects tool results as user messages with tool_result content blocks.
         """
+        # Anthropic API rejects tool_result blocks with empty/whitespace content
+        # with a 400. The history-replay path (line ~790) substitutes
+        # "(empty result)" — this live path didn't, so streams died mid-turn
+        # when any tool returned an empty string. Now symmetric. 2026-05-16.
+        if not result or not str(result).strip():
+            result = "(empty result)"
         return {
             "role": "user",
             "content": [
@@ -576,7 +587,7 @@ class ClaudeProvider(BaseProvider):
                 }
             ]
         }
-    
+
     def _strip_thinking_blocks(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
         Strip thinking blocks from converted Claude messages.
@@ -627,6 +638,69 @@ class ClaudeProvider(BaseProvider):
         # Remap foreign IDs deterministically — same input always gives same output
         h = hashlib.sha256(tool_id.encode()).hexdigest()[:24]
         return f"toolu_{h}"
+
+    def _apply_history_cache_control(self, claude_messages: list, cache_ttl: str) -> None:
+        """Place a cache_control marker on the last message before ghost/new-user.
+
+        Phase 1.5 of cache work (2026-05-08). System prompt + tools are
+        already cached via separate markers in `_build_system_blocks` and
+        `_convert_tools`. This method extends the cached prefix THROUGH the
+        conversation history — only the ghost message + new user input are
+        fresh tokens per turn.
+
+        Detection: the new user message is always the LAST message. The
+        ghost message (when present) is a user-role string starting with
+        the envelope header from `core/ghost_messages.py`. If we find one,
+        place the cache marker on the message BEFORE it (the actual last
+        history turn). Otherwise place it on the second-to-last (which is
+        then the last history turn directly).
+
+        Anthropic auto-skips cache for blocks below the model's minimum
+        cacheable size (~1024 tokens), so short histories silently no-op
+        rather than paying the 1.25x cache-write premium for nothing.
+        """
+        if not claude_messages or len(claude_messages) < 2:
+            return  # too short for any cacheable history
+
+        # Detect the ghost envelope at second-to-last position.
+        # Import the canonical sentinel so a future rename only touches one
+        # file. Legacy prefix kept inline for transition compatibility.
+        try:
+            from core.ghost_messages import _ENVELOPE_HEADER as _GHOST_PREFIX
+        except Exception:
+            _GHOST_PREFIX = "[Sapphire turn-context"
+        second_to_last = claude_messages[-2]
+        _content = second_to_last.get("content") if isinstance(second_to_last.get("content"), str) else ""
+        is_ghost = (
+            second_to_last.get("role") == "user"
+            and (
+                _content.startswith(_GHOST_PREFIX)
+                or _content.startswith("[Operator metadata for assistant")
+            )
+        )
+        cache_idx = -3 if is_ghost else -2
+        if abs(cache_idx) > len(claude_messages):
+            return  # nothing to cache (e.g., only ghost + new user)
+
+        cache_control = {"type": "ephemeral"}
+        if cache_ttl == '1h':
+            cache_control["ttl"] = "1h"
+
+        target = claude_messages[cache_idx]
+        content = target.get("content")
+        if isinstance(content, str):
+            # Wrap string content in a single text block with cache_control.
+            target["content"] = [{
+                "type": "text",
+                "text": content,
+                "cache_control": cache_control,
+            }]
+        elif isinstance(content, list) and content:
+            # Mark the last block. Copy the dict so we don't mutate any
+            # block object that might be shared across requests.
+            last_block = dict(content[-1])
+            last_block["cache_control"] = cache_control
+            content[-1] = last_block
 
     def _convert_messages(self, messages: List[Dict[str, Any]]) -> tuple:
         """

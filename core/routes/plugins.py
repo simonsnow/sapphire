@@ -36,6 +36,69 @@ STATIC_DIR = PROJECT_ROOT / "interfaces" / "web" / "static"
 
 _install_lock = threading.Lock()
 
+
+def _safe_emoji_icon(icon):
+    """Sanitize a plugin manifest 'icon' field for safe rendering.
+
+    Pre-fix, `manifest.get("icon")` shipped raw to UI for every discovered
+    plugin (signed or not). Multiple frontend sinks then injected it into
+    innerHTML — `<div>${icon}</div>` — which made a malicious manifest
+    `"icon": "<img src=x onerror=fetch('/api/credentials/list')...>"` fire
+    XSS in the admin context the moment the user opened Settings → Plugins.
+    Defense-in-depth: server-side strip non-renderable input AND the client
+    `_esc()` calls (added separately). Day-ruiner scout 2026-05-07 #A.
+
+    We allow common emoji characters and a small set of plain ASCII
+    fallbacks (alphanumerics + space + dash + underscore + .). Anything
+    else (including all `<`, `>`, `&`, `"`, `'`, `script`, etc.) is
+    stripped. If the result is empty, return empty string and the UI
+    will fall back to its default placeholder.
+    """
+    if not icon or not isinstance(icon, str):
+        return ""
+    # Truncate first — manifest fields are user-supplied; bound the input
+    # so a 1MB icon can't even reach the regex.
+    icon = icon[:32]
+    out = []
+    for ch in icon:
+        cp = ord(ch)
+        # Allowed: emoji range, common pictographs, ASCII alphanumeric +
+        # space/dash/underscore/period. NO `<`, `>`, `&`, `"`, `'`, etc.
+        if (
+            (0x1F000 <= cp <= 0x1FFFF) or  # Emoji & symbols
+            (0x2600 <= cp <= 0x27BF) or    # Misc symbols + dingbats
+            (0x2300 <= cp <= 0x23FF) or    # Misc tech (⏰ etc)
+            (0x2000 <= cp <= 0x206F) or    # General punctuation (zero-width joiner etc)
+            (0xFE00 <= cp <= 0xFE0F) or    # Variation selectors (emoji presentation)
+            ch.isalnum() or
+            ch in ' -_.'
+        ):
+            out.append(ch)
+    return ''.join(out).strip()
+
+
+def _safe_http_url(url):
+    """Validate a manifest URL is http(s)://, else return empty.
+
+    Pre-fix, `manifest.get("url")` shipped raw and the plugins UI rendered
+    it into an `<a href>` for the kebab "Open website" link. A manifest
+    `"url": "javascript:fetch('/api/credentials/list')..."` fired JS in
+    admin context on click. Server-side scheme allowlist closes this.
+    Day-ruiner scout 2026-05-07 #E.
+    """
+    if not url or not isinstance(url, str):
+        return ""
+    url = url.strip()
+    # Allow http and https only. Reject javascript:, data:, file:, vbscript:,
+    # protocol-relative `//attacker.com`, and anything with whitespace
+    # (which can smuggle past lazy parsers).
+    if not (url.startswith('https://') or url.startswith('http://')):
+        return ""
+    if any(c in url for c in '\r\n\t '):
+        return ""
+    return url[:512]  # Bound length too
+
+
 # Plugin settings paths
 USER_WEBUI_DIR = PROJECT_ROOT / 'user' / 'webui'
 USER_PLUGINS_JSON = USER_WEBUI_DIR / 'plugins.json'
@@ -166,7 +229,11 @@ async def list_plugins(request: Request, _=Depends(require_login)):
                     "name": info["name"],
                     "enabled": info.get("enabled", info["name"] in enabled_set),
                     "locked": False,
-                    "title": manifest.get("short_name") or manifest.get("description", info["name"]).split("—")[0].strip(),
+                    "title": (
+                        manifest.get("display_name")
+                        or manifest.get("short_name")
+                        or manifest.get("description", info["name"]).split("—")[0].strip()
+                    ),
                     "showInSidebar": False,
                     "collapsible": True,
                     "settingsUI": settings_ui,
@@ -175,10 +242,10 @@ async def list_plugins(request: Request, _=Depends(require_login)):
                     "verify_msg": info.get("verify_msg"),
                     "verify_tier": info.get("verify_tier", "unsigned"),
                     "verified_author": info.get("verified_author"),
-                    "url": manifest.get("url"),
+                    "url": _safe_http_url(manifest.get("url")),
                     "version": manifest.get("version"),
                     "author": manifest.get("author"),
-                    "icon": manifest.get("icon"),
+                    "icon": _safe_emoji_icon(manifest.get("icon")),
                     "band": info.get("band"),
                     "has_script": has_script,
                     "sidebar_accordion": manifest.get("capabilities", {}).get("sidebar_accordion"),
@@ -370,7 +437,7 @@ async def list_apps(_=Depends(require_login)):
         apps.append({
             "name": name,
             "label": app_config.get("label", manifest.get("display_name", name)),
-            "icon": app_config.get("icon", manifest.get("emoji", "")),
+            "icon": _safe_emoji_icon(app_config.get("icon", manifest.get("emoji", ""))),
             "description": app_config.get("description", manifest.get("description", "")),
             "nav": app_config.get("nav", False),
         })
@@ -490,9 +557,17 @@ async def install_plugin(
     url: Optional[str] = Form(None),
     file: Optional[UploadFile] = File(None),
     force: bool = Form(False),
+    source: Optional[str] = Form(None),
+    store_slug: Optional[str] = Form(None),
     _=Depends(require_login),
 ):
-    """Install a plugin from GitHub URL or zip upload."""
+    """Install a plugin from GitHub URL or zip upload.
+
+    Optional store-provenance fields (used by the in-app Plugin Store):
+    - source: free-form origin tag, e.g. "store"
+    - store_slug: catalog slug for cross-reference on update checks
+    Both are persisted to plugin_state when provided; absence is fine.
+    """
     from core.settings_manager import settings
     # Block zip uploads in managed mode (GitHub installs OK — signing gate handles security)
     if settings.is_managed() and file:
@@ -514,17 +589,29 @@ async def install_plugin(
     tmp_dir = None
     try:
         # ── Download or receive zip ──
-        url_install_method = None  # 'github_url' | 'zip_url' (set below)
+        url_install_method = None  # 'github_url' | 'gitlab_url' | 'zip_url' (set below)
         if url:
             import requests as req
+            from urllib.parse import urlparse
             clean_url = url.strip()
+            # Parse once and reuse. The path-only checks below let URLs with
+            # query strings / fragments work — e.g. signed S3 URLs ending
+            # `.zip?token=…` or GitHub/GitLab URLs pasted with tracking params.
+            # We still send the FULL URL (clean_url) on the actual request so
+            # signed-URL tokens reach the server. 2026-04-26 enhancement.
+            _parsed = urlparse(clean_url)
+            _path_lower = (_parsed.path or '').lower()
+            # Strip query/fragment for regex matching against repo URL shapes
+            # (GitHub/GitLab repo URLs don't use meaningful params for cloning).
+            _url_for_match = f"{_parsed.scheme}://{_parsed.netloc}{_parsed.path}"
+
             # Direct .zip URL — undocumented fallback for plugin authors without
             # a reachable GitHub. Downstream validation (zip structure, manifest,
             # signing gate) catches bad content. Two guards here against SSRF:
             # require https:// (no plain http) and reject obvious localhost
             # variants. Doesn't catch DNS rebinding or redirect-to-localhost,
             # but the realistic attack surface for a single-user app is small.
-            if clean_url.lower().endswith('.zip') and clean_url.startswith('https://'):
+            if _path_lower.endswith('.zip') and clean_url.startswith('https://'):
                 _lower = clean_url.lower()
                 if any(bad in _lower for bad in (
                     '://localhost', '://127.', '://0.0.0.0', '://169.254.',
@@ -545,27 +632,60 @@ async def install_plugin(
                     raise HTTPException(status_code=400, detail=f"Failed to download zip (HTTP {r.status_code})")
             else:
                 # Parse GitHub URL → zip download
-                m = re.match(r'https?://github\.com/([^/]+)/([^/]+?)(?:\.git)?/?$', clean_url)
-                if not m:
-                    raise HTTPException(status_code=400, detail="Invalid GitHub URL format")
-                owner, repo = m.group(1), m.group(2)
-                zip_url = f"https://github.com/{owner}/{repo}/archive/refs/heads/main.zip"
-                url_install_method = 'github_url'
-                # GitHub serves the zip via 302 -> codeload.github.com; explicit allowlist.
-                r = req.get(zip_url, stream=True, timeout=30, allow_redirects=False)
-                if r.status_code in (301, 302, 303, 307, 308):
-                    loc = r.headers.get('Location', '')
-                    if loc.startswith('https://codeload.github.com/'):
-                        r = req.get(loc, stream=True, timeout=30, allow_redirects=False)
-                if r.status_code == 404:
-                    zip_url = f"https://github.com/{owner}/{repo}/archive/refs/heads/master.zip"
+                m_gh = re.match(r'https?://github\.com/([^/]+)/([^/]+?)(?:\.git)?/?$', _url_for_match)
+                # Parse GitLab URL → zip download. GitLab supports nested subgroups
+                # so the pre-repo path can have multiple segments (e.g.
+                # gitlab.com/group/subgroup/repo). Capture the full path before
+                # the last segment as <gl_path>, last segment as <gl_repo>.
+                # 2026-04-26 — GitLab support added.
+                m_gl = re.match(r'https?://gitlab\.com/(.+?)/([^/]+?)(?:\.git)?/?$', _url_for_match)
+                if m_gh:
+                    owner, repo = m_gh.group(1), m_gh.group(2)
+                    zip_url = f"https://github.com/{owner}/{repo}/archive/refs/heads/main.zip"
+                    url_install_method = 'github_url'
+                    # GitHub serves the zip via 302 -> codeload.github.com; explicit allowlist.
                     r = req.get(zip_url, stream=True, timeout=30, allow_redirects=False)
                     if r.status_code in (301, 302, 303, 307, 308):
                         loc = r.headers.get('Location', '')
                         if loc.startswith('https://codeload.github.com/'):
                             r = req.get(loc, stream=True, timeout=30, allow_redirects=False)
-                if r.status_code != 200:
-                    raise HTTPException(status_code=400, detail=f"Failed to download from GitHub (HTTP {r.status_code})")
+                    if r.status_code == 404:
+                        zip_url = f"https://github.com/{owner}/{repo}/archive/refs/heads/master.zip"
+                        r = req.get(zip_url, stream=True, timeout=30, allow_redirects=False)
+                        if r.status_code in (301, 302, 303, 307, 308):
+                            loc = r.headers.get('Location', '')
+                            if loc.startswith('https://codeload.github.com/'):
+                                r = req.get(loc, stream=True, timeout=30, allow_redirects=False)
+                    if r.status_code != 200:
+                        raise HTTPException(status_code=400, detail=f"Failed to download from GitHub (HTTP {r.status_code})")
+                elif m_gl:
+                    gl_path, gl_repo = m_gl.group(1), m_gl.group(2)
+                    full_path = f"{gl_path}/{gl_repo}"
+                    # GitLab archive URL pattern. The archive filename inside the
+                    # zip is <repo>-<branch>-<sha>/, which the downstream extract
+                    # already handles via the "find plugin.json at root or one
+                    # level deep, hoist wrapper" logic. allow_redirects=False to
+                    # preserve the SSRF guard pattern from the GitHub branch.
+                    zip_url = f"https://gitlab.com/{full_path}/-/archive/main/{gl_repo}-main.zip"
+                    url_install_method = 'gitlab_url'
+                    r = req.get(zip_url, stream=True, timeout=30, allow_redirects=False)
+                    # GitLab may redirect within gitlab.com (e.g. moved repos).
+                    # Allow only same-host redirects.
+                    if r.status_code in (301, 302, 303, 307, 308):
+                        loc = r.headers.get('Location', '')
+                        if loc.startswith('https://gitlab.com/'):
+                            r = req.get(loc, stream=True, timeout=30, allow_redirects=False)
+                    if r.status_code == 404:
+                        zip_url = f"https://gitlab.com/{full_path}/-/archive/master/{gl_repo}-master.zip"
+                        r = req.get(zip_url, stream=True, timeout=30, allow_redirects=False)
+                        if r.status_code in (301, 302, 303, 307, 308):
+                            loc = r.headers.get('Location', '')
+                            if loc.startswith('https://gitlab.com/'):
+                                r = req.get(loc, stream=True, timeout=30, allow_redirects=False)
+                    if r.status_code != 200:
+                        raise HTTPException(status_code=400, detail=f"Failed to download from GitLab (HTTP {r.status_code})")
+                else:
+                    raise HTTPException(status_code=400, detail="Invalid URL format. Supported: github.com/<owner>/<repo>, gitlab.com/<path>/<repo>, or a direct https:// .zip URL")
             content_length = int(r.headers.get("Content-Length", 0))
             if content_length > MAX_ZIP_SIZE:
                 raise HTTPException(status_code=400, detail=f"Zip too large ({content_length // 1024 // 1024}MB, max 50MB)")
@@ -719,6 +839,17 @@ async def install_plugin(
         else:
             state.save("install_method", "zip_upload")
         state.save("installed_at", datetime.utcnow().isoformat() + "Z")
+        # Optional store-provenance fields. Sanitize light — they land in
+        # the user's own plugin_state file, not a multi-tenant surface.
+        if source:
+            state.save("source", str(source)[:64])
+        if store_slug:
+            # Match bazaar's slug regex so we don't accept garbage that
+            # would fail any later catalog lookup.
+            import re as _re
+            cleaned_slug = _re.sub(r'[^a-z0-9\-_]', '', str(store_slug).lower())[:120]
+            if cleaned_slug:
+                state.save("store_slug", cleaned_slug)
 
         # ── Rescan to discover the new plugin ──
         plugin_loader.rescan()
@@ -799,7 +930,7 @@ async def uninstall_plugin_endpoint(plugin_name: str, _=Depends(require_login)):
 
 @router.get("/api/plugins/{plugin_name}/check-update")
 async def check_plugin_update(plugin_name: str, _=Depends(require_login)):
-    """Check if a newer version is available on GitHub."""
+    """Check if a newer version is available on GitHub or GitLab."""
     import re
     from core.plugin_loader import plugin_loader
 
@@ -809,24 +940,39 @@ async def check_plugin_update(plugin_name: str, _=Depends(require_login)):
 
     state = plugin_loader.get_plugin_state(plugin_name)
     source_url = state.get("installed_from")
-    if not source_url or "github.com" not in source_url:
+    if not source_url:
         return {"update_available": False, "reason": "no_source"}
+    source_url_stripped = source_url.strip()
+    # Strip query/fragment for regex matching — defensive in case a stored
+    # installed_from URL was saved with tracking params. Match install path.
+    from urllib.parse import urlparse
+    _src_parsed = urlparse(source_url_stripped)
+    _src_for_match = f"{_src_parsed.scheme}://{_src_parsed.netloc}{_src_parsed.path}"
 
-    m = re.match(r'https?://github\.com/([^/]+)/([^/]+?)(?:\.git)?/?$', source_url.strip())
-    if not m:
-        return {"update_available": False, "reason": "invalid_url"}
+    # Build the list of raw-manifest URLs to try (main + master, GitHub or
+    # GitLab). 2026-04-26 — GitLab support added alongside GitHub.
+    manifest_urls = []
+    m_gh = re.match(r'https?://github\.com/([^/]+)/([^/]+?)(?:\.git)?/?$', _src_for_match)
+    m_gl = re.match(r'https?://gitlab\.com/(.+?)/([^/]+?)(?:\.git)?/?$', _src_for_match)
+    if m_gh:
+        owner, repo = m_gh.group(1), m_gh.group(2)
+        for branch in ("main", "master"):
+            manifest_urls.append(f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/plugin.json")
+    elif m_gl:
+        gl_path, gl_repo = m_gl.group(1), m_gl.group(2)
+        full_path = f"{gl_path}/{gl_repo}"
+        for branch in ("main", "master"):
+            manifest_urls.append(f"https://gitlab.com/{full_path}/-/raw/{branch}/plugin.json")
+    else:
+        return {"update_available": False, "reason": "unsupported_source"}
 
-    owner, repo = m.group(1), m.group(2)
     current_version = info.get("manifest", {}).get("version", "0.0.0")
 
     import requests as req
     remote_manifest = None
-    for branch in ("main", "master"):
+    for url in manifest_urls:
         try:
-            r = req.get(
-                f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/plugin.json",
-                timeout=10,
-            )
+            r = req.get(url, timeout=10)
             if r.status_code == 200:
                 remote_manifest = r.json()
                 break
@@ -1431,8 +1577,30 @@ async def set_email_account(scope: str, request: Request, _=Depends(require_logi
     if existing.get('auth_type') == 'oauth2':
         raise HTTPException(status_code=400, detail="This is an OAuth account managed by the O365 plugin. Disconnect it there first.")
 
-    # If no new password provided, keep existing
+    # If no new password provided, keep existing — but verify the existing
+    # encrypted field actually decrypts. Pre-fix, _unscramble silently
+    # returned '' on decrypt failure (e.g. salt file missing after backup
+    # restore from another machine), and this branch then committed that
+    # empty value back through the encrypt path → app_password permanently
+    # gone. With the strict check, we refuse the save and ask the user to
+    # re-enter the password. Day-ruiner scout 2026-05-07 #C.
     if not app_password:
+        from core.credentials_manager import DecryptionError
+        try:
+            raw = existing.get('_app_password_raw') or existing.get('app_password', '')
+            # `existing` was already unscrambled by get_email_account —
+            # check the underlying stored value via a strict decrypt to
+            # distinguish "user has no password set" from "decrypt failed".
+            stored = credentials._credentials.get('email_accounts', {}).get(scope, {}).get('app_password', '')
+            credentials._unscramble_strict(stored)
+        except DecryptionError:
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "Cannot read existing app password (encryption salt may have changed "
+                    "after a backup restore). Re-enter the password to save."
+                ),
+            )
         app_password = existing.get('app_password', '')
 
     if credentials.set_email_account(scope, address, app_password, imap_server, smtp_server, imap_port, smtp_port):
@@ -1662,15 +1830,45 @@ async def set_gcal_account(scope: str, request: Request, _=Depends(require_login
     calendar_id = data.get('calendar_id', 'primary').strip()
     label = data.get('label', '').strip()
 
-    # If no new secret provided, keep existing
+    # If no new secret provided, keep existing — but strict-decrypt the
+    # existing stored value to confirm we have a real value, not '' from
+    # a swallowed decryption failure. Without this, a salt-file mismatch
+    # (e.g. backup restore from another machine) would silently empty the
+    # client_secret on a routine edit. Day-ruiner scout 2026-05-07 #C.
+    from core.credentials_manager import DecryptionError
     if not client_secret:
+        try:
+            stored_cs = credentials._credentials.get('gcal_accounts', {}).get(scope, {}).get('client_secret', '')
+            credentials._unscramble_strict(stored_cs)
+        except DecryptionError:
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "Cannot read existing client_secret (encryption salt may have "
+                    "changed after a backup restore). Re-enter the secret to save."
+                ),
+            )
         existing = credentials.get_gcal_account(scope)
         client_secret = existing.get('client_secret', '')
 
     if not client_id:
         raise HTTPException(status_code=400, detail="Client ID is required")
 
-    # Preserve existing refresh token if present
+    # Preserve existing refresh token if present — strict-decrypt to detect
+    # the same wipe scenario as above. Refresh tokens are EVEN more painful
+    # to lose because Google only issues one per `prompt=consent` flow.
+    try:
+        stored_rt = credentials._credentials.get('gcal_accounts', {}).get(scope, {}).get('refresh_token', '')
+        credentials._unscramble_strict(stored_rt)
+    except DecryptionError:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Cannot read existing refresh_token (encryption salt may have "
+                "changed). Disconnect this account from the gcal plugin and "
+                "re-authorize via OAuth to recover."
+            ),
+        )
     existing = credentials.get_gcal_account(scope)
     refresh_token = existing.get('refresh_token', '')
 
@@ -1686,6 +1884,50 @@ async def delete_gcal_account(scope: str, request: Request, _=Depends(require_lo
     if credentials.delete_gcal_account(scope):
         return {"success": True}
     raise HTTPException(status_code=404, detail=f"Google Calendar account '{scope}' not found")
+
+
+# =============================================================================
+# GITHUB ACCOUNT ROUTES
+# =============================================================================
+
+@router.get("/api/github/accounts")
+async def list_github_accounts(request: Request, _=Depends(require_login)):
+    """List all GitHub accounts (no PATs)."""
+    from core.credentials_manager import credentials
+    return {"accounts": credentials.list_github_accounts()}
+
+
+@router.put("/api/github/accounts/{scope}")
+async def set_github_account(scope: str, request: Request, _=Depends(require_login)):
+    """Create or update a GitHub account for a scope.
+    If pat is empty in the payload, the existing stored PAT is preserved
+    (so editing the label doesn't require re-pasting the token)."""
+    from core.credentials_manager import credentials
+    data = await request.json() or {}
+    username = data.get('username', '').strip()
+    pat = data.get('pat', '').strip()
+    label = data.get('label', '').strip()
+
+    if not username:
+        raise HTTPException(status_code=400, detail="Username is required")
+
+    # On first creation, a PAT is required. On edit, blank means "keep existing."
+    existing = credentials.get_github_account(scope)
+    if not pat and not existing.get('pat'):
+        raise HTTPException(status_code=400, detail="Personal access token is required")
+
+    if credentials.set_github_account(scope, username, pat, label):
+        return {"success": True}
+    raise HTTPException(status_code=500, detail="Failed to save github account")
+
+
+@router.delete("/api/github/accounts/{scope}")
+async def delete_github_account(scope: str, request: Request, _=Depends(require_login)):
+    """Delete a GitHub account."""
+    from core.credentials_manager import credentials
+    if credentials.delete_github_account(scope):
+        return {"success": True}
+    raise HTTPException(status_code=404, detail=f"GitHub account '{scope}' not found")
 
 
 # =============================================================================
@@ -1818,8 +2060,14 @@ async def plugin_route_dispatch(plugin_name: str, path: str, request: Request):
         token = auth[len('Bearer '):].strip() if auth.startswith('Bearer ') else ''
         if token:
             identity = f"bearer:{hashlib.sha256(token.encode()).hexdigest()[:16]}"
-    check_endpoint_rate(request, f"plugin_route:{plugin_name}", max_calls=30,
-                        identity=identity)
+    # Verb-split rate limits — read-only GETs get more headroom for live
+    # polling UIs (Trinity pane viewer, Status dashboard, etc.) while
+    # state-changing verbs stay tight at 30/min. Originally a single bucket
+    # at 30 caught Trinity's pane-poll burst plus session-list polling and
+    # showed "rate limited — backing off" mid-watch. 2026-04-30.
+    max_calls = 60 if request.method == 'GET' else 30
+    check_endpoint_rate(request, f"plugin_route:{plugin_name}:{request.method}",
+                        max_calls=max_calls, identity=identity)
 
     result = plugin_loader.get_route_handler(plugin_name, request.method, path)
     if not result:
@@ -1851,4 +2099,12 @@ async def plugin_route_dispatch(plugin_name: str, path: str, request: Request):
 
     if isinstance(response_data, Response):
         return response_data
+    # Tuple convention — handler returns (body_dict, status_code). Without
+    # this unpack, FastAPI serialized as a JSON array with HTTP 200; every
+    # plugin route returning (error_dict, 4xx) silently looked like success
+    # to the frontend. 2026-05-13.
+    if (isinstance(response_data, tuple) and len(response_data) == 2
+            and isinstance(response_data[1], int)):
+        body, status_code = response_data
+        return JSONResponse(content=body, status_code=status_code)
     return response_data

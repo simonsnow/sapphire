@@ -30,9 +30,12 @@ Backups contain the entire `user/` directory as a `.tar.gz` archive. This includ
 | Data | Location | Why |
 |------|----------|-----|
 | API keys & credentials | `~/.config/sapphire/credentials.json` | Security — credentials are stored outside `user/` deliberately. They're encrypted with a machine-identity key and excluded from backups. |
+| MCP inbound auth keys | `user/plugin_state/*_mcp_key.json` | Plaintext bearer keys for plugins exposing MCP servers. Re-issued from the plugin UI on restore. |
+| MCP outbound bearer keys | `user/webui/plugins/mcp_client.json` | Plaintext `Authorization` headers for external MCP servers Sapphire connects to. Re-enter from the plugin's settings on restore. |
 | Backup files themselves | `user_backups/` | Backups don't back up other backups. |
 | Logs | `user/logs/` | Included in the archive but not critical for restore. |
 | Downloaded models | System-dependent | STT/TTS models are re-downloaded if missing. |
+| Per-file `.tmp` rename intermediaries + `.bad-{ts}` quarantine files | various | Excluded by filter — they're either in-flight writes or corrupted-state forensics, not data. |
 
 ## Automatic Backups
 
@@ -169,6 +172,16 @@ tar -xzf sapphire-backups/sapphire_2026-03-19_030000_daily.tar.gz -C sapphire-da
 # Start again
 docker compose up -d
 ```
+
+## How Backups Stay Durable
+
+A few things make Sapphire's backup behavior robust beyond just "tar the directory":
+
+- **Atomic writes** — backups are written to `<filename>.gz.partial` first and atomically renamed on success. A power loss mid-backup leaves a partial file that's invisible to the rotation system; prior good backups are untouched.
+- **WAL checkpoint before tar** — chat / memory / knowledge / goals SQLite databases are checkpointed first so the tar captures a consistent snapshot. If a database is mid-stream and the checkpoint can't acquire a lock, that DB is **skipped from the archive** rather than tar'd in a torn main+WAL state. Watch the logs for `WAL checkpoint BUSY for chat.db — backup will skip this DB` if you ever see a smaller-than-expected backup.
+- **0600 permissions** — the tarball is chmod'd to user-only-readable before rename, since it contains plaintext data (chat history, memories, story state, etc.).
+- **Health-check sentinel** — corrupt-DB integrity checks halt rotation so a bad copy can't waterfall through daily → weekly → monthly retention and rotate out your last good backup.
+- **Auto-vacuum after big deletes** — deleting a chat or pruning tool images now incrementally shrinks the chat DB file (since 2.6.4), so backup sizes track actual content rather than high-water-marks.
 
 ## Pre-Update Backups
 

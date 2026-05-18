@@ -103,10 +103,31 @@ class OpenAICompatProvider(BaseProvider):
         logger.debug(f"[MULTIMODAL] Unknown endpoint {base_url}, disabling multimodal")
         return False
     
+    def _is_deepseek_official(self) -> bool:
+        """
+        Check if this is DeepSeek's official reasoner endpoint.
+
+        DeepSeek's official API for `deepseek-reasoner` requires that
+        `reasoning_content` be round-tripped on every assistant message that
+        contains `tool_calls`. Without it, request 2+ in a tool cycle returns
+        400 "Missing reasoning_content field in the assistant message at
+        message index N". Other DeepSeek deployments (Fireworks, OpenRouter,
+        Featherless) don't enforce this — they accept the standard OpenAI
+        message shape. The strip-on-non-tool-turn rule still applies: we
+        ONLY add reasoning_content for assistant messages that have tool_calls.
+
+        Gating on the model name (`reasoner`) keeps `deepseek-chat` requests
+        clean — that model has no reasoning content and the field would be
+        ignored or rejected.
+        """
+        base_url = (self.base_url or '').lower()
+        model = (self.model or '').lower()
+        return 'api.deepseek.com' in base_url and 'reasoner' in model
+
     def _is_fireworks_reasoning_model(self) -> bool:
         """
         Check if this is a Fireworks reasoning model that needs reasoning_effort param.
-        
+
         These models output thinking in reasoning_content field when reasoning_effort is set.
         """
         base_url = (self.base_url or '').lower()
@@ -396,9 +417,20 @@ class OpenAICompatProvider(BaseProvider):
             # Include name field for function calls if present
             if msg.get('name') and role != 'tool':
                 clean_msg['name'] = msg['name']
-            
+
+            # DeepSeek-reasoner official API requires reasoning_content
+            # round-trip on tool-calling assistant turns. Without this,
+            # the next request after a tool result hits 400 "Missing
+            # reasoning_content field in the assistant message at message
+            # index N". Only fires for the official endpoint + reasoner
+            # model — other providers ignore the field. 2026-05-11.
+            if (self._is_deepseek_official()
+                    and msg.get('tool_calls')
+                    and msg.get('thinking')):
+                clean_msg['reasoning_content'] = msg['thinking']
+
             clean.append(clean_msg)
-        
+
         return clean
     
     def chat_completion(
@@ -718,5 +750,6 @@ class OpenAICompatProvider(BaseProvider):
             content=message_content,
             tool_calls=tool_calls,
             finish_reason=choice.finish_reason,
-            usage=usage
+            usage=usage,
+            thinking=reasoning,  # raw reasoning_content for DeepSeek round-trip
         )

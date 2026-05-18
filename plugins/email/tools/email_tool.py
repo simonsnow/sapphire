@@ -389,6 +389,31 @@ def _get_email_creds():
     return creds
 
 
+# Per-scope refresh lock — serializes concurrent refresh attempts for the
+# same email account. Pre-fix, daemon poll thread could refresh while a
+# user-initiated send_email tool call simultaneously refreshed the same
+# scope. Both POST to Microsoft for the same scope; Microsoft v2 rotates
+# refresh_token under conditional-access accounts; last-writer-wins on
+# disk and the other rotated refresh_token is gone forever → next refresh
+# = invalid_grant → permadeath of the email OAuth setup. Gcal had this
+# pattern (calendar.py:18-31); email didn't. Day-ruiner scout 2026-05-07
+# #D. Daemon imports `_lock_for` from this module so the daemon thread
+# and the tool-call thread share the same per-scope lock.
+import threading as _threading
+_refresh_locks_guard = _threading.Lock()
+_refresh_locks: dict = {}
+
+
+def _lock_for(scope: str) -> _threading.Lock:
+    """Per-scope refresh serialization. Mirrors gcal's pattern."""
+    with _refresh_locks_guard:
+        lock = _refresh_locks.get(scope)
+        if lock is None:
+            lock = _threading.Lock()
+            _refresh_locks[scope] = lock
+        return lock
+
+
 def _refresh_oauth_token(scope, creds):
     """Refresh an OAuth2 access token inline. Returns updated creds or None."""
     import requests as http_requests
@@ -397,35 +422,48 @@ def _refresh_oauth_token(scope, creds):
     tenant = creds.get('oauth_tenant_id', 'common')
     token_url = f'https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token'
 
-    try:
-        resp = http_requests.post(token_url, data={
-            'client_id': creds['oauth_client_id'],
-            'client_secret': creds['oauth_client_secret'],
-            'refresh_token': creds['oauth_refresh_token'],
-            'grant_type': 'refresh_token',
-            'scope': 'https://outlook.office365.com/IMAP.AccessAsUser.All https://outlook.office365.com/SMTP.Send offline_access',
-        }, timeout=15)
+    with _lock_for(scope):
+        # Re-read creds INSIDE the lock so a refresh that completed while
+        # we were waiting on the lock isn't redone with stale tokens.
+        try:
+            fresh = credentials.get_email_account(scope)
+            if fresh and fresh.get('oauth_expires_at', 0) > time.time() + 60:
+                # Another thread already refreshed; use the rotated tokens.
+                creds = fresh
+                logger.debug(f"[EMAIL] Refresh skipped — another thread rotated for scope '{scope}'")
+                return creds
+        except Exception:
+            pass  # Fall through to do the refresh ourselves.
 
-        if resp.status_code != 200:
-            logger.error(f"[EMAIL] OAuth token refresh failed: {resp.status_code} {resp.text[:200]}")
+        try:
+            resp = http_requests.post(token_url, data={
+                'client_id': creds['oauth_client_id'],
+                'client_secret': creds['oauth_client_secret'],
+                'refresh_token': creds['oauth_refresh_token'],
+                'grant_type': 'refresh_token',
+                'scope': 'https://outlook.office365.com/IMAP.AccessAsUser.All https://outlook.office365.com/SMTP.Send offline_access',
+            }, timeout=15)
+
+            if resp.status_code != 200:
+                logger.error(f"[EMAIL] OAuth token refresh failed: {resp.status_code} {resp.text[:200]}")
+                return None
+
+            tokens = resp.json()
+            access_token = tokens['access_token']
+            expires_at = time.time() + tokens.get('expires_in', 3600)
+            new_refresh = tokens.get('refresh_token', '')
+
+            credentials.update_email_oauth_tokens(scope, access_token, expires_at, new_refresh)
+
+            creds['oauth_access_token'] = access_token
+            creds['oauth_expires_at'] = expires_at
+            if new_refresh:
+                creds['oauth_refresh_token'] = new_refresh
+            logger.info(f"[EMAIL] OAuth token refreshed for scope '{scope}'")
+            return creds
+        except Exception as e:
+            logger.error(f"[EMAIL] OAuth token refresh error: {e}")
             return None
-
-        tokens = resp.json()
-        access_token = tokens['access_token']
-        expires_at = time.time() + tokens.get('expires_in', 3600)
-        new_refresh = tokens.get('refresh_token', '')
-
-        credentials.update_email_oauth_tokens(scope, access_token, expires_at, new_refresh)
-
-        creds['oauth_access_token'] = access_token
-        creds['oauth_expires_at'] = expires_at
-        if new_refresh:
-            creds['oauth_refresh_token'] = new_refresh
-        logger.info(f"[EMAIL] OAuth token refreshed for scope '{scope}'")
-        return creds
-    except Exception as e:
-        logger.error(f"[EMAIL] OAuth token refresh error: {e}")
-        return None
 
 
 def _build_xoauth2(user, access_token):
@@ -893,11 +931,19 @@ def _send_email(recipient_id=None, subject=None, body='', reply_to_index=None, a
 # ─── Scope Access ────────────────────────────────────────────────────────────
 
 def _get_current_people_scope():
+    """Resolve the active people scope. Returns None when unset/disabled.
+
+    Previously returned 'default' on exception — silent-default class regression
+    (same pattern as the github fix shipped 2026-05-14). Caller (`_get_recipients`)
+    must handle None and refuse rather than silently routing to the default
+    scope's contacts. 2026-05-14.
+    """
     try:
         from core.chat.function_manager import scope_people
         return scope_people.get()
-    except Exception:
-        return 'default'
+    except Exception as e:
+        logger.debug(f"email: people scope resolution failed: {e}")
+        return None
 
 
 # ─── Executor ────────────────────────────────────────────────────────────────

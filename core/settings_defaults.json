@@ -5,7 +5,9 @@
     "DEFAULT_USERNAME": "Human Protagonist",
     "AVATARS_IN_CHAT": true,
     "DEFAULT_PERSONA": "",
-    "USER_TIMEZONE": "UTC"
+    "USER_TIMEZONE": "UTC",
+    "DASHBOARD_DISPLAY_NAME": "Sapphire",
+    "DASHBOARD_FONTS_AUTOFETCH": true
   },
   
   "network": {
@@ -75,6 +77,8 @@
   "recorder": {
     "RECORDER_CHUNK_SIZE": 1024,
     "RECORDER_CHANNELS": 1,
+    "STT_VAD_ENABLED": true,
+    "STT_VAD_SPEECH_THRESHOLD": 0.5,
     "RECORDER_SILENCE_THRESHOLD": 0.0025,
     "RECORDER_SILENCE_DURATION": 1.0,
     "RECORDER_NO_SPEECH_TIMEOUT": 3.0,
@@ -100,7 +104,8 @@
     "TTS_FALLBACK_TIMEOUT": 0.2,
     "TTS_ELEVENLABS_API_KEY": "",
     "TTS_ELEVENLABS_MODEL": "eleven_flash_v2_5",
-    "TTS_ELEVENLABS_VOICE_ID": ""
+    "TTS_ELEVENLABS_VOICE_ID": "",
+    "KOKORO_CUDA_DEVICE": ""
   },
 
   "embedding": {
@@ -180,6 +185,7 @@
       "_comment": "Balanced generation params per model. Edit values here to tune.",
       "__fallback__": { "temperature": 0.7, "top_p": 0.9, "max_tokens": 4096, "presence_penalty": 0.1, "frequency_penalty": 0.1 },
       
+      "claude-opus-4-7": { "temperature": 0.65, "top_p": 0.85, "max_tokens": 16000, "presence_penalty": 0.0, "frequency_penalty": 0.0 },
       "claude-sonnet-4-6": { "temperature": 0.7, "top_p": 0.9, "max_tokens": 16000, "presence_penalty": 0.0, "frequency_penalty": 0.0 },
       "claude-sonnet-4-5": { "temperature": 0.7, "top_p": 0.9, "max_tokens": 16000, "presence_penalty": 0.0, "frequency_penalty": 0.0 },
       "claude-haiku-4-5": { "temperature": 0.7, "top_p": 0.9, "max_tokens": 16000, "presence_penalty": 0.0, "frequency_penalty": 0.0 },
@@ -200,9 +206,13 @@
       "accounts/fireworks/models/qwen3-vl-235b-a22b-thinking": { "temperature": 0.6, "top_p": 0.8, "max_tokens": 8192, "presence_penalty": 0.0, "frequency_penalty": 0.0 },
       "accounts/fireworks/models/qwq-32b": { "temperature": 0.6, "top_p": 0.8, "max_tokens": 8192, "presence_penalty": 0.0, "frequency_penalty": 0.0 },
       "accounts/fireworks/models/kimi-k2-thinking": { "temperature": 0.6, "top_p": 0.8, "max_tokens": 8192, "presence_penalty": 0.0, "frequency_penalty": 0.0 },
+      "accounts/fireworks/models/kimi-k2p6": { "temperature": 0.6, "top_p": 0.8, "max_tokens": 8192, "presence_penalty": 0.0, "frequency_penalty": 0.0 },
       "accounts/fireworks/models/qwen3-coder-480b-a35b-instruct": { "temperature": 0.3, "top_p": 0.7, "max_tokens": 8192, "presence_penalty": 0.0, "frequency_penalty": 0.0 },
+      "accounts/fireworks/models/qwen3p6-plus": { "temperature": 0.6, "top_p": 0.8, "max_tokens": 8192, "presence_penalty": 0.0, "frequency_penalty": 0.0 },
       "accounts/fireworks/models/gpt-oss-120b": { "temperature": 0.75, "top_p": 0.9, "max_tokens": 4096, "presence_penalty": 0.1, "frequency_penalty": 0.1 },
       "accounts/fireworks/models/deepseek-v3p2": { "temperature": 0.75, "top_p": 0.9, "max_tokens": 8192, "presence_penalty": 0.1, "frequency_penalty": 0.1 },
+      "accounts/fireworks/models/deepseek-v4-pro": { "temperature": 0.75, "top_p": 0.9, "max_tokens": 8192, "presence_penalty": 0.1, "frequency_penalty": 0.1 },
+      "accounts/fireworks/models/gemma-4-31b-it": { "temperature": 0.7, "top_p": 0.9, "max_tokens": 4096, "presence_penalty": 0.1, "frequency_penalty": 0.1 },
       "accounts/fireworks/models/glm-4p7": { "temperature": 0.75, "top_p": 0.9, "max_tokens": 4096, "presence_penalty": 0.1, "frequency_penalty": 0.1 },
       "accounts/fireworks/models/minimax-m2p5": { "temperature": 0.75, "top_p": 0.9, "max_tokens": 4096, "presence_penalty": 0.1, "frequency_penalty": 0.1 },
 
@@ -245,6 +255,13 @@
   "plugins": {
     "ALLOW_UNSIGNED_PLUGINS": false,
     "PLUGIN_KEYS_URL": "https://raw.githubusercontent.com/ddxfish/sapphire-plugin-keys/main/authorized_keys.json"
+  },
+
+  "store": {
+    "STORE_ENABLED": true,
+    "STORE_URL": "https://sapphireblue.dev",
+    "STORE_NAMESPACE": "sapphire-store/v1",
+    "STORE_CACHE_TTL_SECONDS": 300
   },
 
   "setup": {

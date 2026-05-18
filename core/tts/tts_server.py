@@ -247,6 +247,12 @@ class TTSHandler(BaseHTTPRequestHandler):
         timestamp = int(time.time())
         file_path = os.path.join(TEMP_DIR, f'audio_{timestamp}_{file_uuid}.ogg')
 
+        # _file_response has its own finally to delete the file on the success
+        # path. But if sf.write raises, _file_response never runs and the temp
+        # file may exist as a partial write. TEMP_DIR is /dev/shm on Linux
+        # (tmpfs = RAM), so per-failure leaks bloat RAM, not disk. Belt-and-
+        # suspenders cleanup here. Longevity scout 2026-05-07.
+        sent = False
         try:
             logger.info(f"Encoding OGG/Opus to {file_path}...")
             sys.stderr.flush()
@@ -255,11 +261,18 @@ class TTSHandler(BaseHTTPRequestHandler):
             sys.stderr.flush()
             del audio  # Free numpy array before sending
             _file_response(self, file_path)
+            sent = True
             logger.info("Response sent OK")
             sys.stderr.flush()
         except Exception as e:
             logger.error(f"Error processing audio file: {e}")
             _json_response(self, {'error': f'Server error: {str(e)}'}, 500)
+        finally:
+            if not sent and os.path.exists(file_path):
+                try:
+                    os.remove(file_path)
+                except Exception as _e:
+                    logger.warning(f"Could not clean partial temp file {file_path}: {_e}")
 
 
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):

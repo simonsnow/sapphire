@@ -10,7 +10,10 @@ export default {
     keys: ['SOCKS_ENABLED', 'SOCKS_HOST', 'SOCKS_PORT', 'SOCKS_TIMEOUT'],
 
     render(ctx) {
-        const whitelist = ctx.settings.PRIVACY_NETWORK_WHITELIST || [];
+        // Read via ctx.getValue so any unsaved changes (pendingChanges) survive
+        // tab switches. Reading settings directly would lose unsaved adds/removes
+        // when the user navigates away and back. See settings.js getValue().
+        const whitelist = ctx.getValue('PRIVACY_NETWORK_WHITELIST') || [];
         return `
             ${ctx.renderFields(this.keys)}
 
@@ -120,16 +123,16 @@ export default {
             } catch { ui.showToast('Failed', 'error'); }
         });
 
-        // Whitelist
+        // Whitelist — read current state via ctx.getValue (pendingChanges-aware),
+        // queue updates via ctx.markChanged. Do NOT mutate ctx.settings directly.
         const addEntry = () => {
             const input = el.querySelector('#wl-input');
             const entry = input.value.trim();
             const err = this.validate(entry);
             if (err) { ui.showToast(err, 'error'); return; }
-            const wl = ctx.settings.PRIVACY_NETWORK_WHITELIST || [];
+            const wl = ctx.getValue('PRIVACY_NETWORK_WHITELIST') || [];
             if (wl.includes(entry)) { ui.showToast('Already exists', 'warning'); input.value = ''; return; }
             const newWl = [...wl, entry];
-            ctx.settings.PRIVACY_NETWORK_WHITELIST = newWl;
             ctx.markChanged('PRIVACY_NETWORK_WHITELIST', newWl);
             el.querySelector('#wl-entries').innerHTML = this.renderEntries(newWl);
             this.bindRemove(ctx, el);
@@ -147,8 +150,7 @@ export default {
         el.querySelectorAll('.wl-remove').forEach(btn => {
             btn.addEventListener('click', () => {
                 const entry = btn.dataset.entry;
-                const wl = (ctx.settings.PRIVACY_NETWORK_WHITELIST || []).filter(e => e !== entry);
-                ctx.settings.PRIVACY_NETWORK_WHITELIST = wl;
+                const wl = (ctx.getValue('PRIVACY_NETWORK_WHITELIST') || []).filter(e => e !== entry);
                 ctx.markChanged('PRIVACY_NETWORK_WHITELIST', wl);
                 el.querySelector('#wl-entries').innerHTML = this.renderEntries(wl);
                 this.bindRemove(ctx, el);

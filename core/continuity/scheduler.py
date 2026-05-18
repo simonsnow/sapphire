@@ -797,10 +797,30 @@ class ContinuityScheduler:
                         logger.error(f"[Continuity] Reply callback failed for '{task_name}': {e}")
             return _response_callback
 
-        # Run on worker thread — executes once then drains any queued events
+        # Run on worker thread — executes once then drains any queued events.
+        # Acquire the concurrency semaphore (cap of 3) to honor the same cap
+        # cron-fired tasks honor at _execute_task. Pre-fix, daemon/webhook
+        # bursts (e.g. Discord 10 messages in 2s) spawned 10 ExecutionContexts
+        # in parallel — each pokes credentials, sqlite, embedder. Voice mode
+        # is going to drive more daemon traffic; the cap stops being a fiction
+        # only if event tasks honor it too. Wildcard scout 2026-05-07 #2.
         cur_event_data = event_data
         cur_reply_callback = reply_callback
         def _run():
+            nonlocal cur_event_data, cur_reply_callback
+            # `_concurrency_sem` is initialized in __init__; test fixtures
+            # that construct via `ContinuityScheduler.__new__()` may bypass
+            # it, so degrade gracefully rather than AttributeError.
+            sem = getattr(self, '_concurrency_sem', None)
+            if sem is not None:
+                sem.acquire()
+            try:
+                _drain_loop()
+            finally:
+                if sem is not None:
+                    sem.release()
+
+        def _drain_loop():
             nonlocal cur_event_data, cur_reply_callback
             while True:
                 # Re-fetch live task per iteration. The outer `task` is a

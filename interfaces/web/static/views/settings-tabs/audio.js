@@ -39,9 +39,13 @@ export default {
 
     async attachListeners(ctx, el) {
         try { await populateDeviceSelects(el); } catch {}
+        // Don't mutate ctx.settings — that pollutes the persisted-state view
+        // for other parts of the app. ctx.markChanged is the only correct way
+        // to queue a setting change. populateDeviceSelects reads from the server
+        // directly so it doesn't need ctx.settings to be pre-populated.
         attachAudioDeviceListeners(el, {
-            onInputChange: v => { ctx.settings.AUDIO_INPUT_DEVICE = v; ctx.markChanged('AUDIO_INPUT_DEVICE', v); },
-            onOutputChange: v => { ctx.settings.AUDIO_OUTPUT_DEVICE = v; ctx.markChanged('AUDIO_OUTPUT_DEVICE', v); }
+            onInputChange: v => ctx.markChanged('AUDIO_INPUT_DEVICE', v),
+            onOutputChange: v => ctx.markChanged('AUDIO_OUTPUT_DEVICE', v)
         });
     }
 };

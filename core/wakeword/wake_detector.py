@@ -11,47 +11,11 @@ from core.event_bus import publish, Events
 logger = logging.getLogger(__name__)
 
 
-# Whisper frequently hallucinates these canned phrases on silence/noise/
-# off-language input (trained heavily on YouTube captions). Filtering them
-# prevents phantom LLM calls after wakeword false-positives. Case-
-# insensitive exact-match after strip + punctuation normalization.
-_WHISPER_HALLUCINATIONS = {
-    'thank you',
-    'thanks for watching',
-    'thanks for watching!',
-    'thanks for watching.',
-    'you',
-    '.',
-    'bye',
-    'bye.',
-    'bye!',
-    'goodbye',
-    'goodbye.',
-    "i'm sorry",
-    "i'm sorry.",
-    'subtitles by',
-    '[music]',
-    '[laughter]',
-    '[applause]',
-    'thanks.',
-    'thank you.',
-    'okay.',
-    'ok.',
-}
-
-
-def _is_whisper_hallucination(text: str) -> bool:
-    """Return True if `text` matches a known Whisper hallucination phrase
-    (or is empty/whitespace — same downstream treatment)."""
-    if not text:
-        return True
-    normalized = text.strip().lower()
-    if not normalized:
-        return True
-    if normalized in _WHISPER_HALLUCINATIONS:
-        return True
-    stripped = normalized.rstrip('.!?').strip()
-    return stripped in _WHISPER_HALLUCINATIONS
+# Hallucination filter moved to core.stt.hallucination and applied at the
+# STT provider boundary (BaseSTTProvider.transcribe_file). Wake detector
+# now sees None for hallucinated transcripts — same downstream treatment
+# as empty speech. Browser STT and future continuous-listen consumers
+# inherit the filter for free. Chaos scout 2026-05-07 #1.
 
 
 class WakeWordDetector:
@@ -301,8 +265,15 @@ class WakeWordDetector:
             audio_file = self.system.whisper_recorder.record_audio()
 
             if not audio_file or not os.path.exists(audio_file):
-                logger.warning("No audio file produced")
-                self.system.speak_error('file')
+                # Pick the right TTS message based on the actual failure
+                # reason set by the recorder. Saying "File creation error"
+                # when the mic was busy or no speech was captured is
+                # technically wrong and not actionable for users —
+                # particularly on Windows where mic-busy is common after
+                # wakeword closes its stream. 2026-04-28.
+                reason = getattr(self.system.whisper_recorder, 'last_failure_reason', '') or 'file'
+                logger.warning(f"No audio file produced (reason={reason})")
+                self.system.speak_error(reason)
                 return
 
             process_time = time.time()
@@ -315,18 +286,11 @@ class WakeWordDetector:
                     pass
             logger.info(f"Processing took: {(time.time() - process_time)*1000:.1f}ms")
 
+            # `transcribe_file` now applies the hallucination filter at the
+            # provider boundary — None means "no usable speech" (silence,
+            # noise, OR a known canned phrase). Single check covers both.
             if not text or not text.strip():
-                logger.warning("No speech detected")
-                self.system.speak_error('speech')
-                return
-
-            # Whisper hallucination filter. On silence or noise after a
-            # wakeword false-positive, Whisper famously produces canned
-            # phrases (trained on YouTube captions). Without this filter,
-            # the user wakes to Sapphire replying to phantom input at 3am.
-            # Scout 4 finding (2026-04-19).
-            if _is_whisper_hallucination(text):
-                logger.warning(f"Whisper hallucination filtered: {text!r}")
+                logger.warning("No speech detected (empty or hallucination)")
                 self.system.speak_error('speech')
                 return
 
@@ -391,9 +355,19 @@ class WakeWordDetector:
                 # Get prediction from OWW
                 predictions = self.model.predict(audio_array)
 
-                # Check if wake word detected
-                # OWW keys predictions by model name (stem), even for custom paths
+                # Check if wake word detected. OWW keys predictions by file
+                # stem when loaded by path (e.g. 'hey_mycroft_v0.1' for the
+                # bundled v0.1.onnx files) and by bare name when loaded as a
+                # builtin. Try exact match first, then prefix match against
+                # versioned stems, finally fall back to whatever the only
+                # loaded model returned. Single-model detector — safe to
+                # inspect all keys.
                 score = predictions.get(self.model_name, 0)
+                if score < self.threshold and predictions:
+                    for k, v in predictions.items():
+                        if k.startswith(self.model_name):
+                            score = v
+                            break
                 if score >= self.threshold:
                     logger.info(f"Wake word '{self.model_name}' detected with score {score:.3f}")
                     self._on_activation()
@@ -434,7 +408,6 @@ class WakeWordDetector:
                         # "wakeword is silently dead." Otherwise the UI toggle
                         # still reads on, but Sapphire can't hear.
                         try:
-                            from core.event_bus import publish, Events
                             publish(Events.CONTINUITY_TASK_ERROR, {
                                 "task": "Wake Word",
                                 "error": f"Wake word stream recovery failed ({type(recovery_err).__name__}: "

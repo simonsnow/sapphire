@@ -86,7 +86,98 @@ def wrap_tool_result(tool_call_id: str, function_name: str, result: str) -> Dict
     }
 
 
-def _extract_tool_images(result, history=None):
+def wire_to_canonical(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Convert a wire-format message list to canonical persistence shape.
+
+    Some providers (Claude, Anthropic-compat) emit tool results as
+    `{role:"user", content:[{type:"tool_result", tool_use_id, content}]}`
+    so the next API call carries them in the shape the model expects. The
+    canonical persistence form, used by `format_messages_for_display` and
+    every OpenAI-style reader, is `{role:"tool", tool_call_id, name, content}`.
+
+    The foreground chat path avoids this mismatch by writing canonical
+    directly through `history.add_tool_result()` during execution. The
+    heartbeat / ExecutionContext path doesn't have a history object, so its
+    `messages` slice arrives at persistence time still in wire form. Without
+    converting, every Claude-backed scheduled task ends up with
+    invisible-bubble corruption in its named chat.
+
+    This walks the input and:
+      - Splits any `role=user` list-content `tool_result` blocks into
+        separate canonical `role=tool` messages (one per block) via the
+        existing `wrap_tool_result` shape, looking up `name` from the most
+        recent preceding assistant `tool_calls` within the slice.
+      - Preserves any non-`tool_result` blocks (text/image/file) on a
+        stripped user message at the original position. In practice
+        `format_tool_result` only emits a single `tool_result` block per
+        message — the mixed branch is defensive.
+      - Passes everything else through unchanged. Image-injection user
+        messages from `_inject_tool_images` (text + image blocks) are
+        already a shape the display formatter handles, so they pass.
+
+    Pure function — does not mutate the input list.
+    """
+    result: List[Dict[str, Any]] = []
+    name_by_tool_use_id: Dict[str, str] = {}
+
+    for msg in messages:
+        role = msg.get("role")
+
+        # Build the rolling name lookup from assistant tool_calls so we can
+        # populate canonical `name` on the converted tool messages below.
+        if role == "assistant":
+            tcs = msg.get("tool_calls")
+            if isinstance(tcs, list):
+                for tc in tcs:
+                    if not isinstance(tc, dict):
+                        continue
+                    tc_id = tc.get("id")
+                    fn_name = (tc.get("function") or {}).get("name", "tool")
+                    if tc_id:
+                        name_by_tool_use_id[tc_id] = fn_name
+            result.append(msg)
+            continue
+
+        if role == "user" and isinstance(msg.get("content"), list):
+            content = msg["content"]
+            tool_result_blocks = [
+                b for b in content
+                if isinstance(b, dict) and b.get("type") == "tool_result"
+            ]
+            if tool_result_blocks:
+                for block in tool_result_blocks:
+                    tc_id = block.get("tool_use_id") or block.get("tool_call_id", "")
+                    name = name_by_tool_use_id.get(tc_id, "tool")
+                    block_content = block.get("content", "")
+                    # tool_result content can itself be a list of typed blocks
+                    # (Claude allows nested text/image inside a tool_result);
+                    # flatten the text parts to a single string for canonical
+                    # storage. Image blocks inside tool results aren't a path
+                    # we exercise today — fall through to str() if needed.
+                    if isinstance(block_content, list):
+                        text_parts = [
+                            b.get("text", "") for b in block_content
+                            if isinstance(b, dict) and b.get("type") == "text"
+                        ]
+                        block_content = "\n".join(t for t in text_parts if t)
+                    result.append(wrap_tool_result(tc_id, name, str(block_content)))
+
+                # Preserve any non-tool_result blocks at the original position
+                # so a defensive mixed message doesn't lose its text/image data.
+                non_tool_blocks = [
+                    b for b in content
+                    if not (isinstance(b, dict) and b.get("type") == "tool_result")
+                ]
+                if non_tool_blocks:
+                    result.append({**msg, "content": non_tool_blocks})
+                continue
+
+        result.append(msg)
+
+    return result
+
+
+def _extract_tool_images(result, history=None, provider=None):
     """Extract images from a tool result if it returned structured data.
 
     Tools can return {"text": "...", "images": [{"data": base64, "media_type": "image/..."}]}
@@ -94,6 +185,12 @@ def _extract_tool_images(result, history=None):
 
     Images are saved to the chat history DB and <<IMG::tool:id>> markers are embedded
     in the text so they persist in history and render via existing image infrastructure.
+
+    If the provider doesn't support vision, images are still saved (UI + history
+    still render them) but the LLM-bound images list is empty, and the tool result
+    text gets a "vision unavailable" suffix. This keeps the conversation a clean
+    tool-call → tool-result → assistant-response pair instead of injecting a fake
+    user message after the tool result. 2026-05-15.
 
     Returns (text_str, images_list). images_list contains the raw image dicts
     for injection into the next LLM turn.
@@ -104,6 +201,7 @@ def _extract_tool_images(result, history=None):
             img for img in result["images"]
             if isinstance(img, dict) and img.get("data")
         ]
+        supports_vision = bool(provider and getattr(provider, 'supports_images', False))
         # Save images to DB and embed markers in text
         # Images with display_only=True are saved for user gallery but not sent to LLM
         llm_images = []
@@ -111,8 +209,26 @@ def _extract_tool_images(result, history=None):
             img_id = _save_tool_image(img, history)
             if img_id:
                 text = f"<<IMG::tool:{img_id}>>\n{text}"
-            if not img.get("display_only"):
+            if not img.get("display_only") and supports_vision:
                 llm_images.append(img)
+        if images and not supports_vision:
+            # Non-vision model: image goes to disk + UI history, but the LLM
+            # can't see it. Generate a CLIP-based atmospheric description so
+            # the model still gets the "vibe" of what was captured.
+            vibe_parts = []
+            for img in images:
+                try:
+                    import base64 as _b64
+                    from core import vibes as _vibes
+                    raw = _b64.b64decode(img["data"])
+                    vibe_parts.append(_vibes.describe(raw))
+                except Exception as e:
+                    logger.warning(f"[VIBES] failed to describe image: {e}")
+            if vibe_parts:
+                text = (text + "\n\n" + "\n\n".join(vibe_parts)).strip()
+            else:
+                text = (text + "\n\n[Note: current model does not support image inputs — "
+                        f"image(s) were captured and saved but cannot be analyzed this turn.]").strip()
         return text, llm_images
     return str(result), []
 
@@ -255,7 +371,7 @@ class ToolCallingEngine:
             })
         return tool_calls_formatted
 
-    def execute_tool_calls(self, tool_calls, messages, history, provider: BaseProvider = None, scopes=None, allowed_tools=None):
+    def execute_tool_calls(self, tool_calls, messages, history, provider: BaseProvider = None, scopes=None, allowed_tools=None, executor_snapshot=None):
         """
         Execute tool calls and add results to messages array AND history.
 
@@ -294,13 +410,13 @@ class ToolCallingEngine:
                 continue
 
             try:
-                function_result = self.function_manager.execute_function(function_name, function_args, scopes=scopes, allowed_tools=allowed_tools)
+                function_result = self.function_manager.execute_function(function_name, function_args, scopes=scopes, allowed_tools=allowed_tools, executor_snapshot=executor_snapshot)
             except Exception as tool_error:
                 logger.error(f"Tool execution failed for {function_name}: {tool_error}", exc_info=True)
                 function_result = f"Tool '{function_name}' failed: {str(tool_error)}"
 
             # Extract images if tool returned structured result
-            result_str, images = _extract_tool_images(function_result, history)
+            result_str, images = _extract_tool_images(function_result, history, provider)
             if images:
                 tool_images.extend(images)
                 logger.info(f"[TOOL] {function_name} returned {len(images)} image(s)")
@@ -328,7 +444,7 @@ class ToolCallingEngine:
 
         return tools_executed, tool_images
 
-    def execute_text_based_tool_call(self, function_call_data, filtered_content, messages, history, provider: BaseProvider = None, scopes=None, allowed_tools=None):
+    def execute_text_based_tool_call(self, function_call_data, filtered_content, messages, history, provider: BaseProvider = None, scopes=None, allowed_tools=None, executor_snapshot=None):
         """
         Execute text-based function call (LM Studio compatibility).
         
@@ -373,12 +489,12 @@ class ToolCallingEngine:
             history.add_assistant_with_tool_calls(filtered_content, tool_calls_formatted)
 
         try:
-            function_result = self.function_manager.execute_function(function_name, function_args, scopes=scopes, allowed_tools=allowed_tools)
+            function_result = self.function_manager.execute_function(function_name, function_args, scopes=scopes, allowed_tools=allowed_tools, executor_snapshot=executor_snapshot)
         except Exception as tool_error:
             logger.error(f"Text-based tool failed for {function_name}: {tool_error}")
             function_result = f"Tool '{function_name}' failed: {str(tool_error)}"
 
-        result_str, tool_images = _extract_tool_images(function_result, history)
+        result_str, tool_images = _extract_tool_images(function_result, history, provider)
         if tool_images:
             logger.info(f"[TOOL] {function_name} returned {len(tool_images)} image(s) (text-based)")
         clean_result = strip_ui_markers(result_str)

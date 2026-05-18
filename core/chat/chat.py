@@ -18,18 +18,67 @@ from .llm_providers import get_provider, get_provider_for_url, get_provider_by_k
 logger = logging.getLogger(__name__)
 
 
-def _inject_tool_images(messages, tool_images):
+def _detect_image_media_type(b64_data: str) -> str:
+    """Best-effort detect media_type from base64 image bytes.
+
+    Tools that return images often forget to set `media_type`. Pre-fix
+    we defaulted to 'image/jpeg', which Claude rejects with a 400 when
+    the actual bytes are PNG (header/data mismatch). Peeking the magic
+    bytes covers PNG/JPEG/GIF/WEBP — the four formats real tool-image
+    outputs actually produce. Returns 'image/png' as the safer default
+    since most tool-gen images are PNG (image-gen tools, screenshots,
+    matplotlib charts). Wildcard scout 2026-05-07 multimodal #2.
+    """
+    if not b64_data:
+        return 'image/png'
+    try:
+        import base64 as _b64
+        # Decode just the prefix — a 24-byte head is plenty for sigs
+        head = _b64.b64decode(b64_data[:64], validate=False)[:16]
+    except Exception:
+        return 'image/png'
+    if head.startswith(b'\x89PNG\r\n\x1a\n'):
+        return 'image/png'
+    if head.startswith(b'\xff\xd8\xff'):
+        return 'image/jpeg'
+    if head.startswith(b'GIF87a') or head.startswith(b'GIF89a'):
+        return 'image/gif'
+    if head.startswith(b'RIFF') and head[8:12] == b'WEBP':
+        return 'image/webp'
+    # Unknown — PNG default is safer than JPEG (broader provider support)
+    return 'image/png'
+
+
+def _inject_tool_images(messages, tool_images, provider=None):
     """Inject tool-returned images as a user message for the next LLM turn.
 
     Images are added as content blocks so providers can convert them
     to their native format (Claude source blocks, OpenAI image_url, etc).
+
+    If the provider doesn't support vision, fall back to a text-only
+    placeholder. Without this the next LLM call blows up with a 400
+    "model does not support image inputs" the moment any image-returning
+    tool (body_see, webcam, etc) fires on a text-only model. 2026-05-15.
     """
+    supports = bool(provider and getattr(provider, 'supports_images', False))
+    if not supports:
+        messages.append({
+            "role": "user",
+            "content": f"[Tool returned {len(tool_images)} image(s) — saved to disk. "
+                       f"Current model does not support image inputs, so the image "
+                       f"contents are not available for analysis this turn.]"
+        })
+        logger.info(f"[TOOL] Skipped image injection ({len(tool_images)} image(s)) — provider does not support vision")
+        return
+
     content = [{"type": "text", "text": "[Tool returned image(s) for analysis]"}]
     for img in tool_images:
+        data = img.get("data", "")
+        media_type = img.get("media_type") or _detect_image_media_type(data)
         content.append({
             "type": "image",
-            "data": img.get("data", ""),
-            "media_type": img.get("media_type", "image/jpeg")
+            "data": data,
+            "media_type": media_type,
         })
     messages.append({"role": "user", "content": content})
     logger.info(f"[TOOL] Injected {len(tool_images)} tool image(s) into conversation")
@@ -152,6 +201,10 @@ class LLMChat:
         
         self.current_system_prompt = None
         self.function_manager = FunctionManager()
+        # Notices to surface to the user as toasts (e.g. dangling toolset
+        # detected, empty-content fallback). Populated by chat() and the
+        # streaming generator; consumed + cleared by the API route layer.
+        self.pending_notices: list = []
         
         self.tool_engine = ToolCallingEngine(self.function_manager)
 
@@ -304,20 +357,14 @@ class LLMChat:
         context_parts = []
         chat_settings = self.session_manager.get_chat_settings()
 
-        # Inject datetime if enabled (user's timezone)
-        if chat_settings.get('inject_datetime', False):
-            from datetime import datetime
-            try:
-                from zoneinfo import ZoneInfo
-                tz_name = getattr(config, 'USER_TIMEZONE', 'UTC') or 'UTC'
-                now = datetime.now(ZoneInfo(tz_name))
-                tz_label = f" ({tz_name})"
-            except Exception:
-                now = datetime.now()
-                tz_label = ""
-            context_parts.append(f"Current date/time: {now.strftime('%A, %B %d, %Y at %I:%M %p')}{tz_label}")
+        # Datetime moved to the ghost-message rail (core/ghost_messages.py)
+        # 2026-05-08 — same per-turn freshness, but injected as a separate
+        # operator-metadata message right before the new user input. Keeps
+        # the system prompt cacheable across turns.
 
-        # Inject custom context if present
+        # Inject custom context if present (LONG-LIVED character info — stays
+        # in system prompt where caching it is fine and the AI treats it as
+        # part of "who I am"). Per-turn ephemera goes through ghost instead.
         custom_ctx = chat_settings.get('custom_context', '').strip()
         if custom_ctx:
             context_parts.append(custom_ctx)
@@ -362,11 +409,28 @@ class LLMChat:
         else:
             user_content = user_input
 
+        # Ghost message — per-turn ephemera (spice, datetime, plugin context)
+        # injected as a labeled operator-metadata user-role message between
+        # history and the new user input. Never persisted to chat history.
+        # Keeps the system prompt + history cacheable across turns. See
+        # core/ghost_messages.py for design + envelope format. 2026-05-08.
+        # `system` attr may be unset in test fixtures; getattr default keeps
+        # build_ghost_message happy (its hook firing tolerates a None system).
+        from core.ghost_messages import build_ghost_message
+        chat_settings_for_ghost = self.session_manager.get_chat_settings()
+        ghost_text = build_ghost_message(
+            getattr(self, 'system', None),
+            chat_settings_for_ghost,
+            user_input or "",
+        )
+
         messages = [
             {"role": "system", "content": system_prompt},
             *history_messages,
-            {"role": "user", "content": user_content}
         ]
+        if ghost_text:
+            messages.append({"role": "user", "content": ghost_text})
+        messages.append({"role": "user", "content": user_content})
 
         # Dynamic story context — injected as separate system content for cache efficiency
         # This changes every turn (state vars, clues, exits) while the main system prompt stays cached
@@ -442,7 +506,20 @@ class LLMChat:
 
             messages = self._build_base_messages(user_input)
             self.session_manager.add_user_message(user_input)
-            
+
+            # Drain any dangling-toolset state that update_enabled_functions
+            # left for us (e.g. on chat-activation). Surface as a toast on
+            # this turn's response so the user sees it the moment they engage.
+            # getattr is defensive: some tests mock function_manager without
+            # this attribute.
+            bad_ts = getattr(self.function_manager, 'last_dangling_toolset', None)
+            if bad_ts:
+                self.pending_notices.append({
+                    "message": f"Toolset '{bad_ts}' is missing — tools disabled for this chat. Fix in chat settings.",
+                    "severity": "warning",
+                })
+                self.function_manager.last_dangling_toolset = None
+
             # Set scopes for this chat context
             # Reset first to prevent bleed: when a chat's saved settings don't include
             # a newly-registered plugin scope, apply_scopes would leave the previous
@@ -460,6 +537,11 @@ class LLMChat:
             # Snapshot names for validation — prevents race if plugins reload mid-chat
             enabled_tools = self.function_manager.enabled_tools
             _allowed_tool_names = {t["function"]["name"] for t in enabled_tools if "function" in t}
+            # Snapshot executor map too — protects against plugin reload mid-chat
+            # yanking executors out from under in-flight tool calls. Streaming
+            # path captures this at chat_streaming.py:179; non-streaming was
+            # missing the same protection. 2026-05-16.
+            _executor_snapshot = self.function_manager.snapshot_executors()
 
             # DIAGNOSTIC: Log what tools are being sent
             enabled_names = [t['function']['name'] for t in enabled_tools] if enabled_tools else []
@@ -576,10 +658,15 @@ class LLMChat:
                     if len(tool_calls_to_execute) < len(tool_calls_formatted):
                         logger.info(f"[LIMIT] Executing {len(tool_calls_to_execute)}/{len(tool_calls_formatted)} tools (MAX_PARALLEL_TOOLS={config.MAX_PARALLEL_TOOLS})")
                     
+                    # Include `thinking` so DeepSeek-reasoner's required
+                    # reasoning_content round-trip works on subsequent iterations.
+                    # See chat_streaming.py and openai_compat.py:427-430. 2026-05-14.
+                    _thinking = getattr(response_msg, "thinking", None)
                     messages.append({
                         "role": "assistant",
                         "content": filtered_content,
-                        "tool_calls": tool_calls_to_execute
+                        "tool_calls": tool_calls_to_execute,
+                        "thinking": _thinking,
                     })
                     self.session_manager.add_assistant_with_tool_calls(filtered_content, tool_calls_to_execute)
 
@@ -593,17 +680,21 @@ class LLMChat:
                         self.session_manager,
                         provider,
                         scopes=_scopes,
-                        allowed_tools=_allowed_tool_names
+                        allowed_tools=_allowed_tool_names,
+                        executor_snapshot=_executor_snapshot,
                     )
                     tool_call_count += tools_executed
 
                     # Inject tool-returned images as user message for next LLM turn
                     if tool_images:
-                        _inject_tool_images(messages, tool_images)
+                        _inject_tool_images(messages, tool_images, provider)
 
-                    # Refresh tools list — tool_load may have added new tools
+                    # Refresh tools list — tool_load may have added new tools.
+                    # Also refresh executor snapshot so newly-loaded tools become
+                    # callable (and stale executors get released) on next iter.
                     enabled_tools = self.function_manager.enabled_tools
                     _allowed_tool_names = {t["function"]["name"] for t in enabled_tools if "function" in t}
+                    _executor_snapshot = self.function_manager.snapshot_executors()
 
                     logger.info(f"Tool execution iteration {i+1} completed")
                     continue
@@ -634,17 +725,39 @@ class LLMChat:
                             self.session_manager,
                             provider,
                             scopes=_scopes,
-                            allowed_tools=_allowed_tool_names
+                            allowed_tools=_allowed_tool_names,
+                            executor_snapshot=_executor_snapshot,
                         )
 
                         if tool_images:
-                            _inject_tool_images(messages, tool_images)
+                            _inject_tool_images(messages, tool_images, provider)
 
                         logger.info(f"Text-based tool iteration {i+1} completed")
                         continue
 
                 logger.info(f"No more tool calls. Final response. (Total tools: {tool_call_count})")
-                final_response_content = response_msg.content or "I have completed the requested actions."
+                # When the LLM stops without returning content, persist a short
+                # honest placeholder in chat history and surface the actionable
+                # hint as a toast. Previously substituted "I have completed the
+                # requested actions" — confident lie when the real cause was
+                # usually a tool error. 2026-05-16.
+                if response_msg.content:
+                    final_response_content = response_msg.content
+                else:
+                    final_response_content = "(no response)"
+                    if tool_call_count > 0:
+                        self.pending_notices.append({
+                            "message": (
+                                f"Generation ended without a reply after {tool_call_count} tool call(s). "
+                                f"A tool likely errored or isn't in the active toolset — check the logs, or rephrase."
+                            ),
+                            "severity": "warning",
+                        })
+                    else:
+                        self.pending_notices.append({
+                            "message": "Model returned no content. Try rephrasing or check the LLM provider settings.",
+                            "severity": "warning",
+                        })
                 
                 # Prepend force prefill if used
                 if force_prefill:

@@ -163,14 +163,20 @@ Core providers (claude, openai, gemini) live in `LLM_PROVIDERS`. Custom/user-add
 
 ### Claude-Friendly Settings
 
-**For prompt caching (90% cost savings):**
-- Enable caching: Settings → LLM → Claude → Enable prompt caching
-- **Disable Spice** — Changes system prompt every turn, breaks cache
-- **Disable Datetime injection** — Same problem, changes every turn
-- **Disable State vars in prompt** — Changes on state updates, breaks cache
-- "Story in prompt" is fine — Only changes on scene advance
+**For prompt caching (up to 90% cost savings on cached input):**
+- Enable caching: Settings → LLM → Claude → Enable prompt caching (default ON since 2.6.4)
+- Sapphire automatically caches system prompt + tools + full conversation history
+- Per-turn variations (spice, datetime) ride the **ghost-message rail** outside the cached prefix — they don't break cache and don't need to be disabled
 
-Cache TTL can be 5m (default) or 1h for longer sessions.
+**The only thing that disables system-prompt caching:** plugins registering a `prompt_inject` hook (story-state injectors, Vanta-class plugins). Most plugins use the safer `ghost_inject` hook (see `core/ghost_messages.py`) which has zero caching impact.
+
+Cache TTL can be 5m (default) or 1h for longer sessions with idle gaps.
+
+### Per-Turn Injection (Ghost Messages)
+
+Per-turn ephemera (spice, current datetime, plugin-contributed context) lives in `core/ghost_messages.py` and is delivered as a labeled user-role message inserted right before the new user message. The envelope opens with `[Operator metadata for assistant — ...]` so the assistant sees these contributions as operator metadata, not user voice. Each line is attributed to the contributing plugin name. Ghost messages are NEVER persisted to chat history.
+
+This is the rail that keeps spice/datetime/plugin context cache-friendly. Plugins use the `ghost_inject` hook to contribute (see `docs/plugin-author/hooks.md`).
 
 ---
 
@@ -372,6 +378,7 @@ Real-time UI updates via Server-Sent Events.
 | Settings | `user/settings.json` | ~2s |
 | Prompts | `user/prompts/*.json` | ~2s |
 | Toolsets | `user/toolsets/toolsets.json` | ~2s |
+| Spice sets | `user/spice_sets/*.json` | ~2s |
 
 ---
 
@@ -404,6 +411,8 @@ Each session has message history, per-chat settings (prompt, voice, toolset, LLM
 | `core/chat/chat.py` | LLM orchestration |
 | `core/chat/chat_streaming.py` | SSE response streaming |
 | `core/chat/llm_providers/` | Claude, OpenAI, Gemini (core) + custom + plugin providers |
+| `core/ghost_messages.py` | Per-turn ephemeral injection (spice, datetime, plugin context) — cache-friendly delivery rail |
+| `core/hooks.py` | Plugin hook runner (pre_chat, prompt_inject, ghost_inject, etc.) |
 | `core/provider_registry.py` | Base registry for TTS, STT, Embedding, LLM |
 | `core/agents/` | Agent spawning, registry, lifecycle |
 | `core/chat/function_manager.py` | Tool loading, scopes, story tools |

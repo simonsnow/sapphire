@@ -526,9 +526,15 @@ def _claude_supports_name():
     if _HAS_NAME_FLAG_CACHE is not None and (now - _HAS_NAME_FLAG_CACHE_TIME) < 60:
         return _HAS_NAME_FLAG_CACHE
     try:
-        out = subprocess.run(['claude', '--help'], capture_output=True, text=True, timeout=5)
+        # Resolve absolute path so Windows CreateProcessW finds claude.cmd
+        # (PATHEXT not honored with bare command + shell=False). 2026-05-14.
+        env = _clean_env()
+        resolved, _err = _resolve_claude_executable(env)
+        cmd = [resolved or 'claude', '--help']
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=5, env=env)
         _HAS_NAME_FLAG_CACHE = '--name' in out.stdout
-    except Exception:
+    except Exception as e:
+        logger.debug(f"[claude-code] _claude_supports_name probe failed: {e}")
         _HAS_NAME_FLAG_CACHE = False
     _HAS_NAME_FLAG_CACHE_TIME = now
     return _HAS_NAME_FLAG_CACHE
@@ -671,6 +677,68 @@ def _clean_env():
     return env
 
 
+def _resolve_claude_executable(env):
+    """Resolve the `claude` CLI to its full path, honoring PATHEXT on Windows.
+
+    Returns (full_path, None) on success, (None, error_message) on failure.
+
+    Why this is its own helper: `subprocess.Popen(['claude', ...])` with
+    `shell=False` on Windows uses CreateProcessW, which does NOT search
+    PATHEXT for `.cmd`/`.bat` wrappers. Since `npm install -g
+    @anthropic-ai/claude-code` installs `claude.cmd` (not `claude.exe`),
+    Popen with the bare command silently fails with FileNotFoundError
+    even though `shutil.which('claude')` (which DOES honor PATHEXT)
+    finds it. Resolving up-front with shutil.which and passing the
+    absolute path to Popen sidesteps the issue. 2026-05-14.
+    """
+    path_env = env.get('PATH', '')
+    resolved = shutil.which('claude', path=path_env)
+    if resolved:
+        logger.info(f"[claude-code] Resolved claude → {resolved}")
+        return resolved, None
+
+    # Build a helpful diagnostic. Include the searched PATH (truncated),
+    # whether we're on Windows (relevant for npm .cmd wrappers), and
+    # platform-specific install hints.
+    path_preview = path_env if len(path_env) < 800 else path_env[:800] + '…(truncated)'
+    pathext = env.get('PATHEXT', '') if _IS_WINDOWS else None
+    platform = 'Windows' if _IS_WINDOWS else ('macOS' if sys.platform == 'darwin' else 'Linux')
+    hints = []
+    if _IS_WINDOWS:
+        hints.append(
+            "Windows: npm-installed claude.cmd lives in %APPDATA%\\npm\\ — confirm "
+            "that directory is on PATH for the user running Sapphire."
+        )
+        hints.append(
+            "If using the native installer, claude.exe is usually under "
+            "%LOCALAPPDATA%\\Programs\\Anthropic\\ or similar."
+        )
+    else:
+        hints.append(
+            "Common locations: ~/.nvm/versions/node/vXX/bin/, ~/.local/bin/, "
+            "/usr/local/bin/. Ensure your shell startup adds the install dir to PATH."
+        )
+        hints.append(
+            "If Sapphire runs as a systemd service, the unit's PATH may differ "
+            "from your interactive shell. Run `systemctl --user show-environment | grep PATH` "
+            "to compare."
+        )
+    diag = (
+        f"Claude Code command 'claude' not found on PATH.\n"
+        f"  Platform: {platform}\n"
+        f"  Searched PATH: {path_preview}\n"
+    )
+    if pathext is not None:
+        diag += f"  PATHEXT: {pathext}\n"
+    diag += "\n".join("  Hint: " + h for h in hints)
+    diag += (
+        "\n  Install: npm install -g @anthropic-ai/claude-code "
+        "(or use the official native installer)"
+    )
+    logger.warning(f"[claude-code] {diag}")
+    return None, diag
+
+
 def _sanity_check(workspace_path):
     ws = str(Path(workspace_path).resolve())
     user_plugins = os.path.join(_SAPPHIRE_ROOT, 'user', 'plugins')
@@ -680,8 +748,9 @@ def _sanity_check(workspace_path):
         if marker in ws.lower():
             return f"SAFETY: Workspace '{ws}' appears to be inside a Python environment."
     clean = _clean_env()
-    if not shutil.which('claude', path=clean.get('PATH', '')):
-        return "Claude Code command not found. Install globally: npm install -g @anthropic-ai/claude-code"
+    resolved, err = _resolve_claude_executable(clean)
+    if err:
+        return err
     return None
 
 
@@ -807,6 +876,16 @@ def _kill_proc(proc):
 def _run_claude(args, workspace, timeout_minutes=30, worker=None):
     env = _clean_env()
     timeout_sec = timeout_minutes * 60
+    # Resolve `claude` to its absolute path BEFORE Popen. On Windows,
+    # subprocess.Popen with a list of args and shell=False uses
+    # CreateProcessW which doesn't honor PATHEXT — `claude.cmd` from
+    # `npm install -g @anthropic-ai/claude-code` is invisible. The
+    # resolver helper logs the resolution (or a detailed diagnostic on
+    # failure). 2026-05-14.
+    resolved, resolve_err = _resolve_claude_executable(env)
+    if resolve_err:
+        return None, resolve_err
+    args = [resolved] + list(args[1:])  # replace bare 'claude' with full path
     logger.info(f"[claude-code] Running: {' '.join(args[:6])}... in {workspace}")
     try:
         popen_kwargs = dict(

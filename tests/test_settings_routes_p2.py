@@ -21,6 +21,17 @@ def settings_client(client, mock_system, monkeypatch):
 
     Same setup as test_settings_routes_p0's fixture but tailored for
     single-key routes: get_system().toggle_* / switch_* stubs.
+
+    Disk-safety note: stubbing `settings.save` only protects the `set()` write
+    path. Other production paths bypass save() and write the user settings
+    file directly — `_remove_key_from_file()` (DELETE handler), `_migrate_
+    providers()`, and `reset_to_defaults()`. Tests in this module hit DELETE
+    /api/settings/{key}, so we additionally snapshot the actual file bytes
+    on entry and restore them on teardown. Without this, every pytest run
+    silently nuked the developer's `DEFAULT_USERNAME` override on disk —
+    name reverted to "Human Protagonist" on next Sapphire restart. The
+    fixture's existing in-memory `_user`/`_runtime`/`_config` snapshot
+    only covered the singleton state, not the file. 2026-05-11.
     """
     c, csrf = client
 
@@ -29,6 +40,12 @@ def settings_client(client, mock_system, monkeypatch):
     orig_user = dict(sm_mod.settings._user)
     orig_runtime = dict(sm_mod.settings._runtime)
     orig_config = dict(sm_mod.settings._config)
+
+    # Snapshot the live user/settings.json bytes before any test touches it.
+    # Routes that call _remove_key_from_file() / reset_to_defaults() bypass
+    # the save() stub and write to disk directly.
+    user_settings_path = sm_mod.settings.BASE_DIR / 'user' / 'settings.json'
+    file_snapshot = user_settings_path.read_bytes() if user_settings_path.exists() else None
 
     from core import credentials_manager as cred_mod
     fresh_cred = MagicMock()
@@ -49,10 +66,18 @@ def settings_client(client, mock_system, monkeypatch):
     try:
         yield c, csrf, sm_mod.settings, fresh_cred, mock_system
     finally:
+        # Restore in-memory singleton state
         with sm_mod.settings._lock:
             sm_mod.settings._user = orig_user
             sm_mod.settings._runtime = orig_runtime
             sm_mod.settings._config = orig_config
+        # Restore the file too — tests may have written via the bypass paths
+        # above. If the file didn't exist at entry and a test created it,
+        # delete it to leave the filesystem in its original state.
+        if file_snapshot is not None:
+            user_settings_path.write_bytes(file_snapshot)
+        elif user_settings_path.exists():
+            user_settings_path.unlink()
 
 
 # ─── GET /api/settings/{key} ─────────────────────────────────────────────────

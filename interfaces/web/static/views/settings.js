@@ -20,16 +20,18 @@ import pluginsTab from './settings-tabs/plugins.js';
 import backupTab from './settings-tabs/backup.js';
 import systemTab from './settings-tabs/system.js';
 import helpTab from './settings-tabs/help-tab.js';
+import storeTab from './settings-tabs/store-tab.js';
 
 import { getRegisteredTabs } from '../shared/plugin-registry.js';
 
-const STATIC_TABS = [dashboardTab, appearanceTab, audioTab, ttsTab, sttTab, embeddingTab, llmTab, toolsTab, networkTab, wakewordTab, pluginsTab, backupTab, systemTab, helpTab];
+const STATIC_TABS = [dashboardTab, appearanceTab, audioTab, ttsTab, sttTab, embeddingTab, llmTab, toolsTab, networkTab, wakewordTab, pluginsTab, storeTab, backupTab, systemTab, helpTab];
 
 let container = null;
 let activeTab = 'dashboard';
 let settings = {};
 let help = {};
 let overrides = [];
+let defaults = {};
 let pendingChanges = {};
 let wakewordModels = [];
 let availableThemes = ['dark'];
@@ -61,6 +63,7 @@ async function loadData() {
             api.getSettingsHelp().catch(() => ({ help: {} }))
         ]);
         settings = settingsData.settings || {};
+        defaults = settingsData.defaults || {};
         overrides = settingsData.user_overrides || [];
         help = helpData.help || {};
         managed = settingsData.managed || false;
@@ -316,6 +319,13 @@ function createCtx() {
         renderFields, renderAccordion, renderInput, formatLabel,
         attachAccordionListeners,
         markChanged(key, value) { pendingChanges[key] = value; },
+        // Source-of-truth read for unsaved state. Custom controls (anything
+        // not rendered via renderFields/renderInput) should use this instead
+        // of reading `settings[key]` directly — otherwise tab-switch loses
+        // their unsaved value. renderInput already uses this internally.
+        getValue(key) {
+            return key in pendingChanges ? pendingChanges[key] : settings[key];
+        },
         async refreshTab() {
             await loadData();
             renderTabContent();
@@ -712,7 +722,13 @@ async function saveChanges() {
     try {
         const parsed = {};
         for (const [key, value] of Object.entries(valid)) {
-            parsed[key] = api.parseValue(value, settings[key]);
+            // Coerce by the DEFAULTS type, not the currently-stored type.
+            // The default's type is the schema — using settings[key] would
+            // duck-type on whatever's currently stored, which lets a bad
+            // value perpetuate forever (the silero data-poisoning bug class).
+            // Fall back to settings[key] if no default registered (plugin keys etc).
+            const referenceType = (key in defaults) ? defaults[key] : settings[key];
+            parsed[key] = api.parseValue(value, referenceType);
         }
 
         const result = await api.updateSettingsBatch(parsed, { confirm_embedding_swap: confirmEmbeddingSwap });

@@ -14,9 +14,10 @@ from collections import deque
 import logging
 
 from core.audio import (
-    get_device_manager, 
-    classify_audio_error, 
+    get_device_manager,
+    classify_audio_error,
     convert_to_mono,
+    resample_audio,
     get_temp_dir
 )
 from . import system_audio
@@ -24,6 +25,11 @@ from core.event_bus import publish, Events
 import config
 
 logger = logging.getLogger(__name__)
+
+# Silero VAD chunk: 512 samples at 16kHz (32ms). We buffer resampled audio
+# until we have at least this many samples, then score one chunk.
+_SILERO_CHUNK = 512
+_SILERO_RATE = 16000
 
 
 class AudioRecorder:
@@ -34,11 +40,29 @@ class AudioRecorder:
     """
     
     def __init__(self):
+        # Amplitude-VAD state — kept as fallback when silero isn't available
         self.level_history = deque(maxlen=config.RECORDER_LEVEL_HISTORY_SIZE)
         self.adaptive_threshold = config.RECORDER_SILENCE_THRESHOLD
+
+        # Silero VAD (default). Lazy-loaded on first use so module import
+        # doesn't fail if onnxruntime is somehow broken. Falls back to
+        # amplitude VAD if silero load/inference errors. 2026-05-16.
+        # Boolean setting matches the UI checkbox shape — no translation
+        # layer means no class of "type mismatch on save" bugs possible.
+        self._silero_enabled = bool(getattr(config, 'STT_VAD_ENABLED', True))
+        self._silero = None
+        self._silero_buffer = np.zeros(0, dtype=np.int16)
+        self._last_speech_prob = 0.0
+
         self._stream = None
         self._recording = False
         self.temp_dir = get_temp_dir()
+        # Set on every record_audio() failure so the caller can give the
+        # user an accurate TTS message instead of the generic "file
+        # creation error" — Windows users in particular hit the
+        # mic-device-busy race after wakeword closes its own stream and
+        # need to know it's a mic problem, not a disk problem. 2026-04-28.
+        self.last_failure_reason: str = ''
         
         # Get device configuration from unified manager
         dm = get_device_manager()
@@ -91,11 +115,89 @@ class AudioRecorder:
         )
 
     def _is_silent(self, audio_data: np.ndarray) -> bool:
-        """Check if audio chunk is silent using adaptive threshold."""
+        """Dispatch to the configured VAD backend.
+
+        Silero (default): ML model trained to distinguish speech from
+        non-speech sounds — robust to coughs, fan noise, music, AC.
+        Amplitude (legacy): adaptive level threshold — sensitive to any
+        loud non-speech sound. Always-available fallback.
+
+        Intent (STT_VAD_ENABLED, boolean) is the user's preference.
+        Capability (silero_vad.is_available()) is the system check — set
+        by the boot warmup. Silero only runs if both are true.
+        """
+        if self._silero_enabled:
+            from core.stt import silero_vad as _svad
+            if _svad.is_available():
+                try:
+                    return self._is_silent_silero(audio_data)
+                except Exception as e:
+                    logger.warning(
+                        f"[VAD] Silero inference failed mid-recording ({e}) — "
+                        f"falling back to amplitude for this session."
+                    )
+                    self._silero_enabled = False
+                    self.level_history.clear()
+            # Silero pending or failed at warmup — silently use amplitude
+            # this recording. User intent (settings) is preserved.
+        return self._is_silent_amplitude(audio_data)
+
+    def _is_silent_amplitude(self, audio_data: np.ndarray) -> bool:
+        """Check if audio chunk is silent using adaptive amplitude threshold."""
         level = np.max(np.abs(audio_data.astype(np.float32) / 32768.0))
         self._update_threshold(level)
-        print(f"Level: {level:.4f} | Threshold: {self.adaptive_threshold:.4f}", end='\r')
         return level < self.adaptive_threshold
+
+    def _ensure_silero(self):
+        """Lazy-init silero VAD. Returns instance or raises."""
+        if self._silero is None:
+            from .silero_vad import SileroVAD
+            self._silero = SileroVAD(sample_rate=_SILERO_RATE)
+        return self._silero
+
+    def _is_silent_silero(self, audio_data: np.ndarray) -> bool:
+        """Score this chunk's speech probability via silero.
+
+        audio_data is mono int16 at self.rate. We resample to 16kHz if needed,
+        buffer until we have at least 512 samples (silero's chunk size), then
+        score and slide. Returns True when scored probability is below threshold
+        (not-speech)."""
+        silero = self._ensure_silero()
+
+        # Resample to 16kHz if device isn't already there. Same linear-interp
+        # as wakeword path — silero handles the resulting waveform fine once
+        # given proper leading context (which the wrapper now does).
+        if self.rate != _SILERO_RATE:
+            chunk_16k = resample_audio(audio_data, self.rate, _SILERO_RATE)
+        else:
+            chunk_16k = audio_data
+        if chunk_16k.dtype != np.int16:
+            chunk_16k = chunk_16k.astype(np.int16)
+
+        # Accumulate into buffer; score as many 512-sample chunks as we have.
+        # Most-recent score wins.
+        self._silero_buffer = np.concatenate([self._silero_buffer, chunk_16k])
+        scored_this_call = 0
+        # Track audio amplitude of what's being fed to silero — if this is
+        # near-zero while user is speaking, the bug is upstream (resample,
+        # device, dtype) rather than silero.
+        chunk_amp = int(np.max(np.abs(chunk_16k))) if len(chunk_16k) else 0
+        self._silero_max_amp = max(getattr(self, '_silero_max_amp', 0), chunk_amp)
+        while len(self._silero_buffer) >= _SILERO_CHUNK:
+            window = self._silero_buffer[:_SILERO_CHUNK]
+            self._silero_buffer = self._silero_buffer[_SILERO_CHUNK:]
+            self._last_speech_prob = silero.score_chunk(window)
+            scored_this_call += 1
+            self._silero_max_prob = max(getattr(self, '_silero_max_prob', 0.0), self._last_speech_prob)
+            self._silero_score_count = getattr(self, '_silero_score_count', 0) + 1
+            self._silero_prob_sum = getattr(self, '_silero_prob_sum', 0.0) + self._last_speech_prob
+
+        threshold = getattr(config, 'STT_VAD_SPEECH_THRESHOLD', 0.5)
+        is_speech = self._last_speech_prob >= threshold
+        if scored_this_call:
+            logger.debug(f"[SILERO] prob={self._last_speech_prob:.3f} thresh={threshold:.2f} "
+                         f"{'speech' if is_speech else 'silence'} ({scored_this_call} windows scored)")
+        return not is_speech
 
     def _open_stream(self) -> bool:
         """Open the audio stream. Retries once with device re-resolution on failure."""
@@ -120,7 +222,25 @@ class AudioRecorder:
             return True
         except Exception as e:
             logger.warning(f"STT stream open failed: {classify_audio_error(e)}")
-            # Retry once — re-resolve device by name in case index shifted
+            # Brief sleep before retry — on Windows (WASAPI/MME) the OS
+            # often hasn't released the mic from the wakeword stream yet
+            # when STT immediately tries to open it. 200ms is enough for
+            # the typical release; harmless on Linux. 2026-04-28.
+            time.sleep(0.2)
+            try:
+                self._stream = sd.InputStream(
+                    device=self.device_index,
+                    samplerate=self.rate,
+                    channels=self.channels,
+                    dtype=np.int16,
+                    blocksize=self.blocksize
+                )
+                self._stream.start()
+                logger.info(f"STT stream opened after brief retry on device {self.device_index}")
+                return True
+            except Exception as e_quick:
+                logger.debug(f"Quick retry also failed: {classify_audio_error(e_quick)}")
+            # Final retry — re-resolve device by name in case index shifted
             if getattr(self, 'device_name', ''):
                 logger.info(f"Retrying with device re-resolution for '{self.device_name}'")
                 dm = get_device_manager()
@@ -162,11 +282,29 @@ class AudioRecorder:
         if not self._open_stream():
             system_audio.restore_system_volume()
             publish(Events.STT_ERROR, {"reason": "failed_to_open_stream"})
+            self.last_failure_reason = "mic_busy"
             return None
+        # Clear stale failure state on a successful start; cleared again
+        # on each return path below if a different failure trips.
+        self.last_failure_reason = ''
         
         self._recording = True
         publish(Events.STT_RECORDING_START)
-        
+
+        # Reset silero hidden state for this recording — each utterance
+        # starts fresh, no leakage from prior sessions
+        if self._silero is not None:
+            try:
+                self._silero.reset()
+            except Exception:
+                pass
+        self._silero_buffer = np.zeros(0, dtype=np.int16)
+        self._last_speech_prob = 0.0
+        self._silero_max_prob = 0.0
+        self._silero_score_count = 0
+        self._silero_prob_sum = 0.0
+        self._silero_max_amp = 0
+
         frames = []
         silent_chunks = speech_chunks = 0
         has_speech = False
@@ -210,7 +348,19 @@ class AudioRecorder:
                 
                 # Early abort if no speech detected within timeout (accidental wakeword trigger)
                 if not has_speech and (time.time() - start_time) > config.RECORDER_NO_SPEECH_TIMEOUT:
-                    logger.info("No speech detected within timeout - early abort")
+                    if self._silero_enabled:
+                        n = getattr(self, '_silero_score_count', 0)
+                        mean = (self._silero_prob_sum / n) if n else 0.0
+                        max_amp = getattr(self, '_silero_max_amp', 0)
+                        # int16 amplitude reference: speech ~3000-15000, silence <500
+                        logger.info(
+                            f"No speech detected within timeout - early abort. "
+                            f"[silero] {n} chunks scored, prob max={self._silero_max_prob:.3f}, "
+                            f"mean={mean:.3f}, threshold={getattr(config, 'STT_VAD_SPEECH_THRESHOLD', 0.5):.2f}. "
+                            f"audio max amp={max_amp} int16 (speech typically 3000-15000)"
+                        )
+                    else:
+                        logger.info("No speech detected within timeout - early abort")
                     break
                 
                 if time.time() - start_time > config.RECORDER_MAX_SECONDS:
@@ -237,24 +387,26 @@ class AudioRecorder:
         publish(Events.STT_RECORDING_END)
         
         if not has_speech:
+            self.last_failure_reason = "no_speech_captured"
             return None
-        
+
         publish(Events.STT_PROCESSING)
-        
+
         try:
             # Combine all frames into single array
             audio_data = np.concatenate(frames)
-            
+
             # Write WAV file using soundfile (always mono output)
             timestamp = int(time.time())
             temp_path = os.path.join(self.temp_dir, f"voice_assistant_{timestamp}.wav")
             sf.write(temp_path, audio_data, self.rate)
-            
+
             return temp_path
-            
+
         except Exception as e:
             logger.error(f"Error saving audio: {e}")
             publish(Events.STT_ERROR, {"reason": "save_failed"})
+            self.last_failure_reason = "save_failed"
             return None
 
     def stop(self) -> None:

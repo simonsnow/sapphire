@@ -15,6 +15,41 @@ logger = logging.getLogger(__name__)
 
 IS_WINDOWS = sys.platform == 'win32'
 
+
+def _fsync_file(f):
+    """Force file contents to disk before close.
+
+    Without this, our 'atomic write' (tmp + rename) is only atomic against
+    process crashes — not power loss. A power flicker between the rename
+    and the pagecache flush leaves the target file as zero bytes, wiping
+    settings/credentials silently. Day-ruiner scout 2026-05-07.
+    """
+    try:
+        f.flush()
+        os.fsync(f.fileno())
+    except OSError as e:
+        logger.warning(f"fsync failed (write may not survive power loss): {e}")
+
+
+def _fsync_dir(path):
+    """Force a directory entry to disk so a rename inside it is durable.
+
+    Without this, the temp+rename can be reordered after power loss — the
+    rename hits the journal but the directory's updated entry is still in
+    pagecache. Result: file disappears or reverts.
+    """
+    try:
+        dir_fd = os.open(str(path), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        # Windows + some network filesystems don't support directory fsync;
+        # the file-level fsync above is the larger safety net anyway.
+        pass
+
+
 class SettingsManager:
     """Manages application settings with hot-reload and persistence."""
     
@@ -182,7 +217,9 @@ class SettingsManager:
             tmp_path = user_path.with_suffix('.json.tmp')
             with open(tmp_path, 'w', encoding='utf-8') as f:
                 json.dump(nested, f, indent=2)
+                _fsync_file(f)
             tmp_path.replace(user_path)
+            _fsync_dir(user_path.parent)
             # Update mtime immediately — no gap for file watcher
             self._last_mtime = user_path.stat().st_mtime
             logger.info(f"[SETTINGS] Migration persisted to disk")
@@ -331,7 +368,7 @@ class SettingsManager:
             return False
         return key in self.MANAGED_LOCKED_KEYS
 
-    def set(self, key, value, persist=False):
+    def set(self, key, value, persist=False, _skip_callbacks=False):
         """
         Set a setting value.
 
@@ -339,6 +376,15 @@ class SettingsManager:
             key: Setting key
             value: New value
             persist: If True, save to user/settings.json
+            _skip_callbacks: If True, suppress hot-reload callbacks for this
+                set. Used by route handlers that will explicitly run the
+                provider-switch themselves — without this, the callback +
+                explicit switch double-fire (e.g., Kokoro restart twice,
+                STT recorder torn down + rebuilt twice with flap risk).
+                Reload callbacks are still desirable for plugin_loader's
+                unload-plugin path, file-watcher reloads, and direct
+                settings UI saves — those keep the default behavior.
+                Voice-prep code review 2026-05-07 #J.
         """
         if self.is_locked(key):
             logger.warning(f"[MANAGED] Blocked write to locked setting: {key}")
@@ -366,7 +412,7 @@ class SettingsManager:
                 self._runtime[key] = value  # Track for survival across reloads
 
             # Trigger hot-reload callback if registered
-            if key in self._reload_callbacks:
+            if not _skip_callbacks and key in self._reload_callbacks:
                 try:
                     self._reload_callbacks[key](value)
                 except Exception as e:
@@ -423,11 +469,13 @@ class SettingsManager:
                             section[ck] = ''
             
             user_path.parent.mkdir(exist_ok=True)
-            # Atomic write: tmp file + rename to prevent corruption on crash
+            # Atomic write: tmp + fsync + rename + dir fsync to survive power loss
             tmp_path = user_path.with_suffix('.json.tmp')
             with open(tmp_path, 'w', encoding='utf-8') as f:
                 json.dump(nested, f, indent=2)
+                _fsync_file(f)
             tmp_path.replace(user_path)
+            _fsync_dir(user_path.parent)
             # Update mtime IMMEDIATELY after rename — no gap for the file watcher
             # to see a new mtime before _last_mtime is updated (fixes spurious reloads)
             self._last_mtime = user_path.stat().st_mtime
@@ -510,7 +558,9 @@ class SettingsManager:
                 tmp_path = user_path.with_suffix('.json.tmp')
                 with open(tmp_path, 'w', encoding='utf-8') as f:
                     json.dump({"_comment": "Your custom settings - edit freely or use web UI"}, f, indent=2)
+                    _fsync_file(f)
                 tmp_path.replace(user_path)
+                _fsync_dir(user_path.parent)
                 self._last_mtime = user_path.stat().st_mtime
                 logger.info("Settings reset to defaults")
                 return True
@@ -608,6 +658,15 @@ class SettingsManager:
     def get_all_settings(self):
         """Get all current settings (defaults + user overrides)"""
         return self._config.copy()
+
+    def get_defaults(self):
+        """Get the canonical default values (the schema). Used by the
+        frontend to drive type coercion on save — the default's type is
+        the source-of-truth type, not whatever happens to be in the user
+        settings file. This protects against data poisoning bugs where a
+        corrupted user value (wrong type) would otherwise self-perpetuate
+        through parseValue's duck-typing. 2026-05-16."""
+        return self._defaults.copy()
     
     def validate_tier(self, key):
         """
@@ -707,15 +766,38 @@ class SettingsManager:
                     # Reload settings
                     logger.info("Detected settings file change, reloading...")
                     self.reload()
-                    
-                    # Trigger all registered callbacks
+
+                    # Advance _last_mtime BEFORE callback dispatch — pre-fix
+                    # the watcher self-triggered when reload callbacks
+                    # (switch_tts_provider etc.) ran long enough that the
+                    # next poll iteration came around with the file's new
+                    # mtime != stored mtime → second reload → second
+                    # provider rebuild. Bumping the stamp first closes that
+                    # window. Wildcard scout 2026-05-07 W1.
+                    try:
+                        self._last_mtime = user_path.stat().st_mtime
+                    except Exception:
+                        pass
+
+                    # Snapshot callback list under the lock, then dispatch
+                    # OUTSIDE the lock. Pre-fix, the dispatch ran inside
+                    # `with self._lock:` — provider rebuilds (Kokoro server
+                    # restart, STT recorder rebuild, embedder reload) can
+                    # take seconds and stalled every concurrent settings
+                    # read for the entire rebuild duration. Stop-the-world.
+                    # `set()` already uses this snapshot-then-dispatch
+                    # pattern at L405-410. Wildcard scout 2026-05-07 W2.
                     with self._lock:
-                        for key, callback in self._reload_callbacks.items():
-                            if key in self._config:
-                                try:
-                                    callback(self._config[key])
-                                except Exception as e:
-                                    logger.error(f"Callback failed for {key}: {e}")
+                        snapshot = [
+                            (key, cb, self._config.get(key))
+                            for key, cb in self._reload_callbacks.items()
+                            if key in self._config
+                        ]
+                    for key, callback, value in snapshot:
+                        try:
+                            callback(value)
+                        except Exception as e:
+                            logger.error(f"Callback failed for {key}: {e}")
             
             except Exception as e:
                 logger.error(f"File watcher error: {e}")
@@ -785,7 +867,9 @@ class SettingsManager:
                 tmp_path = user_path.with_suffix('.json.tmp')
                 with open(tmp_path, 'w', encoding='utf-8') as f:
                     json.dump(nested, f, indent=2)
+                    _fsync_file(f)
                 tmp_path.replace(user_path)
+                _fsync_dir(user_path.parent)
                 self._last_mtime = user_path.stat().st_mtime
                 logger.debug(f"Removed '{key}' from settings file")
         except Exception as e:

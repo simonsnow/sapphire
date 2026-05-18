@@ -1,3 +1,4 @@
+import os
 import tarfile
 import sqlite3
 import logging
@@ -29,6 +30,15 @@ def _backup_filter(tarinfo):
     # Krem keeps them recoverable via re-generation in the plugin UI; backup
     # exclusion is the right tradeoff. Witch-hunt 2026-04-21 finding C5.
     if name.endswith('_mcp_key.json'):
+        return None
+    # mcp_client.json holds OUTBOUND bearer tokens (Authorization headers)
+    # for MCP servers Sapphire connects to as a client. Different naming
+    # convention from `*_mcp_key.json` (which is the inbound auth pattern),
+    # so the rule above didn't catch it. Same blast radius — plaintext
+    # credentials riding into RAID + offsite. Re-issuable from the MCP
+    # server's admin UI, so excluding from backups is the right tradeoff.
+    # Wildcard scout 2026-05-07 MCP C1.
+    if name.endswith('mcp_client.json'):
         return None
     return tarinfo
 
@@ -114,10 +124,36 @@ class Backup:
         partial = filepath.with_suffix('.gz.partial')
 
         try:
-            # Checkpoint SQLite WAL files before backup to ensure consistent snapshots
-            self._checkpoint_databases()
+            # Checkpoint SQLite WAL files before backup. DBs whose checkpoint
+            # failed (SQLITE_BUSY etc.) get skipped from the archive entirely
+            # — better to omit a DB from this backup than capture it in a
+            # torn state that won't restore cleanly. The next scheduled
+            # backup will retry. Day-ruiner scout 2026-05-07 #K.
+            failed_checkpoints = self._checkpoint_databases()
+            def _filter_with_busy(tarinfo):
+                base = _backup_filter(tarinfo)
+                if base is None:
+                    return None
+                # Drop the failed DB and its WAL/SHM siblings so we don't
+                # ship a half-snapshot. Match against absolute path of the
+                # underlying file (tarinfo.name is relative to the arcname).
+                src = (self.user_dir / tarinfo.name[len("user/"):]).resolve() if tarinfo.name.startswith("user/") else None
+                if src is not None:
+                    for db in failed_checkpoints:
+                        if src == db or src == Path(str(db) + "-wal") or src == Path(str(db) + "-shm"):
+                            return None
+                return tarinfo
             with tarfile.open(partial, "w:gz") as tar:
-                tar.add(self.user_dir, arcname="user", filter=_backup_filter)
+                tar.add(self.user_dir, arcname="user",
+                        filter=(_filter_with_busy if failed_checkpoints else _backup_filter))
+            # Restrict perms BEFORE rename — backup contains credentials.json
+            # (which is itself 0600). Without this, the tarball is world-readable
+            # by default umask. Multi-user system risk; single-user is fine but
+            # belt-and-suspenders. Day-ruiner scout 2026-05-07 #L.
+            try:
+                os.chmod(partial, 0o600)
+            except OSError as _e:
+                logger.warning(f"Could not chmod backup: {_e}")
             # Atomic rename — `list_backups` glob excludes `.partial` so a
             # truncated archive never appears as a legitimate backup.
             partial.replace(filepath)
@@ -137,14 +173,43 @@ class Backup:
             return None
 
     def _checkpoint_databases(self):
-        """Flush WAL journals on all SQLite databases so tar captures consistent state."""
+        """Flush WAL journals on all SQLite databases so tar captures
+        consistent state. Returns set of paths whose checkpoint failed —
+        the backup loop may choose to skip these from the archive rather
+        than tar a torn main+WAL pair.
+
+        Pre-fix, a SQLITE_BUSY (long-running reader holding a lock)
+        silently swallowed at debug level and tar proceeded with stale
+        main.db + active .db-wal. On restore, the WAL had to replay or
+        be discarded — either path could miss writes the user assumed
+        were captured. Voice mode increases concurrent writers, raising
+        the BUSY rate. Day-ruiner scout 2026-05-07 #K.
+        """
+        failed = set()
         for db_path in self.user_dir.rglob("*.db"):
             try:
-                conn = sqlite3.connect(str(db_path))
-                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                conn = sqlite3.connect(str(db_path), timeout=10.0)
+                # busy_timeout for the checkpoint itself — better to wait
+                # a few seconds than skip. But cap to avoid hanging the
+                # whole backup if a chat is mid-stream.
+                conn.execute("PRAGMA busy_timeout=10000")
+                # wal_checkpoint returns (busy, log_pages, checkpointed_pages).
+                # busy=1 means SQLITE_BUSY — the checkpoint did not complete.
+                row = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
                 conn.close()
+                if row and row[0] == 1:
+                    logger.warning(
+                        f"WAL checkpoint BUSY for {db_path.name} — backup will "
+                        f"skip this DB to avoid torn main+WAL state."
+                    )
+                    failed.add(db_path.resolve())
             except Exception as e:
-                logger.debug(f"WAL checkpoint skipped for {db_path.name}: {e}")
+                logger.warning(
+                    f"WAL checkpoint failed for {db_path.name}: {e} — "
+                    f"DB skipped from backup to avoid inconsistent capture."
+                )
+                failed.add(db_path.resolve())
+        return failed
 
     def _db_housekeeping(self, is_weekly: bool = False):
         """Run DB integrity_check daily and VACUUM weekly against every

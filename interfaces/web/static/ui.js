@@ -236,7 +236,21 @@ const createMessage = (msg, idx = null, total = null, isHistoryRender = false) =
     }
     
     Parsing.parseContent(contentDiv, msg, isHistoryRender, scrollToBottomIfSticky);
-    
+
+    // Degraded-task signal: when a heartbeat / scheduled task ends without
+    // a real reply (context overflow, tool exhaustion, empty LLM), the
+    // backend keeps `content` empty so the text never reaches TTS / Discord
+    // / Telegram (Apr-24 incident), but it also tags `metadata.degraded_reason`
+    // so we can show the user WHY in chat. Italic muted note — no audio path.
+    if (role === 'assistant' && !msg.content && msg.metadata?.degraded_reason) {
+        const note = createElem(
+            'div',
+            { class: 'message-degraded' },
+            `⚠️ ${msg.metadata.degraded_reason}`
+        );
+        contentDiv.appendChild(note);
+    }
+
     // Add metadata footer for assistant messages
     if (role === 'assistant' && msg.metadata) {
         const meta = msg.metadata;
@@ -270,11 +284,16 @@ const createMessage = (msg, idx = null, total = null, isHistoryRender = false) =
             parts.push(`${fmt(prompt)} in / ${fmt(content)} out`);
         }
 
-        // Cache indicator
+        // Cache indicator. Anthropic reports `prompt` as the NON-cached
+        // input tokens, with cached tokens reported separately. Total
+        // input = prompt + cache_read. Old formula divided cache_read
+        // by the leftover non-cached portion and gave 5000%+ readings
+        // on near-full cache hits. Fixed 2026-04-30.
         const cacheRead = tok.cache_read_tokens || 0;
         const cacheWrite = tok.cache_write_tokens || 0;
-        if (cacheRead > 0 && prompt > 0) {
-            const pct = Math.round((cacheRead / prompt) * 100);
+        if (cacheRead > 0) {
+            const totalPrompt = prompt + cacheRead;
+            const pct = totalPrompt > 0 ? Math.round((cacheRead / totalPrompt) * 100) : 0;
             parts.push(`cache ${pct}%`);
         } else if (cacheWrite > 0) {
             parts.push('cache miss');
@@ -411,6 +430,10 @@ export const startStreaming = () => {
 export const appendStream = (chunk) => {
     Streaming.appendStream(chunk, scrollToBottomIfSticky);
 };
+
+// Stream-id passthrough — send-handlers uses it to drop stale chunks after
+// a Stop→immediate-Send. Bumped inside Streaming on every start/cancel.
+export const getCurrentStreamId = () => Streaming.getCurrentStreamId();
 
 export const startTool = (toolId, toolName, args) => {
     Streaming.startTool(toolId, toolName, args, scrollToBottomIfSticky);

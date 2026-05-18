@@ -275,9 +275,14 @@ def assemble_prompt():
         if emotion in emotions:
             parts.append(emotions[emotion])
     
-    if _assembled_state["spice"]:
-        parts.append(f'URGENT ALERT: {_assembled_state["spice"]}')
-    
+    # Spice DOES NOT go into the assembled system prompt anymore. Pre-2026-05-08
+    # this appended `URGENT ALERT: {spice}` here, which mutated the system
+    # prompt every spice rotation and broke Claude's prompt cache. Spice now
+    # rides on the ghost-message rail (core/ghost_messages.py) — same per-turn
+    # delivery, recency-amplified, cache-friendly. `_assembled_state["spice"]`
+    # still rotates here; `get_current_spice()` still surfaces it; ghost rail
+    # picks it up and labels it. The prompt itself stays cacheable.
+
     assembled = "\n".join(filter(None, parts))
     return {"role": "system", "content": prompt_manager._replace_templates(assembled)}
 

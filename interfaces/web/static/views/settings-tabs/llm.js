@@ -20,11 +20,11 @@ export default {
     generalKeys: ['LLM_MAX_HISTORY', 'CONTEXT_LIMIT', 'LLM_REQUEST_TIMEOUT', 'FORCE_THINKING', 'THINKING_PREFILL', 'IMAGE_UPLOAD_MAX_WIDTH'],
 
     render(ctx) {
-        const coreProviders = ctx.settings.LLM_PROVIDERS || {};
-        const customProviders = ctx.settings.LLM_CUSTOM_PROVIDERS || {};
+        const coreProviders = ctx.getValue('LLM_PROVIDERS') || {};
+        const customProviders = ctx.getValue('LLM_CUSTOM_PROVIDERS') || {};
         const allProviders = {...coreProviders, ...customProviders};
-        const fallbackOrder = ctx.settings.LLM_FALLBACK_ORDER || Object.keys(allProviders);
-        generationProfiles = ctx.settings.MODEL_GENERATION_PROFILES || {};
+        const fallbackOrder = ctx.getValue('LLM_FALLBACK_ORDER') || Object.keys(allProviders);
+        generationProfiles = ctx.getValue('MODEL_GENERATION_PROFILES') || {};
 
         // Core provider cards (in fallback order)
         const coreKeys = Object.keys(coreProviders);
@@ -207,7 +207,7 @@ export default {
         // Drag-drop reorder
         initProviderDragDrop(el.querySelector('#providers-list'), order => {
             // Merge core order with existing custom order
-            const customKeys = Object.keys(ctx.settings.LLM_CUSTOM_PROVIDERS || {});
+            const customKeys = Object.keys(ctx.getValue('LLM_CUSTOM_PROVIDERS') || {});
             const fullOrder = [...order, ...customKeys.filter(k => !order.includes(k))];
             updateFallbackOrder(fullOrder);
         });
@@ -248,7 +248,7 @@ export default {
             info.style.cursor = 'pointer';
             info.addEventListener('click', () => {
                 const key = info.closest('.custom-provider-row').dataset.provider;
-                const custom = ctx.settings.LLM_CUSTOM_PROVIDERS || {};
+                const custom = ctx.getValue('LLM_CUSTOM_PROVIDERS') || {};
                 const config = custom[key] || {};
                 _showEditWizard(el, key, config, ctx);
             });

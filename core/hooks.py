@@ -23,7 +23,19 @@ class HookEvent:
         post_stt:          After voice transcription — mutate `input` to correct STT
         on_wake:           Wakeword detected — notification only (must return fast)
         pre_chat:          Before LLM — mutate `input`, set `skip_llm`/`response` to bypass
-        prompt_inject:     During prompt build — append to `context_parts`
+        prompt_inject:     During prompt build — append to `context_parts` (system prompt)
+        ghost_inject:      Per-turn ephemeral content — set `ghost_text` to inject a
+                           non-persisted operator-metadata note into THIS turn's LLM
+                           call only. Goes through the ghost-message rail (a labeled
+                           user-role message just before the new user input), never
+                           saved to chat history, attributed to the contributing
+                           plugin in the envelope so the assistant can see who's
+                           talking. Use for time-sensitive context (weather, calendar,
+                           ambient state). Subject to elevated store review — this
+                           hook can shape replies invisibly to the user, so plugins
+                           must declare WHAT they inject and WHY in their manifest.
+                           Plugins that fingerprint user content and inject opinion-
+                           shaping text get rejected (Vanta-shape). 2026-05-08.
         post_llm:          After LLM response, before save — mutate `response` to filter/translate
         post_chat:         After response saved — observational (`input`, `response`)
         pre_execute:       Before tool call — mutate `arguments`, block with `skip_llm`
@@ -37,6 +49,11 @@ class HookEvent:
         skip_llm: Set True to bypass LLM entirely (voice commands, cached responses)
         response: Direct response text when skip_llm is True / post_chat final response
         context_parts: Append strings to inject into system prompt (prompt_inject hooks)
+        ghost_text: Set in `ghost_inject` to contribute a per-turn ephemeral note.
+                    Goes into the ghost message envelope, never persisted, attributed
+                    by `ghost_label` so the assistant sees which plugin spoke.
+        ghost_label: Plugin name for ghost attribution. Auto-set by the runner from
+                     the registering plugin's manifest. Plugins should not override.
         stop_propagation: Set True to prevent lower-priority hooks from firing
         config: System config object (read-only by convention)
         metadata: Arbitrary data — may include 'system' (VoiceChatSystem instance)
@@ -51,6 +68,14 @@ class HookEvent:
     skip_llm: bool = False
     response: Optional[str] = None
     context_parts: List[str] = field(default_factory=list)
+    # Ghost-injection rail (set by handlers in `ghost_inject` hook). Plugins
+    # set `ghost_text` to contribute. The runner collects (label, text) pairs
+    # in `ghost_contributions` so build_ghost_message can attribute each line
+    # to the originating plugin in the envelope. Plugins should NOT modify
+    # ghost_label or ghost_contributions — those are runner-managed.
+    ghost_text: Optional[str] = None
+    ghost_label: str = ""
+    ghost_contributions: List[tuple] = field(default_factory=list)
     stop_propagation: bool = False
     config: Any = None
     metadata: Dict[str, Any] = field(default_factory=dict)
@@ -169,9 +194,20 @@ class HookRunner:
             self._ensure_sorted(hook_name)
             snapshot = list(handlers)
 
+        is_ghost_hook = (hook_name == "ghost_inject")
+
         for priority, handler, plugin_name, voice_match in snapshot:
             if not self._check_voice_match(voice_match, event.input):
                 continue
+
+            # For ghost_inject: stamp the label, clear any previous handler's
+            # text, so each contribution is attributed to the right plugin.
+            # Plugins set `event.ghost_text = "..."` to contribute; the runner
+            # captures it after the handler returns and resets for the next
+            # plugin. Attribution lives in `ghost_contributions`. 2026-05-08.
+            if is_ghost_hook:
+                event.ghost_label = plugin_name
+                event.ghost_text = None
 
             try:
                 handler(event)
@@ -182,9 +218,19 @@ class HookRunner:
                 )
                 continue
 
+            if is_ghost_hook and event.ghost_text:
+                event.ghost_contributions.append((plugin_name, event.ghost_text))
+
             if event.stop_propagation:
                 logger.info(f"[HOOKS] Propagation stopped by {plugin_name} on '{hook_name}'")
                 break
+
+        # Clear scratch fields after ghost dispatch so accidental reads of
+        # ghost_text/ghost_label after fire() don't carry the last plugin's
+        # state. ghost_contributions is the canonical output.
+        if is_ghost_hook:
+            event.ghost_text = None
+            event.ghost_label = ""
 
         return event
 
