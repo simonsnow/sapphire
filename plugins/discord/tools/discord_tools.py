@@ -5,6 +5,7 @@
 # In daemon context, channel defaults to the one that triggered the event.
 
 import asyncio
+import discord
 import logging
 from contextvars import ContextVar
 from datetime import datetime, timezone
@@ -155,7 +156,10 @@ def _resolve_channel(client, loop, channel_ref):
                 ch = await client.fetch_channel(int(channel_ref))
             return ch
         future = asyncio.run_coroutine_threadsafe(_by_id(), loop)
-        return future.result(timeout=10), None
+        ch = future.result(timeout=10)
+        if isinstance(ch, discord.DMChannel):
+            logger.debug("[DISCORD] Resolved DM channel with %s", ch.recipient)
+        return ch, None
 
     # Otherwise resolve by name (case-insensitive)
     target = channel_ref.lower()
@@ -221,10 +225,12 @@ def _read_messages(client, loop, channel_ref=None, count=20):
     future = asyncio.run_coroutine_threadsafe(_fetch(), loop)
     messages = future.result(timeout=15)
 
-    if not messages:
-        return _header() + f"#{channel.name}: No messages.", True
+    ch_label = f"DM:{channel.recipient}" if isinstance(channel, discord.DMChannel) else channel.name
 
-    lines = [_header() + f"#{channel.name} — {len(messages)} messages:\n"]
+    if not messages:
+        return _header() + f"#{ch_label}: No messages.", True
+
+    lines = [_header() + f"#{ch_label} — {len(messages)} messages:\n"]
     for m in messages:
         ago = _time_ago(m["time"])
         attach = f" [{m['attachments']} file(s)]" if m["attachments"] else ""
@@ -247,7 +253,7 @@ def _send_message(client, loop, channel_ref=None, text=""):
 
     async def _send():
         await channel.send(text)
-        return channel.name
+        return f"DM:{channel.recipient}" if isinstance(channel, discord.DMChannel) else channel.name
 
     future = asyncio.run_coroutine_threadsafe(_send(), loop)
     channel_name = future.result(timeout=10)
